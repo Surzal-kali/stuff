@@ -11,7 +11,7 @@ import cryptography
 from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
 
 TARGET_INTERFACE = "eth0" 
-
+#[ ]TODO: Rewrite! Needs to take advantage of poor cryptography, it's just sitting there
 class PacketUtils:
     def dissect_packet(self, packet: scapy.Packet):
         """Dissect a packet."""
@@ -63,18 +63,17 @@ class PacketCraft:
         packet = IP(src=src_ip, dst=dst_ip) / ICMP(type=0) / Raw(load=payload)
         return packet
 
-    def craft_http_request(self, src_ip: str, dst_ip: str, method: str = "GET", path: str = "/", headers: dict = None, payload: bytes = b"") -> scapy.Packet:
+    def craft_http_request(self, src_ip: str, dst_ip: str, method: str = "GET", path: str = "/", headers: list[tuple[str, str]] = [], payload: bytes = b"") -> scapy.Packet:
         """Craft an HTTP request packet."""
-        if headers is None:
-            headers = {}
+        headers_dict = dict(headers)
         http_layer = HTTPRequest(
             Method=method,
             Path=path,
-            Host=headers.get("Host", ""),
-            User_Agent=headers.get("User-Agent", ""),
-            Accept=headers.get("Accept", ""),
-            Accept_Encoding=headers.get("Accept-Encoding", ""),
-            Accept_Language=headers.get("Accept-Language", "")
+            Host=headers_dict.get("Host", ""),
+            User_Agent=headers_dict.get("User-Agent", ""),
+            Accept=headers_dict.get("Accept", ""),
+            Accept_Encoding=headers_dict.get("Accept-Encoding", ""),
+            Accept_Language=headers_dict.get("Accept-Language", "")
         )
         packet = IP(src=src_ip, dst=dst_ip) / TCP(sport=random.randint(1024, 65535), dport=80, flags="PA") / http_layer / Raw(load=payload)
         return packet

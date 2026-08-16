@@ -1,83 +1,88 @@
 import sys
 import code
-import tempfile
-import shlex
-import importlib
-import importlib.util
-from pathlib import Path
 import asyncio
-import concurrent.futures
+import threading
+import importlib
+from pathlib import Path
 
 FRAMEWORK_ROOT = Path(__file__).parent
-#[ ]TODO: rewrite
+
+class AsyncBackgroundRunner:
+    """Runs an asyncio event loop in a separate background thread."""
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def run_task(self, coro):
+        """Schedules a coroutine to run in the background loop."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join()
+
 class FrameworkLoader:
-    """
-    Checks for child "strap" python submodules to properly load the underlying c++ binaries/ python modules
-    """
     def __init__(self, framework_root: Path):
         self.framework_root = framework_root
-        self.loaded_modules = {}
-        self.loaded_binaries = {}
-        self.loaded_paths = set()
-        self.loaded_paths.add(str(self.framework_root))
-        self.load_strap_modules()
+        self.runner = AsyncBackgroundRunner()
+        self.active_tasks = []
 
-    def load_strap_modules(self):
-        for strap_dir in self.framework_root.iterdir():
-            if strap_dir.is_dir() and (strap_dir / "__init__.py").exists():
-                module_name = strap_dir.name
-                if module_name not in self.loaded_modules:
-                    self.load_module(module_name, strap_dir)
-
-    def load_module(self, module_name: str, module_path: Path):
-        spec = importlib.util.spec_from_file_location(module_name, module_path / "__init__.py")
-        if spec is None:
-            print(f"[-] Could not load module {module_name} from {module_path}")
-            return
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        self.loaded_modules[module_name] = module
-        self.loaded_paths.add(str(module_path))
-        if spec.loader is not None:
-            spec.loader.exec_module(module)
-
-
-    def load_binary(self, binary_name: str, binary_path: Path):
-        if binary_name in self.loaded_binaries:
-            return self.loaded_binaries[binary_name]
+    async def start_brain_server(self):
+        """Imports and starts the Brain listener."""
         try:
-            import ctypes
-            binary = ctypes.CDLL(str(binary_path))
-            self.loaded_binaries[binary_name] = binary
-            return binary
+            from listeners.thebrain import start_brain
+            print("[+] Starting Brain listener...")
+            await start_brain()
         except Exception as e:
-            print(f"[-] Could not load binary {binary_name} from {binary_path}: {e}")
-            return None
+            print(f"[!] Brain server failed: {e}")
 
+    async def start_ssl_server(self, ip="0.0.0.0", port=4433):
+        """Starts the SSL server binary as a subprocess."""
+        ssl_server_path = self.framework_root / "utils" / "plugins" / "ssl_server" / "ssl_server"
+        if not ssl_server_path.exists():
+            print(f"[!] SSL server binary not found at {ssl_server_path}")
+            return
 
-    def ipython_shell(self):
-        banner = "Interactive Python shell with loaded modules and binaries."
-        local_vars = {**self.loaded_modules, **self.loaded_binaries}
-        code.interact(banner=banner, local=local_vars)
+        try:
+            print(f"[+] Starting SSL server on {ip}:{port}...")
+            process = await asyncio.create_subprocess_exec(
+                str(ssl_server_path), ip, str(port),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.wait()
+        except Exception as e:
+            print(f"[!] SSL server exception: {e}")
 
-    def send_command(self, command: str):
-        """
-        Sends a command to the C library via the socket.
-        """
-        import socket
-        socket_path = "/tmp/brain.sock"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(socket_path)
-            client.sendall(command.encode())
-            response = client.recv(1024)
-            print(f"Response from C library: {response.decode()}")
+    def launch_all(self):
+        """Launches all servers in the background."""
+        self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
+        self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
+        print("[*] Background servers initialized.")
 
-
-async def main():
-    loader = FrameworkLoader(FRAMEWORK_ROOT)
-    loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        await loop.run_in_executor(executor, loader.ipython_shell)
+    def start_shell(self):
+        """Starts the interactive Python shell."""
+        print("\n--- Modular Security Framework Shell ---")
+        print("Type 'exit()' to quit.\n")
+        
+        local_vars = {
+            "loader": self,
+            "root": self.framework_root,
+            "asyncio": asyncio
+        }
+        code.interact(banner="Framework Interactive Shell", local=local_vars)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loader = FrameworkLoader(FRAMEWORK_ROOT)
+    try:
+        loader.launch_all()
+        loader.start_shell()
+    except KeyboardInterrupt:
+        print("\n[!] Shutting down...")
+    finally:
+        loader.runner.stop()
