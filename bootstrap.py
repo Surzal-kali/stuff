@@ -21,74 +21,46 @@ class FrameworkLoader:
         self.loaded_paths.add(str(self.framework_root))
         self.load_strap_modules()
 
-
     def load_strap_modules(self):
-        """
-        Loads all strap modules from the framework root directory.
-        """
-        for item in self.framework_root.iterdir():
-            if item.is_dir() and (item / '__init__.py').exists():
-                self.load_module(item.name)
-            elif item.is_file() and item.suffix in ['.so', '.exe']:
-                self.load_binary(item.name)
+        for strap_dir in self.framework_root.iterdir():
+            if strap_dir.is_dir() and (strap_dir / "__init__.py").exists():
+                module_name = strap_dir.name
+                if module_name not in self.loaded_modules:
+                    self.load_module(module_name, strap_dir)
 
-    def load_module(self, module_name: str):
-        """
-        Loads a Python module by name.
-        """
-        if module_name in self.loaded_modules:
-            return self.loaded_modules[module_name]
-
-        module_path = self.framework_root / module_name
-        spec = importlib.util.spec_from_file_location(module_name, module_path / '__init__.py')
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot find module {module_name}")
-
+    def load_module(self, module_name: str, module_path: Path):
+        spec = importlib.util.spec_from_file_location(module_name, module_path / "__init__.py")
+        if spec is None:
+            print(f"[-] Could not load module {module_name} from {module_path}")
+            return
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
         self.loaded_modules[module_name] = module
-        return module
+        self.loaded_paths.add(str(module_path))
+        if spec.loader is not None:
+            spec.loader.exec_module(module)
 
-    def load_binary(self, binary_name: str):
-        """
-        Loads a binary file by name.
-        """
+
+    def load_binary(self, binary_name: str, binary_path: Path):
         if binary_name in self.loaded_binaries:
             return self.loaded_binaries[binary_name]
+        try:
+            import ctypes
+            binary = ctypes.CDLL(str(binary_path))
+            self.loaded_binaries[binary_name] = binary
+            return binary
+        except Exception as e:
+            print(f"[-] Could not load binary {binary_name} from {binary_path}: {e}")
+            return None
 
-        binary_path = self.framework_root / binary_name
-        if not binary_path.exists():
-            raise FileNotFoundError(f"Cannot find binary {binary_name}")
 
-        self.loaded_binaries[binary_name] = binary_path
-        return binary_path
-
-    def get_loaded_modules(self):
-        """
-        Returns a dictionary of loaded modules.
-        """
-        return self.loaded_modules
-
-    def get_loaded_binaries(self):
-        """
-        Returns a dictionary of loaded binaries.
-        """
-        return self.loaded_binaries
-    
-    def interactive_shell(self):
-        """
-        Starts an interactive Python shell with the loaded modules and binaries in the context.
-        """
+    def ipython_shell(self):
+        banner = "Interactive Python shell with loaded modules and binaries."
         local_vars = {**self.loaded_modules, **self.loaded_binaries}
-        code.interact(local=local_vars)
+        code.interact(banner=banner, local=local_vars)
+
 
 if __name__ == "__main__":
     loader = FrameworkLoader(FRAMEWORK_ROOT)
-    print("Loaded modules:", loader.loaded_modules.keys())
-    print("Loaded binaries:", loader.loaded_binaries.keys())
-    interactive_shell = input("Do you want to start an interactive shell? (y/n): ")
-    if interactive_shell.lower() == 'y':
-        loader.interactive_shell()
-    else:
-        print("Exiting.")
+    loader.ipython_shell()
+    
