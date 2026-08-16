@@ -1,4 +1,3 @@
-
 import sys
 import code
 import tempfile
@@ -6,6 +5,8 @@ import shlex
 import importlib
 import importlib.util
 from pathlib import Path
+import asyncio
+import concurrent.futures
 
 FRAMEWORK_ROOT = Path(__file__).parent
 #[ ]TODO: rewrite
@@ -59,8 +60,24 @@ class FrameworkLoader:
         local_vars = {**self.loaded_modules, **self.loaded_binaries}
         code.interact(banner=banner, local=local_vars)
 
+    def send_command(self, command: str):
+        """
+        Sends a command to the C library via the socket.
+        """
+        import socket
+        socket_path = "/tmp/brain.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(socket_path)
+            client.sendall(command.encode())
+            response = client.recv(1024)
+            print(f"Response from C library: {response.decode()}")
+
+
+async def main():
+    loader = FrameworkLoader(FRAMEWORK_ROOT)
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        await loop.run_in_executor(executor, loader.ipython_shell)
 
 if __name__ == "__main__":
-    loader = FrameworkLoader(FRAMEWORK_ROOT)
-    loader.ipython_shell()
-    
+    asyncio.run(main())
