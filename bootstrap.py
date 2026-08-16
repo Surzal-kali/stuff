@@ -74,19 +74,7 @@ class FrameworkLoader:
         self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
         self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
         print("[*] Background servers initialized.")
-
-    def start_shell(self):
-        """Starts the interactive Python shell."""
-        print("\n--- Modular Security Framework Shell ---")
-        print("Type 'exit()' to quit.\n")
-        
-        local_vars = {
-            "loader": self,
-            "root": self.framework_root,
-            "asyncio": asyncio
-        }
-        code.interact(banner="Framework Interactive Shell", local=local_vars)
-
+#no more shell. to the web!
     def stop(self):
         """Stops all background tasks and the event loop."""
         print("[*] Stopping background tasks...")
@@ -109,7 +97,6 @@ if __name__ == "__main__":
     loader = FrameworkLoader(FRAMEWORK_ROOT)
     try:
         loader.launch_all()
-        loader.start_shell()
     except Exception as e:
         print(f"[-] Exception in main: {e}")
     except KeyboardInterrupt:
