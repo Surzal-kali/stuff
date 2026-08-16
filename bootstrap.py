@@ -33,17 +33,27 @@ class FrameworkLoader:
         self.active_tasks = []
 
     async def start_brain_server(self):
-        """Imports and starts the Brain listener."""
+        """Starts the Brain listener as a separate sidecar process."""
         try:
-            from listeners.thebrain import start_brain
-            print("[+] Starting Brain listener...")
-            await start_brain()
+            import subprocess
+            brain_script = self.framework_root / "listeners" / "thebrain.py"
+            if not brain_script.exists():
+                print(f"[!] Brain script not found at {brain_script}")
+                return
+
+            print("[+] Starting Brain sidecar...")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(brain_script),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            # We let it run as a sidecar process in the background
         except Exception as e:
-            print(f"[!] Brain server failed: {e}")
+            print(f"[!] Brain sidecar failed to launch: {e}")
 
     async def start_ssl_server(self, ip="0.0.0.0", port=4433):
         """Starts the SSL server binary as a subprocess."""
-        ssl_server_path = self.framework_root / "utils" / "plugins" / "ssl_server" / "ssl_server"
+        ssl_server_path = self.framework_root / "utils" / "plugins" / "sslserver" / "ssl_server"
         if not ssl_server_path.exists():
             print(f"[!] SSL server binary not found at {ssl_server_path}")
             return
