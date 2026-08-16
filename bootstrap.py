@@ -87,12 +87,32 @@ class FrameworkLoader:
         }
         code.interact(banner="Framework Interactive Shell", local=local_vars)
 
+    def stop(self):
+        """Stops all background tasks and the event loop."""
+        print("[*] Stopping background tasks...")
+        for task in self.active_tasks:
+            task.cancel()
+        self.runner.stop()
+        print("[*] All background tasks stopped.")
+
+
+
+    def reload_module(self, module):
+        """Reloads a previously imported module."""
+        try:
+            importlib.reload(module)
+            print(f"[+] Successfully reloaded {module.__name__}")
+        except Exception as e:
+            print(f"[-] Failed to reload {module.__name__}: {e}")
+
 if __name__ == "__main__":
     loader = FrameworkLoader(FRAMEWORK_ROOT)
     try:
         loader.launch_all()
         loader.start_shell()
+    except Exception as e:
+        print(f"[-] Exception in main: {e}")
     except KeyboardInterrupt:
         print("\n[!] Shutting down...")
     finally:
-        loader.runner.stop()
+        loader.stop()
