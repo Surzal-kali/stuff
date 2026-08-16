@@ -1,7 +1,7 @@
 import sqlite3
 
 
-class Database_Manager:
+class DatabaseManager:
     def __init__(self):
         self.conn = sqlite3.connect('ids.db')
         self.c = self.conn.cursor()
