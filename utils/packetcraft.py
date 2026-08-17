@@ -11,7 +11,7 @@ import cryptography
 from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
 
 TARGET_INTERFACE = "eth0" 
-#[ ]TODO: Rewrite! Needs to take advantage of poor cryptography, it's just sitting there
+#[ ]TODO:  Needs to take advantage of poor cryptography, it's just sitting there
 class PacketUtils:
     def dissect_packet(self, packet: scapy.Packet):
         """Dissect a packet."""

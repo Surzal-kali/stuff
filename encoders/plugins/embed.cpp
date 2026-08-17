@@ -18,8 +18,7 @@ static bool tail_initialized = false;
 constexpr std::size_t PAYLOAD_SIZE = sizeof(SHELL_PAYLOAD);
 const std::array<uint8_t, 4> OVERLAP_BUFFER = {0xDE, 0xAD, 0xBE, 0xEF}; // Example overlap buffer - sized as sliver of SHELL_PAYLOAD (size: PAYLOAD_SIZE bytes).
 
-//[ ] Write corresponding jmp and mov instructions and patterns for cross-chunk detection and handling.
-//[ ] Implement a more robust pattern detection mechanism that can handle edge cases and false positives 
+// [ ] TODO: Rewrite in python and take advantage of radare2's already existing seek/write functions. This will allow us to avoid reinventing the wheel and make the code more maintainable. :D
 const std::size_t MAX_BATCH_SIZE = 1024 * 1024; // 1 MB
 
 void reset_detector_state() {
@@ -145,7 +144,7 @@ int process_file_in_batches(
     return 0;
 }
 // Check per chunk permissions
-// [ ] Parse the elf header, then map executable regions, THEN run pattern matching 
+// Parse the elf header, then map executable regions, THEN run pattern matching 
 
 // Returns 0 on success, -1 on failure.
 int write_in_batches(

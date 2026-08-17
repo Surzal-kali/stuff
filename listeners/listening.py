@@ -7,12 +7,23 @@ import socket
 from asyncio import StreamReader, StreamWriter
 import argparse
 
-
 class TCPListener:
     def __init__(self, host='0.0.0.0', port=8888):
         self.host = host
         self.port = port
+        self.brain_socket = "/tmp/brain.sock"
 
+    async def send_to_brain(self, event_type, session_id, data):
+        try:
+            reader, writer = await asyncio.open_unix_connection(self.brain_socket)
+            # Send as "event|session_id|data"
+            payload = f"{event_type}|{session_id}|{data}"
+            writer.write(payload.encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception as e:
+            print(f"[!] Failed to send event to brain: {e}")
 
     async def start(self):
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
@@ -23,7 +34,10 @@ class TCPListener:
             await server.serve_forever()
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
         addr = writer.get_extra_info('peername')
-        print(f"\n[+] New Session established: {addr}")
+        session_id = hash(addr) & 0xFFFFFFFF
+        print(f"\n[+] New Session established: {addr} (ID: {session_id})")
+        
+        await self.send_to_brain("session_start", session_id, f"Connection from {addr}")
 
         # This creates a persistent session loop for each client
         try:
@@ -35,9 +49,11 @@ class TCPListener:
 
                     message = data.decode().strip()
                     print(f"[{addr}] Received: {message}")
+                    
+                    await self.send_to_brain("data_received", session_id, message)
 
                     # Echo back or send command (Example: basic interaction)
-                    response = f"Session {addr} acknowledged: {message}\n"
+                    response = f"Session {session_id} acknowledged: {message}\n"
                     writer.write(response.encode())
                     await writer.drain()
                     
@@ -47,6 +63,7 @@ class TCPListener:
         except Exception as e:
             print(f"[!] Error in session {addr}: {e}")
         finally:
+            await self.send_to_brain("session_end", session_id, f"Closing {addr}")
             print(f"[*] Closing session {addr}")
             writer.close()
             await writer.wait_closed()

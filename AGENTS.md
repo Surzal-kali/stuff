@@ -8,13 +8,13 @@ The framework follows a "Hybrid Glue" pattern where Python handles orchestration
 
 ### 🐍 Pythonic Modules
 - **Definition**: Pure Python packages/directories.
-- **Location**: Found in top-level directories (e.g., `listeners/`, `utils/`, `payloads/modules/`).
+- **Location**: Found in top-level directories (e.g., `listeners/`, `utils/`, `payloads/`).
 - **Convention**: Must contain an `__init__.py` to be recognized by the `FrameworkLoader` in `bootstrap.py`.
 - **Purpose**: Orchestration, API wrappers, configuration, and rapid feature development.
 
 ### ⚙️ Compiled Plugins
 - **Definition**: Shared objects (`.so`) compiled from C or C++ source.
-- **Location**: Source code is kept in the same folder as the resulting binary (e.g., `listeners/plugins/frameit.c` $\rightarrow$ `frameit.so`).
+- **Location**: Source code is kept in the same folder as the resulting binary (e.g., `listeners/plugins/frameit.c` > `frameit.so`).
 - **Convention**: 
     - Compiled with `-fPIC` and `-shared`.
     - Loaded via `ctypes.CDLL` in Python.
@@ -30,8 +30,8 @@ The framework follows a "Hybrid Glue" pattern where Python handles orchestration
 ## 📝 Development Guidelines for Agents
 
 1. **Language Choice**:
-    - If the task requires high-level logic, networking wrappers, or configuration $\rightarrow$ Create a **Python Module**.
-    - If the task requires raw memory access, custom assembly, or extreme performance $\rightarrow$ Create a **C/C++ Plugin**.
+    - If the task requires high-level logic, networking wrappers, or configuration > Create a **Python Module**.
+    - If the task requires raw memory access, custom assembly, or extreme performance > Create a **C/C++ Plugin**.
 2. **Adding Capability**:
     - To add a Python module: Create a folder with an `__init__.py`.
     - To add a C plugin: Create a `.c` file, compile to `.so` in the same folder, and ensure the Python side uses `ctypes` to map the function signatures.

@@ -33,7 +33,7 @@ SSL_CTX* create_context() {
 }
 
 int start_listening_socket() {
-    int server_fd, new_socket;
+    int server_fd;
     struct sockaddr_in address;
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -57,7 +57,7 @@ int start_listening_socket() {
     
 
 }
-void accept_new_connections(int server_fd, SSL_CTX *ctx) {
+SSL* accept_new_connections(int server_fd, SSL_CTX *ctx) {
     int new_socket;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
@@ -66,7 +66,7 @@ void accept_new_connections(int server_fd, SSL_CTX *ctx) {
     new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
     if (new_socket < 0) {
         perror("accept failed");
-        return;
+        return NULL;
     }
     
     // Create SSL structure for the new connection
@@ -74,31 +74,23 @@ void accept_new_connections(int server_fd, SSL_CTX *ctx) {
     if (ssl == NULL) {
         perror("SSL_new failed");
         close(new_socket);
-        return;
+        return NULL;
     }
     
     // Set the socket file descriptor for SSL
     SSL_set_fd(ssl, new_socket);
     
-    // Perform the SSL handshake //[ ]TODO: Pass the connection instead of closing it
+    // Perform the SSL handshake
     if (SSL_accept(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
         SSL_free(ssl);
         close(new_socket);
-        return;
+        return NULL;
     }
     
     printf("SSL connection established with client\n");
     
-    //Now we pass the connection to the encryption function
-    encrypt_data(ssl); //This is where we would pass the connection
-
-    // Clean up 
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(new_socket); //AHA here's the problem
-    return; // Return to main loop to accept more connections
-
+    return ssl; // Return the SSL session to the manager instead of closing it here
 }
 
 
@@ -120,6 +112,12 @@ void encrypt_data(SSL *ssl) {
     int n; // Rewrite to accept multiple client connections without freezing
     while ((n = SSL_read(ssl, buffer, BUFFER_SIZE - 1)) > 0) {
         buffer[n] = '\0';
+        
+        // [INSPECTION ENGINE HOOK]
+        // This is where the inspection engine would analyze the decrypted buffer
+        // before it gets echoed back or forwarded.
+        printf("[Inspection] Analyzing decrypted data: %s\n", buffer);
+
         printf("Received: %s\n", buffer);
         SSL_write(ssl, buffer, n);
     }
@@ -143,16 +141,23 @@ int main() {
     configure_context(ctx);
     // Create Socket
     int server_fd = start_listening_socket();
-    struct sockaddr_in address;
 
     while(1) {
-        //Accept + Encrypt in One Go :D //[ ]TODO add inspection engine to ssl connection lifecycle
-        accept_new_connections(server_fd, ctx);
+        
+        SSL *session = accept_new_connections(server_fd, ctx);
+        if (session) {
+            // For now, we still call encrypt_data to keep it functional,
+            // but we now have the session object to pass to an inspection engine.
+            encrypt_data(session);
+            
+            // Cleanup after the session ends
+            SSL_shutdown(session);
+            SSL_free(session);
+        }
     }
 
     //Obligatory Cleanup
     SSL_CTX_free(ctx);
     close(server_fd);
     return 0;
-    // (Technically unreachable but hey it makes me feel better)
 }

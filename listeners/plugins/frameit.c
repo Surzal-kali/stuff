@@ -6,7 +6,12 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-// we're making a .so for the brain to use, so we need to export the functions. The brain already makes the socket, so we just need to accept connections and read data from it. The brain will send us a string of data, which we will print to stdout.
+typedef struct {
+    char event_type[32];
+    int session_id;
+    char data[1024];
+    size_t data_len;
+} FrameworkEvent;
 
 // Reads exactly n bytes from fd into buf, looping over short reads. Returns 0 on success, -1 on error/EOF.
 static int read_exact(int fd, char *buf, size_t n) {
@@ -114,7 +119,7 @@ int main(int argc, char *argv[]) {
 }
 
 
-void send_command(const char *command) {
+void send_event(const FrameworkEvent *event) {
     int sock;
     struct sockaddr_un address;
 
@@ -126,7 +131,7 @@ void send_command(const char *command) {
 
     // Set up the address structure
     address.sun_family = AF_UNIX;
-    strncpy(address.sun_path, "/tmp/brain_socket", sizeof(address.sun_path) - 1); //address sun_path is the path to the socket file
+    strncpy(address.sun_path, "/tmp/brain_socket", sizeof(address.sun_path) - 1);
 
     // Connect to the server
     if (connect(sock, (struct sockaddr *)&address, sizeof(address)) == -1) {
@@ -135,17 +140,8 @@ void send_command(const char *command) {
         return;
     }
 
-    // Frame the command as "<len>:<payload>" so the reader knows exactly how many bytes to expect
-    char framed[1040];
-    int framed_len = snprintf(framed, sizeof(framed), "%zu:%s", strlen(command), command);
-    if (framed_len < 0 || (size_t)framed_len >= sizeof(framed)) {
-        fprintf(stderr, "command too long to frame\n");
-        close(sock);
-        return;
-    }
-
-    // Send the framed command
-    if (write(sock, framed, (size_t)framed_len) == -1) {
+    // Send the raw struct over the socket
+    if (write(sock, event, sizeof(FrameworkEvent)) == -1) {
         perror("write failed");
     }
 

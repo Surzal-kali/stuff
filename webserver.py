@@ -6,7 +6,7 @@ import asyncio
 app = FastAPI(title="Framework Control Panel")
 BRAIN_SOCKET = "/tmp/brain.sock"
 
-
+# [ ]TODO: Implement a more robust logging system, possibly with log rotation and different log levels, and change the endpoints after we're done with everything else. 
 # --- Models ---
 class CommandRequest(BaseModel):
     command: str
