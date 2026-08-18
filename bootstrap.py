@@ -48,6 +48,7 @@ class FrameworkLoader:
                 stderr=asyncio.subprocess.PIPE
             )
             # We let it run as a sidecar process in the background
+            # Optionally, you could store the process handle if you need to terminate it later
         except Exception as e:
             print(f"[!] Brain sidecar failed to launch: {e}")
 

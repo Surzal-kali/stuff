@@ -35,6 +35,13 @@ class FrameworkAPI:
                     })
             return modules
 
+
+        @self.app.post("/auxiliaries/smb_scan")
+        async def trigger_smb_scan(targets: List[str]):
+            from auxiliaries.smb_scanner import run_smb_recon
+            asyncio.create_task(run_smb_recon(targets))
+            return {"status": "scanning", "targets": targets}
+
         @self.app.post("/modules/reload")
         async def reload_module(module_name: str):
             """Actually calls the loader's reload logic"""
