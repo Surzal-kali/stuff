@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Security, WebSocket
+from fastapi import FastAPI, HTTPException, Security, WebSocket, Depends
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import os
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 import uvicorn
 from dotenv import load_dotenv
+from fastapi_mcp import FastApiMCP
 
 load_dotenv()
 
@@ -15,8 +16,11 @@ API_KEY = os.getenv("FRAMEWORK_API_KEY")
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
+if not API_KEY:
+    raise RuntimeError("FRAMEWORK_API_KEY must be set (refusing to start with auth disabled)")
+
 async def get_api_key(header_value: str = Security(api_key_header)):
-    if header_value == API_KEY:
+    if header_value and header_value == API_KEY:
         return header_value
     raise HTTPException(status_code=403, detail="Could not validate credentials")
 # Import framing.py directly (not via the listeners package, whose __init__
@@ -27,9 +31,11 @@ from listeners.framing import pack_message, read_message
 class FrameworkAPI:
     def __init__(self, loader):
         self.loader = loader
-        self.app = FastAPI(title="Framework Control Panel")
+        # dependency applied at app-level so every route (and the MCP tools built from them) requires the key
+        self.app = FastAPI(title="Framework Control Panel", dependencies=[Depends(get_api_key)])
         self.BRAIN_SOCKET = "/tmp/brain.sock"
         self._setup_routes()
+        self._setup_mcp()
 
     def _setup_routes(self):
         # --- 1. Dynamic Module Discovery ---
@@ -46,7 +52,32 @@ class FrameworkAPI:
                         "path": str(item.relative_to(self.loader.framework_root))
                     })
             return modules
+        @self.app.post("/compile")
+        async def compile_module(source_path: str):
+            """Compiles a .c plugin in-place to a .so, following the -fPIC/-shared plugin convention"""
+            src = (self.loader.framework_root / source_path).resolve()
+            try:
+                src.relative_to(self.loader.framework_root.resolve())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="source_path must stay inside the framework root")
+            if src.suffix != ".c" or not src.is_file():
+                raise HTTPException(status_code=400, detail="source_path must point to an existing .c file")
 
+            output_path = src.with_suffix(".so")
+            proc = await asyncio.create_subprocess_exec(
+                "gcc", "-fPIC", "-shared", "-O2", "-o", str(output_path), str(src),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise HTTPException(status_code=400, detail=stderr.decode(errors="replace"))
+            return {
+                "status": "success",
+                "source": str(src.relative_to(self.loader.framework_root)),
+                "output": str(output_path.relative_to(self.loader.framework_root)),
+                "stdout": stdout.decode(errors="replace"),
+            }
 
         @self.app.post("/auxiliaries/smb_scan")
         async def trigger_smb_scan(targets: List[str]):
@@ -94,6 +125,16 @@ class FrameworkAPI:
                 return {"status": "success", "response": response.decode()}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Brain Error: {e}")
+
+    def _setup_mcp(self):
+        """Exposes every REST route above as an MCP tool for model integrations."""
+        self.mcp = FastApiMCP(
+            self.app,
+            name="Framework Control Panel",
+            description="Model-facing tools for the Modular Security Framework control panel",
+            headers=[API_KEY_NAME],
+        )
+        self.mcp.mount_http(mount_path="/mcp")
 
     def run(self, host="0.0.0.0", port=8000):
         uvicorn.run(self.app, host=host, port=port)

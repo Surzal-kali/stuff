@@ -99,26 +99,37 @@ class FrameworkLoader:
             print(f"[-] Failed to reload {module.__name__}: {e}")
 
 if __name__ == "__main__":
+    daemon_mode = "--daemon" in sys.argv
     loader = FrameworkLoader(FRAMEWORK_ROOT)
     try:
         loader.launch_all()
-        while True:
-            user_input = input(">>> ")
-            if user_input.strip() == "exit":
-                break
-            elif user_input.startswith("reload "):
-                module_name = user_input.split(" ", 1)[1].strip()
-                try:
-                    module = importlib.import_module(module_name)
-                    loader.reload_module(module)
-                except ModuleNotFoundError:
-                    print(f"[-] Module {module_name} not found.")
-            else:
-                try:
-                    exec(user_input, globals())
-                except Exception as e:
-                    print(f"[-] Error executing command: {e}")
+        if daemon_mode:
+            import signal
+            shutdown_event = threading.Event()
+            signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
+            signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
+            shutdown_event.wait()
+        else:
+            while True:
+                user_input = input(">>> ")
+                if user_input.strip() == "exit":
+                    break
+                elif user_input.startswith("reload "):
+                    module_name = user_input.split(" ", 1)[1].strip()
+                    try:
+                        module = importlib.import_module(module_name)
+                        loader.reload_module(module)
+                    except ModuleNotFoundError:
+                        print(f"[-] Module {module_name} not found.")
+                else:
+                    try:
+                        exec(user_input, globals())
+                    except Exception as e:
+                        print(f"[-] Error executing command: {e}")
     except Exception as e:
+        with open("/tmp/framework_error.log", "w") as f:
+            f.write(str(e))
+            f.write("\n")
         print(f"[-] Exception in main: {e}")
     except KeyboardInterrupt:
         print("\n[!] Shutting down...")
