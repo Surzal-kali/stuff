@@ -74,7 +74,7 @@ class FrameworkLoader:
         self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
         self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
         print("[*] Background servers initialized.")
-#no more shell. to the web!
+
     def stop(self):
         """Stops all background tasks and the event loop."""
         print("[*] Stopping background tasks...")
@@ -97,6 +97,22 @@ if __name__ == "__main__":
     loader = FrameworkLoader(FRAMEWORK_ROOT)
     try:
         loader.launch_all()
+        while True:
+            user_input = input(">>> ")
+            if user_input.strip() == "exit":
+                break
+            elif user_input.startswith("reload "):
+                module_name = user_input.split(" ", 1)[1].strip()
+                try:
+                    module = importlib.import_module(module_name)
+                    loader.reload_module(module)
+                except ModuleNotFoundError:
+                    print(f"[-] Module {module_name} not found.")
+            else:
+                try:
+                    exec(user_input, globals())
+                except Exception as e:
+                    print(f"[-] Error executing command: {e}")
     except Exception as e:
         print(f"[-] Exception in main: {e}")
     except KeyboardInterrupt:
