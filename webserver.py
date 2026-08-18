@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 import uvicorn
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
+import importlib
 
 COMPILERS = {".c": "gcc", ".cpp": "g++", ".cc": "g++", ".cxx": "g++"}
 
@@ -17,6 +18,10 @@ class CompileRequest(BaseModel):
     source: Optional[str] = None  # inline content, written to source_path first - lets an AI iterate without a separate file-write step
     mode: str = "plugin"  # "syntax" (check only, no artifact) | "plugin" (.so via -fPIC -shared) | "binary" (standalone executable)
     defines: Optional[Dict[str, str]] = None  # rendered as -DKEY=VALUE, e.g. for listen.cpp's TARGET macro
+
+class LaunchRequest(BaseModel):
+    tool_name: str
+    args: Optional[List[str]] = None
 
 load_dotenv()
 
@@ -49,9 +54,9 @@ class FrameworkAPI:
         # --- 1. Dynamic Module Discovery ---
         @self.app.get("/modules")
         async def list_modules():
-            """Dynamically list files in the encoders/plugins directory"""
+            """Dynamically list files in a given directory"""
             modules = []
-            plugin_path = self.loader.framework_root / "encoders" / "plugins"
+            plugin_path = self.loader.framework_root / "auxiliaries"
             if plugin_path.exists():
                 for item in plugin_path.iterdir():
                     modules.append({
@@ -60,6 +65,35 @@ class FrameworkAPI:
                         "path": str(item.relative_to(self.loader.framework_root))
                     })
             return modules
+
+        @self.app.post("/launch")
+        async def launch_tool(req: LaunchRequest):
+            """Launches a registered Python tool in the background loop."""
+            if req.tool_name not in self.loader.tool_registry:
+                raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found in registry")
+            
+            module_path, func_name = self.loader.tool_registry[req.tool_name]
+            
+            async def execute():
+                try:
+                    import importlib
+                    mod = importlib.import_module(module_path)
+                    func = getattr(mod, func_name)
+                    
+                    if asyncio.iscoroutinefunction(func):
+                        await func(*(req.args or []))
+                    else:
+                        # Run blocking functions in a thread to avoid hanging the loop
+                        await asyncio.get_event_loop().run_in_executor(None, lambda: func(*(req.args or [])))
+                    
+                    return {"status": "completed"}
+                except Exception as e:
+                    return {"status": "failed", "error": str(e)}
+
+            # Schedule in background loop and return immediately
+            task = self.loader.runner.run_task(execute())
+            return {"status": "launched", "tool": req.tool_name, "task_id": id(task)}
+
         @self.app.post("/compile")
         async def compile_module(req: CompileRequest):
             """Compiles/syntax-checks a C or C++ plugin. Compiling never executes the result - running a
@@ -140,6 +174,19 @@ class FrameworkAPI:
                 "active_tasks_count": len(self.loader.active_tasks),
                 "loader_running": self.loader.runner.thread.is_alive()
             }
+        # we need a api post to execute the auxiliaries and pythonic scripts available
+        @self.app.post("/auxiliaries/execute")
+        async def execute_auxiliary(script_name: str, args: dict):
+            """Executes an auxiliary script with the given arguments"""
+            try:
+                module = importlib.import_module(f"auxiliaries.{script_name}")
+                if hasattr(module, "main"):
+                    result = await module.main(**args)
+                    return {"status": "success", "result": result}
+                else:
+                    raise HTTPException(status_code=400, detail="No main function found in the script")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Execution Error: {e}")
 
         # --- 3. Brain Integration ---
         @self.app.post("/sessions/{session_id}/inject")

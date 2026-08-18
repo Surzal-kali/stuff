@@ -31,6 +31,7 @@ class FrameworkLoader:
         self.framework_root = framework_root
         self.runner = AsyncBackgroundRunner()
         self.active_tasks = []
+        self.tool_registry = {}  # Mapping of tool_name -> (module_path, function_name)
 
     async def start_brain_server(self):
         """Starts the Brain listener as a separate sidecar process."""
@@ -72,6 +73,9 @@ class FrameworkLoader:
 
     def launch_all(self):
         """Launches all servers in the background."""
+        # Register default tools
+        self.tool_registry["smb_scan"] = ("auxiliaries.smb_scanner", "run_smb_recon")
+        
         self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
         self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
         self.api = FrameworkAPI(self)

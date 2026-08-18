@@ -1,4 +1,4 @@
-from packetcraft import PacketCraft, PacketUtils
+from utils.packetcraft import PacketCraft, PacketUtils
 from sessions import DatabaseManager
 import subprocess
 import sys
