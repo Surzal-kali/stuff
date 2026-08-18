@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Security, WebSocket
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import os
 import sys
@@ -6,7 +7,18 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional
 import uvicorn
+from dotenv import load_dotenv
 
+load_dotenv()
+
+API_KEY = os.getenv("FRAMEWORK_API_KEY")
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(header_value: str = Security(api_key_header)):
+    if header_value == API_KEY:
+        return header_value
+    raise HTTPException(status_code=403, detail="Could not validate credentials")
 # Import framing.py directly (not via the listeners package, whose __init__
 # has an unrelated pre-existing import bug) to avoid triggering it.
 sys.path.insert(0, str(Path(__file__).parent / "listeners"))

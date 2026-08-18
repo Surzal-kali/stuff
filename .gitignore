@@ -15,3 +15,5 @@ __pycache__/*
 /listeners/__pycache__/*
 *.exe
 __pycache__/webserver.cpython-313.pyc
+__pycache__/webserver.cpython-313.pyc
+.env
