@@ -1,5 +1,17 @@
 */__pycache__/
+__pycache__/
+__pycache__/*
 *.so
 WIP_*.*
 ids.db
 *.pem
+*.cpython-*-
+*.so
+__pycache__/*.pyc
+__pycache__/*.pyo
+*.pyc
+*.pyo
+__pycache__/*
+/listeners/__pycache__/*
+*.exe
+__pycache__/webserver.cpython-313.pyc

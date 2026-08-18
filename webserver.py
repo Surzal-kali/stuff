@@ -10,7 +10,7 @@ import uvicorn
 # Import framing.py directly (not via the listeners package, whose __init__
 # has an unrelated pre-existing import bug) to avoid triggering it.
 sys.path.insert(0, str(Path(__file__).parent / "listeners"))
-from framing import pack_message, read_message
+from listeners.framing import pack_message, read_message
 
 class FrameworkAPI:
     def __init__(self, loader):
