@@ -2,3 +2,4 @@
 *.so
 WIP_*.*
 ids.db
+*.pem
