@@ -5,10 +5,18 @@ import os
 import sys
 import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 import uvicorn
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
+
+COMPILERS = {".c": "gcc", ".cpp": "g++", ".cc": "g++", ".cxx": "g++"}
+
+class CompileRequest(BaseModel):
+    source_path: str
+    source: Optional[str] = None  # inline content, written to source_path first - lets an AI iterate without a separate file-write step
+    mode: str = "plugin"  # "syntax" (check only, no artifact) | "plugin" (.so via -fPIC -shared) | "binary" (standalone executable)
+    defines: Optional[Dict[str, str]] = None  # rendered as -DKEY=VALUE, e.g. for listen.cpp's TARGET macro
 
 load_dotenv()
 
@@ -53,30 +61,55 @@ class FrameworkAPI:
                     })
             return modules
         @self.app.post("/compile")
-        async def compile_module(source_path: str):
-            """Compiles a .c plugin in-place to a .so, following the -fPIC/-shared plugin convention"""
-            src = (self.loader.framework_root / source_path).resolve()
+        async def compile_module(req: CompileRequest):
+            """Compiles/syntax-checks a C or C++ plugin. Compiling never executes the result - running a
+            built artifact stays a separate, deliberate step (e.g. the loaders in bootstrap.py)."""
+            root = self.loader.framework_root.resolve()
+            src = (root / req.source_path).resolve()
             try:
-                src.relative_to(self.loader.framework_root.resolve())
+                src.relative_to(root)
             except ValueError:
                 raise HTTPException(status_code=400, detail="source_path must stay inside the framework root")
-            if src.suffix != ".c" or not src.is_file():
-                raise HTTPException(status_code=400, detail="source_path must point to an existing .c file")
+            if "plugins" not in src.parts:
+                raise HTTPException(status_code=400, detail="source_path must live under a 'plugins' directory")
+            if src.suffix not in COMPILERS:
+                raise HTTPException(status_code=400, detail=f"source_path must end in one of {list(COMPILERS)}")
 
-            output_path = src.with_suffix(".so")
+            if req.source is not None:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                src.write_text(req.source)
+            elif not src.is_file():
+                raise HTTPException(status_code=400, detail="source file does not exist and no inline source was provided")
+
+            compiler = COMPILERS[src.suffix]
+            define_flags = [f"-D{key}={value}" for key, value in (req.defines or {}).items()]
+
+            output_path: Optional[Path]
+            if req.mode == "syntax":
+                output_path = None
+                args = [compiler, "-fsyntax-only", *define_flags, str(src)]
+            elif req.mode == "plugin":
+                output_path = src.with_suffix(".so")
+                args = [compiler, "-fPIC", "-shared", "-O2", *define_flags, "-o", str(output_path), str(src)]
+            elif req.mode == "binary":
+                output_path = src.with_suffix("")
+                args = [compiler, "-O2", *define_flags, "-o", str(output_path), str(src)]
+            else:
+                raise HTTPException(status_code=400, detail="mode must be one of: syntax, plugin, binary")
+
             proc = await asyncio.create_subprocess_exec(
-                "gcc", "-fPIC", "-shared", "-O2", "-o", str(output_path), str(src),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
                 raise HTTPException(status_code=400, detail=stderr.decode(errors="replace"))
             return {
                 "status": "success",
-                "source": str(src.relative_to(self.loader.framework_root)),
-                "output": str(output_path.relative_to(self.loader.framework_root)),
+                "mode": req.mode,
+                "source": str(src.relative_to(root)),
+                "output": str(output_path.relative_to(root)) if output_path else None,
                 "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
             }
 
         @self.app.post("/auxiliaries/smb_scan")
