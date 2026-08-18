@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Security, WebSocket, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
 import sys
 import asyncio
@@ -14,20 +14,32 @@ import importlib
 COMPILERS = {".c": "gcc", ".cpp": "g++", ".cc": "g++", ".cxx": "g++"}
 
 class CompileRequest(BaseModel):
-    source_path: str
-    source: Optional[str] = None  # inline content, written to source_path first - lets an AI iterate without a separate file-write step
-    mode: str = "plugin"  # "syntax" (check only, no artifact) | "plugin" (.so via -fPIC -shared) | "binary" (standalone executable)
-    defines: Optional[Dict[str, str]] = None  # rendered as -DKEY=VALUE, e.g. for listen.cpp's TARGET macro
+    """Request body for compiling a C/C++ plugin or checking syntax.
+
+    Use this when you want to build a plugin under the framework's plugins tree
+    without running it immediately. The route enforces that source_path remains
+    under the framework root and that the file lives under a plugins directory.
+    """
+    source_path: str = Field(..., description="Relative path inside the framework root, usually under a plugins directory, e.g. listeners/plugins/raw_scan.cpp")
+    source: Optional[str] = Field(default=None, description="Optional inline source content to write to source_path before compiling")
+    mode: str = Field(default="plugin", description="Compilation mode: syntax, plugin, or binary")
+    defines: Optional[Dict[str, str]] = Field(default=None, description="Optional preprocessor defines to pass as -DKEY=VALUE flags")
 
 class LaunchRequest(BaseModel):
-    tool_name: str
-    args: Optional[List[str]] = None
+    """Request body for launching a registered framework tool by name."""
+    tool_name: str = Field(..., description="Registered tool name from the framework registry, such as smb_scan")
+    args: Optional[List[str]] = Field(default=None, description="Positional arguments to pass to the tool function")
 
 class SynScanRequest(BaseModel):
-    target: str
-    port: int
-    source_ip: Optional[str] = None
-    timeout_ms: int = 250
+    """Request body for a raw SYN scan against a target host or IP.
+
+    Note: this path uses raw TCP socket behavior and typically requires root or
+    CAP_NET_RAW privileges. It is intended for lab or privileged network testing.
+    """
+    target: str = Field(..., description="Target IP address to scan, e.g. 192.168.1.10")
+    port: int = Field(..., ge=1, le=65535, description="Destination TCP port to probe")
+    source_ip: Optional[str] = Field(default=None, description="Optional source IP to use for the scan packet. If omitted, the wrapper may default to a placeholder value.")
+    timeout_ms: int = Field(default=250, ge=1, le=5000, description="Socket receive timeout in milliseconds")
 
 load_dotenv()
 
@@ -64,7 +76,11 @@ class FrameworkAPI:
         # --- 1. Dynamic Module Discovery ---
         @self.app.get("/modules")
         async def list_modules():
-            """Dynamically list files in the auxiliaries directory"""
+            """List available auxiliary modules and plugin folders.
+
+            Use this to discover what capabilities are already built into the framework
+            before invoking a module or tool. Returns names, types, and relative paths.
+            """
             modules = []
             plugin_path = self.loader.framework_root / "auxiliaries"
             if plugin_path.exists():
@@ -78,7 +94,12 @@ class FrameworkAPI:
 
         @self.app.post("/launch")
         async def launch_tool(req: LaunchRequest):
-            """Launches a registered Python tool in the background loop."""
+            """Launch a registered framework tool in the background runner.
+
+            This is the generic execution path for framework capabilities that were
+            previously registered in the loader. Use it when you know the tool name and
+            want the framework to execute it asynchronously without blocking the API.
+            """
             if req.tool_name not in self.loader.tool_registry:
                 raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found in registry")
             
@@ -107,8 +128,13 @@ class FrameworkAPI:
 
         @self.app.post("/compile")
         async def compile_module(req: CompileRequest):
-            """Compiles/syntax-checks a C or C++ plugin. Compiling never executes the result - running a
-            built artifact stays a separate, deliberate step (e.g. the loaders in bootstrap.py)."""
+            """Compile or syntax-check a C/C++ plugin inside the framework tree.
+
+            This route is intended for building and validating native plugin code.
+            Use mode='syntax' for a fast compiler check, mode='plugin' to produce a .so,
+            or mode='binary' to compile a standalone executable. The source file must be
+            under a plugins directory inside the framework root.
+            """
             root = self.loader.framework_root.resolve()
             src = (root / req.source_path).resolve()
             try:
@@ -159,7 +185,13 @@ class FrameworkAPI:
 # --- 2. The Packet Bridge ---
         @self.app.post("/packets/send")
         async def send_custom_packet(request: Dict[str, Any]):
-            """Generic interface to PacketCraft recipes"""
+            """Send a crafted packet using a PacketCraft recipe.
+
+            Use this to emit custom network packets generated from an existing PacketCraft
+            method, such as a TCP, UDP, ICMP, DNS, or ARP packet. Supply a recipe name and
+            the matching keyword arguments in params. Set preview=true to inspect the packet
+            hex without transmitting it.
+            """
             if self.packet_tool is None:
                 raise HTTPException(status_code=503, detail="PacketCraft is unavailable; packet sending is disabled at startup.")
 
@@ -191,6 +223,11 @@ class FrameworkAPI:
 
         @self.app.post("/auxiliaries/smb_scan")
         async def trigger_smb_scan(targets: List[str]):
+            """Run the SMB reconnaissance auxiliary against a list of targets.
+
+            This schedules the SMB scanning routine in the background and returns immediately.
+            Use it when you want rapid host enumeration from the framework's auxiliary tooling.
+            """
             from auxiliaries.smb_scanner import run_smb_recon
             asyncio.create_task(run_smb_recon(targets))
             return {"status": "scanning", "targets": targets}
@@ -211,7 +248,11 @@ class FrameworkAPI:
         # --- 2. Live Process Status ---
         @self.app.get("/status")
         async def get_status():
-            """Check if the Unix socket exists and tasks are scheduled"""
+            """Return the current framework health summary.
+
+            This is the fastest way to confirm whether the brain socket is active,
+            whether background tasks are running, and whether the loader thread is healthy.
+            """
             return {
                 "brain_active": os.path.exists(self.BRAIN_SOCKET),
                 "active_tasks_count": len(self.loader.active_tasks),
@@ -220,7 +261,12 @@ class FrameworkAPI:
         # we need a api post to execute the auxiliaries and pythonic scripts available
         @self.app.post("/auxiliaries/execute")
         async def execute_auxiliary(script_name: str, args: dict):
-            """Executes an auxiliary script with the given arguments"""
+            """Execute a Python auxiliary module by name.
+
+            Provide the module name without the auxiliaries prefix and pass any keyword
+            arguments required by that module's main() function. This is the main entry
+            point for model-driven auxiliary execution.
+            """
             try:
                 module = importlib.import_module(f"auxiliaries.{script_name}")
                 if hasattr(module, "main"):
@@ -234,7 +280,12 @@ class FrameworkAPI:
         # --- 3. Brain Integration ---
         @self.app.post("/sessions/{session_id}/inject")
         async def inject_session(session_id: str, payload: str):
-            """Pipes directly into the Brain sidecar socket"""
+            """Inject a payload into a session through the brain sidecar socket.
+
+            Use this when you want to push a command or message directly into an active
+            session stream managed by the framework brain. The payload is wrapped in the
+            existing message format and sent over the Unix socket path.
+            """
             try:
                 reader, writer = await asyncio.open_unix_connection(path=self.BRAIN_SOCKET)
                 # Using your established triplet format: event|session_id|data
@@ -251,6 +302,12 @@ class FrameworkAPI:
 
         @self.app.post("/scan/syn")
         async def syn_scan_route(req: SynScanRequest):
+            """Perform a SYN scan against a target host on a single TCP port.
+
+            This is a privileged raw-socket scan intended for lab or controlled testing.
+            It returns a simple status payload, such as open, closed_or_filtered, or error.
+            Use it when you need a lightweight port probe without a full port scanner.
+            """
             try:
                 from listeners.raw_scan import syn_scan
                 result = syn_scan(
@@ -268,7 +325,7 @@ class FrameworkAPI:
         self.mcp = FastApiMCP(
             self.app,
             name="Framework Control Panel",
-            description="Model-facing tools for the Modular Security Framework control panel",
+            description="Model-facing toolset for the Modular Security Framework. Includes plugin compilation, module discovery, auxiliary execution, packet crafting, session injection, and SYN scanning operations.",
             headers=[API_KEY_NAME],
         )
         self.mcp.mount_http(mount_path="/mcp")
