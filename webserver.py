@@ -6,7 +6,7 @@ import os
 import sys
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import uvicorn
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
@@ -50,6 +50,10 @@ from listeners.framing import pack_message, read_message
 class FrameworkAPI:
     def __init__(self, loader):
         self.loader = loader
+        # PacketCraft is owned by the loader and is used by the packet routes.
+        # Keep an explicit instance attribute so type checkers and route
+        # handlers agree on where the packet tool comes from.
+        self.packet_tool = getattr(loader, "packet_tool", None)
         # dependency applied at app-level so every route (and the MCP tools built from them) requires the key
         self.app = FastAPI(title="Framework Control Panel", dependencies=[Depends(get_api_key)])
         self.BRAIN_SOCKET = "/tmp/brain.sock"
@@ -152,6 +156,38 @@ class FrameworkAPI:
                 "stdout": stdout.decode(errors="replace"),
                 "stderr": stderr.decode(errors="replace"),
             }
+# --- 2. The Packet Bridge ---
+        @self.app.post("/packets/send")
+        async def send_custom_packet(request: Dict[str, Any]):
+            """Generic interface to PacketCraft recipes"""
+            if self.packet_tool is None:
+                raise HTTPException(status_code=503, detail="PacketCraft is unavailable; packet sending is disabled at startup.")
+
+            recipe = request.get("recipe")
+            params = request.get("params", {})
+            preview = request.get("preview", False)
+
+            if not recipe:
+                raise HTTPException(status_code=400, detail="Missing 'recipe' parameter")
+
+            # Dynamically find the method in PacketCraft
+            method = getattr(self.packet_tool, f"craft_{recipe}" if not hasattr(self.packet_tool, recipe) else recipe, None)
+            
+            if not method or callable(method) == False:
+                raise HTTPException(status_code=404, detail=f"Recipe '{recipe}' not found in PacketCraft")
+
+            try:
+                # Generate the packet
+                packet = method(**params)
+                
+                if preview:
+                    return {"status": "preview", "hex": self.packet_tool.utils.export_packet_hex(packet)}
+                
+                # Send the packet
+                self.packet_tool.send_packet(packet)
+                return {"status": "sent", "recipe": recipe}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Packet error: {str(e)}")
 
         @self.app.post("/auxiliaries/smb_scan")
         async def trigger_smb_scan(targets: List[str]):

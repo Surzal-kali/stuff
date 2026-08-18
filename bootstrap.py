@@ -5,6 +5,7 @@ import threading
 import importlib
 from pathlib import Path
 from webserver import FrameworkAPI
+from utils.packetcraft import PacketCraft
 FRAMEWORK_ROOT = Path(__file__).parent
 
 class AsyncBackgroundRunner:
@@ -32,6 +33,12 @@ class FrameworkLoader:
         self.runner = AsyncBackgroundRunner()
         self.active_tasks = []
         self.tool_registry = {}  # Mapping of tool_name -> (module_path, function_name)
+        self.packet_tool = None
+        try:
+            from utils.packetcraft import PacketCraft
+            self.packet_tool = PacketCraft()
+        except Exception as exc:
+            print(f"[!] PacketCraft unavailable during startup: {exc}")
 
     async def start_brain_server(self):
         """Starts the Brain listener as a separate sidecar process."""
@@ -102,6 +109,10 @@ class FrameworkLoader:
         except Exception as e:
             print(f"[-] Failed to reload {module.__name__}: {e}")
 
+    def get_packet_tool(self):
+        """Returns the PacketCraft tool instance."""
+        return self.packet_tool
+
 if __name__ == "__main__":
     daemon_mode = "--daemon" in sys.argv
     loader = FrameworkLoader(FRAMEWORK_ROOT)
@@ -131,10 +142,14 @@ if __name__ == "__main__":
                     except Exception as e:
                         print(f"[-] Error executing command: {e}")
     except Exception as e:
-        with open("/tmp/framework_error.log", "w") as f:
-            f.write(str(e))
-            f.write("\n")
-        print(f"[-] Exception in main: {e}")
+        try:
+            with open("/tmp/framework_error.log", "w") as f:
+                f.write(str(e))
+                f.write("\n")
+        except PermissionError:
+            print(f"[-] Exception in main: {e}")
+        else:
+            print(f"[-] Exception in main: {e}")
     except KeyboardInterrupt:
         print("\n[!] Shutting down...")
     finally:

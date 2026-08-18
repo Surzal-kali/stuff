@@ -1,5 +1,5 @@
-from utils.packetcraft import PacketCraft, PacketUtils
-from sessions import DatabaseManager
+from .packetcraft import PacketCraft, PacketUtils
+from .sessions import DatabaseManager
 import subprocess
 import sys
 __all__ = ['PacketCraft', 'PacketUtils', 'DatabaseManager']
