@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Security, WebSocket, Depends
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import os
@@ -10,7 +11,6 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
 import importlib
-
 COMPILERS = {".c": "gcc", ".cpp": "g++", ".cc": "g++", ".cxx": "g++"}
 
 class CompileRequest(BaseModel):
@@ -22,6 +22,12 @@ class CompileRequest(BaseModel):
 class LaunchRequest(BaseModel):
     tool_name: str
     args: Optional[List[str]] = None
+
+class SynScanRequest(BaseModel):
+    target: str
+    port: int
+    source_ip: Optional[str] = None
+    timeout_ms: int = 250
 
 load_dotenv()
 
@@ -54,7 +60,7 @@ class FrameworkAPI:
         # --- 1. Dynamic Module Discovery ---
         @self.app.get("/modules")
         async def list_modules():
-            """Dynamically list files in a given directory"""
+            """Dynamically list files in the auxiliaries directory"""
             modules = []
             plugin_path = self.loader.framework_root / "auxiliaries"
             if plugin_path.exists():
@@ -88,7 +94,8 @@ class FrameworkAPI:
                     
                     return {"status": "completed"}
                 except Exception as e:
-                    return {"status": "failed", "error": str(e)}
+                    return JSONResponse(status_code=500, content={"status": "failed", "detail": str(e)})
+                    # return {"status": "failed", "error": str(e)}  # Removed redundant return
 
             # Schedule in background loop and return immediately
             task = self.loader.runner.run_task(execute())
@@ -206,6 +213,20 @@ class FrameworkAPI:
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Brain Error: {e}")
 
+        @self.app.post("/scan/syn")
+        async def syn_scan_route(req: SynScanRequest):
+            try:
+                from listeners.raw_scan import syn_scan
+                result = syn_scan(
+                    target_ip=req.target,
+                    port=req.port,
+                    source_ip=req.source_ip,
+                    timeout_ms=req.timeout_ms,
+                )
+                return result
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
     def _setup_mcp(self):
         """Exposes every REST route above as an MCP tool for model integrations."""
         self.mcp = FastApiMCP(
@@ -218,3 +239,12 @@ class FrameworkAPI:
 
     def run(self, host="0.0.0.0", port=8000):
         uvicorn.run(self.app, host=host, port=port)
+
+    def add_tool(self, tool_name: str, module_path: str, func_name: str):
+        """Adds a custom tool to the framework."""
+        self.loader.tool_registry[tool_name] = (module_path, func_name)
+        self._setup_mcp()
+
+    def add_syn_scan_tool(self):
+        """Adds the syn_scan tool to the framework."""
+        self.loader.tool_registry["syn_scan"] = ("listeners.raw_scan", "syn_scan")

@@ -18,9 +18,9 @@ The framework is an MCP-enabled pipeline that follows a "Hybrid Glue" pattern wh
 - **Definition**: Shared objects (`.so`) compiled from C or C++ source.
 - **Location**: Source code is kept in the same folder as the resulting binary (e.g., `listeners/plugins/frameit.c` > `frameit.so`).
 - **Convention**:
-    - Compiled with `-fPIC` and `-shared`.
-    - Loaded via `ctypes.CDLL` in Python.
-    - Follows the "C to Raw Byte Array Pipeline" for payloads (see `C_TO_BYTE_ARRAY_PIPELINE.md`).
+    Compiled with `-fPIC` and `-shared`.
+    Loaded via `ctypes.CDLL` in Python.
+    Follows the "C to Raw Byte Array Pipeline" for payloads (see `C_TO_BYTE_ARRAY_PIPELINE.md`).
 - **Purpose**: Low-level system calls, raw packet manipulation, and high-performance execution.
 
 ## 🛠 Key Components & "Glue" Logic
