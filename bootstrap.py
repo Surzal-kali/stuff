@@ -74,6 +74,9 @@ class FrameworkLoader:
         self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
         self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
         self.api = FrameworkAPI(self)
+        self.api_thread = threading.Thread(target=self.api.run, kwargs={"host": "0.0.0.0", "port": 8000}, daemon=True)
+        self.api_thread.start()
+        print("[+] API Control Panel started on port 8000")
         print("[*] Background servers initialized.")
 
     def stop(self):
