@@ -3,6 +3,8 @@ import os
 import socket
 import ctypes
 
+from framing import pack_message, read_message
+
 EVENT_HANDLERS = {}
 
 class FrameworkEvent(ctypes.Structure):
@@ -29,16 +31,22 @@ if os.path.exists(socket_path):
 
 async def start_brain():
     async def handle_client(reader, writer):
-        data = await reader.read(1024)
+        try:
+            data = await read_message(reader)
+        except (asyncio.IncompleteReadError, ValueError) as e:
+            print(f"Dropped connection: {e}")
+            writer.close()
+            return
+
         message = data.decode()
-        
+
         # Parse the event triplet: "event|session_id|data"
         try:
             event_type, session_id, payload = message.split('|', 2)
             session_id = int(session_id)
         except ValueError:
             print(f"Malformed event received: {message}")
-            writer.write(b"Error: Malformed event")
+            writer.write(pack_message(b"Error: Malformed event"))
             await writer.drain()
             writer.close()
             return
@@ -53,7 +61,7 @@ async def start_brain():
         event.data_len = len(payload)
         
         await dispatch(event)
-        writer.write(b"Event dispatched.")
+        writer.write(pack_message(b"Event dispatched."))
         await writer.drain()
         writer.close()
     server = await asyncio.start_unix_server(handle_client, path=socket_path)
@@ -70,5 +78,9 @@ async def dispatch(event):
         # Default: forward to the C library if no Python handler is found
         loop = asyncio.get_event_loop()
         loop.run_in_executor(None, lib.send_event, ctypes.byref(event))
+
+if __name__ == "__main__":
+    asyncio.run(start_brain())
+
 
 

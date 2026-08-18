@@ -4,7 +4,7 @@ import asyncio
 import threading
 import importlib
 from pathlib import Path
-
+from webserver import FrameworkAPI
 FRAMEWORK_ROOT = Path(__file__).parent
 
 class AsyncBackgroundRunner:
@@ -73,6 +73,7 @@ class FrameworkLoader:
         """Launches all servers in the background."""
         self.active_tasks.append(self.runner.run_task(self.start_brain_server()))
         self.active_tasks.append(self.runner.run_task(self.start_ssl_server()))
+        self.api = FrameworkAPI(self)
         print("[*] Background servers initialized.")
 
     def stop(self):

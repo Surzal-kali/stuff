@@ -7,6 +7,8 @@ import socket
 from asyncio import StreamReader, StreamWriter
 import argparse
 
+from framing import pack_message
+
 class TCPListener:
     def __init__(self, host='0.0.0.0', port=8888):
         self.host = host
@@ -16,9 +18,10 @@ class TCPListener:
     async def send_to_brain(self, event_type, session_id, data):
         try:
             reader, writer = await asyncio.open_unix_connection(self.brain_socket)
-            # Send as "event|session_id|data"
+            # Send as "event|session_id|data", length-prefixed so thebrain.py
+            # can read the exact message even if it's split across TCP frames
             payload = f"{event_type}|{session_id}|{data}"
-            writer.write(payload.encode())
+            writer.write(pack_message(payload.encode()))
             await writer.drain()
             writer.close()
             await writer.wait_closed()
