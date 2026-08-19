@@ -59,6 +59,7 @@ class MemorySearchRequest(BaseModel):
     namespace: str = Field(..., description="Memory namespace to search, e.g. intel or sessions")
     query_text: Optional[str] = Field(default=None, description="Text keyword to match within stored documents")
     query_embedding: Optional[List[float]] = Field(default=None, description="Optional embedding to run semantic similarity search")
+    session_id: Optional[str] = Field(default=None, description="Optional session identifier to scope the memory search to a single runtime session")
     limit: int = Field(default=5, ge=1, le=25, description="Maximum number of results")
 
 class MemoryRememberRequest(BaseModel):
@@ -67,6 +68,7 @@ class MemoryRememberRequest(BaseModel):
     memory_id: str = Field(..., description="Stable unique identifier for the memory")
     text: str = Field(..., description="Human-readable content to be stored")
     embedding: List[float] = Field(..., description="Embedding vector for similarity search")
+    session_id: Optional[str] = Field(default=None, description="Optional session identifier associated with this memory entry")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional additional metadata")
 
 load_dotenv()
@@ -356,14 +358,24 @@ class FrameworkAPI:
                 raise HTTPException(status_code=400, detail="Either query_text or query_embedding must be provided")
 
             if req.query_text is not None:
-                hits = self.memory.search(namespace=req.namespace, query_text=req.query_text, limit=req.limit)
-                return {"namespace": req.namespace, "query_text": req.query_text, "hits": hits}
+                hits = self.memory.search(
+                    namespace=req.namespace,
+                    query_text=req.query_text,
+                    limit=req.limit,
+                    session_id=req.session_id,
+                )
+                return {"namespace": req.namespace, "query_text": req.query_text, "session_id": req.session_id, "hits": hits}
 
             if req.query_embedding is not None:
-                hits = self.memory.recall(namespace=req.namespace, query_embedding=req.query_embedding, limit=req.limit)
-                return {"namespace": req.namespace, "query_embedding": req.query_embedding, "hits": hits}
+                hits = self.memory.recall(
+                    namespace=req.namespace,
+                    query_embedding=req.query_embedding,
+                    limit=req.limit,
+                    session_id=req.session_id,
+                )
+                return {"namespace": req.namespace, "query_embedding": req.query_embedding, "session_id": req.session_id, "hits": hits}
 
-            return {"namespace": req.namespace, "hits": []}
+            return {"namespace": req.namespace, "session_id": req.session_id, "hits": []}
 
         @self.app.post("/memory/remember")
         async def remember_memory(req: MemoryRememberRequest):
@@ -374,9 +386,10 @@ class FrameworkAPI:
                 memory_id=req.memory_id,
                 text=req.text,
                 embedding=req.embedding,
+                session_id=req.session_id,
                 **payload,
             )
-            return {"namespace": req.namespace, "memory_id": memory_id, "status": "stored"}
+            return {"namespace": req.namespace, "memory_id": memory_id, "session_id": req.session_id, "status": "stored"}
 
     def _setup_mcp(self):
         """Exposes every REST route above as an MCP tool for model integrations."""

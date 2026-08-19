@@ -14,6 +14,13 @@ class MemoryService:
         self.client = chromadb.PersistentClient(path=self.storage_path)
         self._collections: dict[str, Any] = {}
 
+    @staticmethod
+    def _normalize_session_id(session_id: str | None) -> str | None:
+        if session_id is None:
+            return None
+        session_id = str(session_id).strip()
+        return session_id or None
+
     def _namespace_name(self, namespace: str) -> str:
         namespace = str(namespace).strip()
         if not namespace:
@@ -28,6 +35,16 @@ class MemoryService:
                 metadata={"hnsw:space": "cosine"},
             )
         return self._collections[name]
+
+    @staticmethod
+    def _build_filters(session_id: str | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        filters: dict[str, Any] = {}
+        normalized_session_id = MemoryService._normalize_session_id(session_id)
+        if normalized_session_id is not None:
+            filters["session_id"] = normalized_session_id
+        if extra:
+            filters.update({key: value for key, value in extra.items() if value is not None})
+        return filters or None
 
     def list_namespaces(self) -> list[str]:
         """Return all namespaces that currently have a collection."""
@@ -45,25 +62,39 @@ class MemoryService:
         memory_id: str,
         text: str,
         embedding: list[float],
+        session_id: str | None = None,
         **metadata: Any,
     ) -> str:
         collection = self._get_collection(namespace)
+        normalized_session_id = self._normalize_session_id(session_id)
+        payload = dict(metadata)
+        if normalized_session_id is not None:
+            payload["session_id"] = normalized_session_id
         collection.upsert(
             ids=[str(memory_id)],
             documents=[str(text)],
             embeddings=[list(embedding)],
-            metadatas=[dict(metadata)],
+            metadatas=[payload],
         )
         return str(memory_id)
 
-    def search(self, namespace: str, query_text: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search(
+        self,
+        namespace: str,
+        query_text: str,
+        limit: int = 5,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Simple keyword-style search over stored document text within a namespace."""
         collection = self._get_collection(namespace)
         query = str(query_text).strip()
         if not query:
             return []
 
-        results = collection.get(include=["documents", "metadatas"])
+        results = collection.get(
+            where=self._build_filters(session_id=session_id),
+            include=["documents", "metadatas"],
+        )
         ids = results.get("ids", [])
         documents = results.get("documents", [])
         metadatas = results.get("metadatas", [])
@@ -88,11 +119,13 @@ class MemoryService:
         namespace: str,
         query_embedding: list[float],
         limit: int = 5,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         collection = self._get_collection(namespace)
         results = collection.query(
             query_embeddings=[list(query_embedding)],
             n_results=max(1, int(limit)),
+            where=self._build_filters(session_id=session_id),
             include=["documents", "metadatas", "distances"],
         )
 
@@ -113,9 +146,13 @@ class MemoryService:
             )
         return hits
 
-    def get(self, namespace: str, memory_id: str) -> dict[str, Any] | None:
+    def get(self, namespace: str, memory_id: str, session_id: str | None = None) -> dict[str, Any] | None:
         collection = self._get_collection(namespace)
-        result = collection.get(ids=[str(memory_id)], include=["documents", "metadatas", "embeddings"])
+        result = collection.get(
+            ids=[str(memory_id)],
+            where=self._build_filters(session_id=session_id),
+            include=["documents", "metadatas", "embeddings"],
+        )
         ids = result.get("ids", [])
         if not ids or str(memory_id) not in ids:
             return None
@@ -136,7 +173,12 @@ class MemoryService:
 _default_service = MemoryService()
 
 
-def store_embedding(key: str, embedding: list[float], namespace: str = "shared") -> str:
+def store_embedding(
+    key: str,
+    embedding: list[float],
+    namespace: str = "shared",
+    session_id: str | None = None,
+) -> str:
     """Compatibility wrapper for storing a raw embedding under a namespaced key."""
     return _default_service.remember(
         namespace=namespace,
@@ -144,18 +186,23 @@ def store_embedding(key: str, embedding: list[float], namespace: str = "shared")
         text=key,
         embedding=list(embedding),
         source="embedding",
+        session_id=session_id,
     )
 
 
-def retrieve_embedding(key: str, namespace: str = "shared") -> tuple[list[float] | None, str | None]:
+def retrieve_embedding(
+    key: str,
+    namespace: str = "shared",
+    session_id: str | None = None,
+) -> tuple[list[float] | None, str | None]:
     """Compatibility wrapper returning the stored embedding and id for a key."""
-    result = _default_service.get(namespace=namespace, memory_id=key)
+    result = _default_service.get(namespace=namespace, memory_id=key, session_id=session_id)
     if result is None:
         return None, None
     return result.get("embedding"), result.get("id")
 
 
-def store_id(key: str, id_value: str, namespace: str = "shared") -> str:
+def store_id(key: str, id_value: str, namespace: str = "shared", session_id: str | None = None) -> str:
     """Compatibility wrapper for storing a key-to-id mapping in a namespace."""
     return _default_service.remember(
         namespace=namespace,
@@ -164,13 +211,18 @@ def store_id(key: str, id_value: str, namespace: str = "shared") -> str:
         embedding=[0.0],
         source="id",
         key=str(key),
+        session_id=session_id,
     )
 
 
-def retrieve_id(key: str, namespace: str = "shared") -> str:
+def retrieve_id(key: str, namespace: str = "shared", session_id: str | None = None) -> str:
     """Compatibility wrapper for retrieving the id assigned to a key."""
     collection = _default_service._get_collection(namespace)
-    results = collection.get(where={"key": str(key)}, include=["ids", "metadatas"])
+    where = {"key": str(key)}
+    normalized = MemoryService._normalize_session_id(session_id)
+    if normalized is not None:
+        where["session_id"] = normalized
+    results = collection.get(where=where, include=["ids", "metadatas"])
     ids = results.get("ids", [])
     return ids[0] if ids else ""
 
