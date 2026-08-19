@@ -11,6 +11,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
 import importlib
+from memories import MemoryService
 COMPILERS = {".c": "gcc", ".cpp": "g++", ".cc": "g++", ".cxx": "g++"}
 
 class CompileRequest(BaseModel):
@@ -41,6 +42,33 @@ class SynScanRequest(BaseModel):
     source_ip: Optional[str] = Field(default=None, description="Optional source IP to use for the scan packet. If omitted, the wrapper may default to a placeholder value.")
     timeout_ms: int = Field(default=250, ge=1, le=5000, description="Socket receive timeout in milliseconds")
 
+class PacketSendRequest(BaseModel):
+    """Request body for sending a custom packet using a PacketCraft recipe.
+
+    Use this to emit custom network packets generated from an existing PacketCraft
+    method, such as a TCP, UDP, ICMP, DNS, or ARP packet. Supply a recipe name and
+    the matching keyword arguments in params. Set preview=true to inspect the packet
+    hex without transmitting it.
+    """
+    recipe: str = Field(..., description="PacketCraft recipe name")
+    params: Dict[str, Any] = Field(default_factory=dict, description="Recipe parameters")
+    preview: bool = Field(default=False, description="Whether to preview without sending")
+
+class MemorySearchRequest(BaseModel):
+    """Request body for searching the framework memory vault."""
+    namespace: str = Field(..., description="Memory namespace to search, e.g. intel or sessions")
+    query_text: Optional[str] = Field(default=None, description="Text keyword to match within stored documents")
+    query_embedding: Optional[List[float]] = Field(default=None, description="Optional embedding to run semantic similarity search")
+    limit: int = Field(default=5, ge=1, le=25, description="Maximum number of results")
+
+class MemoryRememberRequest(BaseModel):
+    """Request body for storing a frame fact in the memory vault."""
+    namespace: str = Field(..., description="Namespace to store the memory under")
+    memory_id: str = Field(..., description="Stable unique identifier for the memory")
+    text: str = Field(..., description="Human-readable content to be stored")
+    embedding: List[float] = Field(..., description="Embedding vector for similarity search")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional additional metadata")
+
 load_dotenv()
 
 API_KEY = os.getenv("FRAMEWORK_API_KEY")
@@ -62,6 +90,7 @@ from listeners.framing import pack_message, read_message
 class FrameworkAPI:
     def __init__(self, loader):
         self.loader = loader
+        self.memory = MemoryService(storage_path=str(Path(loader.framework_root) / ".memory" / "chroma"))
         # PacketCraft is owned by the loader and is used by the packet routes.
         # Keep an explicit instance attribute so type checkers and route
         # handlers agree on where the packet tool comes from.
@@ -184,7 +213,7 @@ class FrameworkAPI:
             }
 # --- 2. The Packet Bridge ---
         @self.app.post("/packets/send")
-        async def send_custom_packet(request: Dict[str, Any]):
+        async def send_custom_packet(req: PacketSendRequest):
             """Send a crafted packet using a PacketCraft recipe.
 
             Use this to emit custom network packets generated from an existing PacketCraft
@@ -195,9 +224,9 @@ class FrameworkAPI:
             if self.packet_tool is None:
                 raise HTTPException(status_code=503, detail="PacketCraft is unavailable; packet sending is disabled at startup.")
 
-            recipe = request.get("recipe")
-            params = request.get("params", {})
-            preview = request.get("preview", False)
+            recipe = req.recipe
+            params = req.params
+            preview = req.preview
 
             if not recipe:
                 raise HTTPException(status_code=400, detail="Missing 'recipe' parameter")
@@ -319,6 +348,35 @@ class FrameworkAPI:
                 return result
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.post("/memory/search")
+        async def search_memory(req: MemorySearchRequest):
+            """Search the framework memory store by keyword or embedding similarity."""
+            if req.query_text is None and req.query_embedding is None:
+                raise HTTPException(status_code=400, detail="Either query_text or query_embedding must be provided")
+
+            if req.query_text is not None:
+                hits = self.memory.search(namespace=req.namespace, query_text=req.query_text, limit=req.limit)
+                return {"namespace": req.namespace, "query_text": req.query_text, "hits": hits}
+
+            if req.query_embedding is not None:
+                hits = self.memory.recall(namespace=req.namespace, query_embedding=req.query_embedding, limit=req.limit)
+                return {"namespace": req.namespace, "query_embedding": req.query_embedding, "hits": hits}
+
+            return {"namespace": req.namespace, "hits": []}
+
+        @self.app.post("/memory/remember")
+        async def remember_memory(req: MemoryRememberRequest):
+            """Store a memory entry in the framework memory store."""
+            payload = dict(req.metadata or {})
+            memory_id = self.memory.remember(
+                namespace=req.namespace,
+                memory_id=req.memory_id,
+                text=req.text,
+                embedding=req.embedding,
+                **payload,
+            )
+            return {"namespace": req.namespace, "memory_id": memory_id, "status": "stored"}
 
     def _setup_mcp(self):
         """Exposes every REST route above as an MCP tool for model integrations."""

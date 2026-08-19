@@ -10,8 +10,8 @@ import time
 import cryptography
 from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
 
-TARGET_INTERFACE = "eth0" 
-#[ ]TODO:  Needs to take advantage of poor cryptography, it's just sitting there
+TARGET_INTERFACE = "enp92s0"
+#[ ]TODO:  Needs to take advantage of poor cryptography, it's just sitting there {muy importante now that its on mcp}
 class PacketUtils:
     def dissect_packet(self, packet: scapy.Packet):
         """Dissect a packet."""
