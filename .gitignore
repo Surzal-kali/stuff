@@ -17,3 +17,4 @@ __pycache__/*
 __pycache__/webserver.cpython-313.pyc
 __pycache__/webserver.cpython-313.pyc
 .env
+*.sqlite3
