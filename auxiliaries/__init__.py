@@ -1,4 +1,5 @@
-from ..utils.networkscan import NetworkScanner
+from .nmap import Nmap
+from .paramiko import ParamikoClient 
 
 
-__all__ = ["NetworkScanner"]
+__all__ = ["Nmap", "ParamikoClient"]

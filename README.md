@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project was born out of a desire to understand the architecture of professional security frameworks like Metasploit. Rather than just using existing tools, I wanted to understand how a framework manages modules, handles cross-language communication, and orchestrates security tasks.
+This project was born out of a desire to understand the architecture of professional security frameworks like Metasploit. It has quickly evolved to be a headless/mcp server for ML model orchestration and security research.
 
 ## Technical Architecture
 
@@ -11,6 +11,10 @@ The framework utilizes a hybrid approach to balance performance and flexibility:
 - **C++ Core:** Used for low-level systems interaction and high-performance execution.
 
 - **Python Wrapper/Orchestration:** Used for rapid development of modules, automation, and a more flexible user interface.
+
+- **Memory Service:** Provides persistent, namespaced vector memory for cross-harness recall.
+
+- **MCP Server:** Manages the orchestration of ML models and facilitates communication between different components of the framework.
 
 ## Learning Objectives
 

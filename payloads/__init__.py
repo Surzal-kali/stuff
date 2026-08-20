@@ -2,7 +2,7 @@ import subprocess
 import sys
 import asyncio
 from pathlib import Path
-
+from .metasploiting import MetasploitClient
 
 listener = Path(__file__).parent / "plugins" / "listen.cpp"
 
@@ -29,3 +29,5 @@ def execute_tcp(ip="127.0.0.1", port=4444):
         print(f"[+] Successfully executed {binary_path} with IP: {ip} and Port: {port}")
     except subprocess.CalledProcessError as e:
         print(f"[-] Execution failed: {e}")
+
+__all__ = ["MetasploitClient", "compile_tcp", "execute_tcp"]

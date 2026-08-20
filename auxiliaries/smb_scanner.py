@@ -1,6 +1,15 @@
 import asyncio
+import importlib.util
 from impacket.smbconnection import SMBConnection
 from pathlib import Path
+
+_FRAMING_PATH = Path(__file__).resolve().parent.parent / "framing.py"
+_FRAMING_SPEC = importlib.util.spec_from_file_location("framing", _FRAMING_PATH)
+if _FRAMING_SPEC is None or _FRAMING_SPEC.loader is None:
+    raise ImportError(f"Unable to load framing module from {_FRAMING_PATH}")
+_FRAMING = importlib.util.module_from_spec(_FRAMING_SPEC)
+_FRAMING_SPEC.loader.exec_module(_FRAMING)
+pack_message = _FRAMING.pack_message
 
 class SMBScanner:
     def __init__(self, brain_socket="/tmp/brain.sock"):
@@ -14,8 +23,6 @@ class SMBScanner:
             # We use a dummy session_id 0 for general recon events
             payload = f"{event_type}|0|{data}"
             
-            # Assuming we use the pack_message from your framing.py
-            from framing import pack_message 
             writer.write(pack_message(payload.encode()))
             await writer.drain()
             writer.close()
@@ -23,7 +30,7 @@ class SMBScanner:
         except Exception as e:
             print(f"[!] Brain reporting failed: {e}")
 
-    def check_null_session(self, target):
+    def check_null_session(self, target, remote):
         """Attempts a Null Session connection to a target SMB share."""
         try:
             # timeout=2 to keep the scan moving
@@ -41,7 +48,7 @@ class SMBScanner:
         for target in targets:
             # Run the blocking Impacket call in a thread to avoid freezing the loop
             loop = asyncio.get_event_loop()
-            is_vuln = await loop.run_in_executor(None, self.check_null_session, target)
+            is_vuln = await loop.run_in_executor(None, self.check_null_session, target, "C$")
             
             if is_vuln:
                 print(f"[+] Target {target} is vulnerable to Null Sessions!")

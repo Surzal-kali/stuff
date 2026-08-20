@@ -19,3 +19,6 @@ __pycache__/webserver.cpython-313.pyc
 .env
 *.sqlite3
 *.memory/
+tests/*
+tests/__pycache__/*
+*.txt
