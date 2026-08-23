@@ -9,3 +9,8 @@ class Nmap:
         command = f"nmap {options} {self.target}"
         result = subprocess.run(command, shell=True, capture_output=True, text=True)
         return result.stdout
+
+
+async def run_nmap(target, options=""):
+    nmap = Nmap(target)
+    return nmap.scan(options)
