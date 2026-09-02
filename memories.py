@@ -13,7 +13,18 @@ class MemoryService:
         self.storage_path = str(Path(storage_path))
         self.client = chromadb.PersistentClient(path=self.storage_path)
         self._collections: dict[str, Any] = {}
-
+    def create_collection(self, namespace: str, embedding_model: str = "nomic-embed-text"):
+        """Create a new collection for a given namespace."""
+        name = self._namespace_name(namespace)
+        if name in self._collections:
+            raise ValueError(f"Collection for namespace '{namespace}' already exists.")
+        collection = self.client.get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=embedding_model,
+        )
+        self._collections[name] = collection
+        return collection
     @staticmethod
     def _normalize_session_id(session_id: str | None) -> str | None:
         if session_id is None:

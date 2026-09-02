@@ -16,3 +16,5 @@ void send_event(const FrameworkEvent *event) {
            event->session_id, 
            event->data);
 }
+//to compile the code, use the following command:
+// gcc -shared -o frameit.so -fPIC frameit.c

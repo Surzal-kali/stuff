@@ -3,7 +3,7 @@ import importlib.util
 from impacket.smbconnection import SMBConnection
 from pathlib import Path
 
-_FRAMING_PATH = Path(__file__).resolve().parent.parent / "framing.py"
+_FRAMING_PATH = Path(__file__).resolve().parent.parent / "listeners" / "framing.py"
 _FRAMING_SPEC = importlib.util.spec_from_file_location("framing", _FRAMING_PATH)
 if _FRAMING_SPEC is None or _FRAMING_SPEC.loader is None:
     raise ImportError(f"Unable to load framing module from {_FRAMING_PATH}")
