@@ -22,3 +22,4 @@ __pycache__/webserver.cpython-313.pyc
 tests/*
 tests/__pycache__/*
 *.txt
+dockertings/weaviate_data/*
