@@ -1,36 +1,28 @@
 import os
 import json
 import sys
-from pathlib import Path
-from pydantic import BaseModel, Field
-import chromadb # Changed from weaviate
-from chromadb.config import Settings
-import httpx # 
-from pydantic_ai import (
-    Agent,
-    ModelMessage,
-    ModelMessagesTypeAdapter,
-    ModelRequest,
-    ModelResponse,
-    ModelSettings,
-    TextPart,
-    UnexpectedModelBehavior,
-    UserPromptPart
-)
-from pydantic_ai.models.ollama import OllamaModel
-from pydantic_ai.providers.ollama import OllamaProvider
-from pydantic_ai.output import NativeOutput
-from typing import Dict, List, Optional
-from enum import Enum
-import numpy as np # For cosine similarity
+import logging
 import asyncio
 import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Union
+from enum import Enum
+import httpx
+from pydantic import BaseModel, Field, ValidationError
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 
-from memories import MemoryService
-KNOWN_MCP_SERVERS = {
-    "metasploit": "http://localhost:55552", 
-}
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://100.66.181.0:11434/v1")
+# --- Setup Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://100.66.181.0:11434/v1").rstrip("/")
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "9000"))
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
@@ -42,21 +34,16 @@ ALLOWED_TOOL_ROOTS = [
     (WORKSPACE_ROOT / "encoders").resolve(),
 ]
 
+# --- Transport Type ---
 class TransportType(Enum):
-    """Transport mechanism for tool execution."""
     LOCAL_FILE = "local_file"
-    MCP_HTTP = "mcp_http"
+    MCP_RPC = "mcp_rpc"
 
-from chromadb.utils import embedding_functions
-from typing import List
-import httpx
-
-class OllamaEmbeddingFunction(chromadb.EmbeddingFunction):
+# --- Ollama Embedding Function ---
+class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
     def __init__(self, model_name: str = "nomic-embed-text", base_url: str = OLLAMA_BASE_URL):
         self.model_name = model_name
-        self.base_url = base_url.rstrip("/")
-        if self.base_url.endswith("/v1"):
-            self.base_url = self.base_url[:-3]
+        self.base_url = base_url.rstrip("/v1")
         self.embed_url = f"{self.base_url}/api/embed"
 
     def __call__(self, texts: List[str]) -> List[List[float]]:
@@ -72,70 +59,77 @@ class OllamaEmbeddingFunction(chromadb.EmbeddingFunction):
                     return payload["embeddings"]
                 raise ValueError(f"Unexpected Ollama embedding response: {payload}")
 
-        # Run the async function synchronously (ChromaDB expects sync)
-        import asyncio
         return asyncio.run(embed_async())
 
     def name(self) -> str:
         return self.model_name
 
+# --- Tool Manifest ---
 class ToolManifest(BaseModel):
-    module_id: str = Field(..., min_length=1) # e.g., "MOD-412"
-    internal_semantic_capability: str = Field(..., min_length=1) # Used for embedding/LFM lookup
-    external_sanitized_description: str = Field(..., min_length=1) # What the main model sees
-    parameters: dict = Field(default_factory=dict)
-    implementation_path: str = Field(..., min_length=1) # e.g., "auxiliaries/smb_scanner.py"
+    module_id: str = Field(..., min_length=1)
+    internal_semantic_capability: str = Field(..., min_length=1)
+    external_sanitized_description: str = Field(..., min_length=1)
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    implementation_path: str = Field(..., min_length=1)
     internal_semantics: str = Field(..., min_length=1)
-    transport: TransportType = TransportType.LOCAL_FILE # Transport mechanism
-    endpoint: Optional[str] = None # MCP HTTP endpoint URL
-    tool_name: Optional[str] = None # Actual tool name in the implementation
-    
+    transport: TransportType = TransportType.LOCAL_FILE
+    endpoint: Optional[str] = None
+    tool_name: Optional[str] = None
 
     @classmethod
-    def from_output(cls, payload):
+    def from_output(cls, payload: Any) -> Union["ToolManifest", List["ToolManifest"]]:
         if isinstance(payload, cls):
             return payload
+        if isinstance(payload, list):
+            return [cls.from_output(item) for item in payload]
         if isinstance(payload, dict):
+            # Handle Metasploit module dictionary mapping
+            # MSF modules usually have 'name' and 'description'
+            if 'name' in payload or 'description' in payload:
+                mapped_payload = {
+                    "module_id": payload.get('name', 'unknown_module'),
+                    "internal_semantic_capability": payload.get('description', 'No description provided'),
+                    "external_sanitized_description": payload.get('description', 'No description provided'),
+                    "implementation_path": f"msf://{payload.get('name', 'unknown_module')}",
+                    "internal_semantics": payload.get('description', 'No description provided'),
+                    "transport": TransportType.MCP_RPC,
+                    "endpoint": "metasploit"
+                }
+                return cls.model_validate(mapped_payload)
             return cls.model_validate(payload)
         if hasattr(payload, "model_dump"):
             return cls.model_validate(payload.model_dump())
         raise TypeError(f"Unsupported ToolManifest payload: {type(payload).__name__}")
 
-
-#for testing we'll bring out gemma4:12b
-model = OllamaModel("gemma4:12b", provider=OllamaProvider(base_url=OLLAMA_BASE_URL))
-#this will be the secretary agent that will handle the requests to the model anything that is directly tied to a module in name must be semantically "translated" back to the main model. module #1 vs module ms17_eb ya feel?
-
-#we'll need vectors and an embedding agent to allocate the full lot of the tools
-
-secretary_model = OllamaModel("lfm2.5-thinking:1.2b", provider=OllamaProvider(base_url=OLLAMA_BASE_URL))
-
-agent = Agent(model, output_type=NativeOutput)
-
-secretary = Agent(secretary_model, output_type=ToolManifest)
-
-embeddings = OllamaModel("nomic-embed-text", provider=OllamaProvider(base_url=OLLAMA_BASE_URL))
-
-
+# --- Tool Registry ---
 class ToolRegistry:
-    def __init__(self, embedding_model: OllamaEmbeddingFunction, mcp_servers: Optional[Dict[str, str]] = None):
+    def __init__(self, embedding_model: OllamaEmbeddingFunction, rpc_servers: Optional[Dict[str, str]] = None):
         self.embedding_model = embedding_model
-        self.mcp_servers = mcp_servers or {}
+        self.rpc_registry = rpc_servers or {}
         self.client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
         self.collection = self.client.get_or_create_collection(
             name="tool_inventory",
             metadata={"hnsw:space": "cosine"},
-            embedding_function=self.embedding_model,  # Now a proper embedding function
+            embedding_function=self.embedding_model,
         )
+        self.secretary = self._init_secretary_agent()
+
+    def _init_secretary_agent(self):
+        from pydantic_ai import Agent
+        from pydantic_ai.models.ollama import OllamaModel
+        from pydantic_ai.providers.ollama import OllamaProvider
+        model = OllamaModel("lfm2.5-thinking:1.2b", provider=OllamaProvider(base_url=OLLAMA_BASE_URL))
+        return Agent(model, output_type=ToolManifest)
+
     @staticmethod
-    def _ensure_valid_manifest(manifest):
+    def _ensure_valid_manifest(manifest: Any) -> ToolManifest:
         try:
             return ToolManifest.from_output(manifest)
-        except Exception as exc:
+        except ValidationError as exc:
             raise ValueError(f"Invalid ToolManifest payload: {exc}") from exc
 
     @staticmethod
-    def _resolve_script_path(script_path: str) -> Path:
+    def _resolve_script_path(script_path: Union[str, Path]) -> Path:
         candidate = Path(script_path)
         if not candidate.is_absolute():
             candidate = (WORKSPACE_ROOT / candidate).resolve()
@@ -146,7 +140,7 @@ class ToolRegistry:
             for try_path in ALLOWED_TOOL_ROOTS
         )
         if not allowed:
-            raise ValueError(f"Script path is outside the allowed workspace roots: {script_path}")
+            raise ValueError(f"Script path is outside allowed workspace roots: {script_path}")
         return candidate
 
     async def _embed_text(self, text: str):
@@ -158,7 +152,7 @@ class ToolRegistry:
         Derives the embed endpoint from OLLAMA_BASE_URL by stripping /v1 suffix.
         """
         if hasattr(self.embedding_model, "embed"):
-            return await self.embedding_model.embed(text)
+            return self.embedding_model.embed_query(text)
 
         # Strip /v1 suffix from OLLAMA_BASE_URL to get the base endpoint
         embed_base = OLLAMA_BASE_URL.rstrip("/")
@@ -188,68 +182,33 @@ class ToolRegistry:
 
         raise ValueError(f"Unexpected Ollama embedding response: {payload}")
 
-    async def register_tool(self, manifest: ToolManifest):
-        manifest = self._ensure_valid_manifest(manifest)
+    async def register_tool(self, manifest: Union[ToolManifest, List[ToolManifest]]):
+        manifests = manifest if isinstance(manifest, list) else [manifest]
+        results = []
+        for m in manifests:
+            m = self._ensure_valid_manifest(m)
 
-        if manifest.transport == TransportType.LOCAL_FILE:
-            manifest.implementation_path = str(self._resolve_script_path(manifest.implementation_path))
+            if m.transport == TransportType.LOCAL_FILE:
+                m.implementation_path = str(self._resolve_script_path(m.implementation_path))
+            existing = self.collection.get(ids=[m.module_id], include=[])
+            if existing and existing.get("ids"):
+                continue
 
-            # If this is an MCP wrapper, auto-generate an MCP manifest
-            if "MCP wrapper" in manifest.internal_semantics:
-                mcp_manifest = await self._generate_mcp_manifest(manifest)
-                await self._register_mcp_manifest(mcp_manifest)
+            vector = await self._embed_text(m.internal_semantic_capability)
+            self.collection.add(
+                ids=[m.module_id],
+                embeddings=[list(vector)],
+                metadatas=[{
+                    "internal_semantics": m.internal_semantics,
+                    "external_description": m.external_sanitized_description,
+                    "implementation_path": m.implementation_path,
+                    "transport": m.transport.value,
+                }],
+                documents=[m.internal_semantic_capability]
+            )
+            results.append(m.module_id)
+        return results
 
-        existing = self.collection.get(ids=[manifest.module_id], include=[])
-        if existing and existing.get("ids"):
-            return
-
-        vector = await self._embed_text(manifest.internal_semantic_capability)
-        self.collection.add(
-            ids=[manifest.module_id],
-            embeddings=[vector],
-            metadatas=[{
-                "internal_semantics": manifest.internal_semantics,
-                "external_description": manifest.external_sanitized_description,
-                "implementation_path": manifest.implementation_path,
-                "transport": manifest.transport.value,
-            }],
-            documents=[manifest.internal_semantic_capability]
-        )
-
-    async def _generate_mcp_manifest(self, manifest: ToolManifest) -> ToolManifest:
-        """Generate an MCP-compatible manifest for a local MCP wrapper."""
-        return ToolManifest(
-            module_id=f"mcp:{manifest.module_id}",
-            internal_semantic_capability=f"MCP tool: {manifest.internal_semantic_capability}",
-            external_sanitized_description=f"Metasploit tool: {manifest.external_sanitized_description}",
-            parameters={},
-            implementation_path=manifest.implementation_path,
-            internal_semantics=f"MCP wrapper for {manifest.internal_semantics}",
-            transport=TransportType.MCP_HTTP,
-            endpoint=KNOWN_MCP_SERVERS.get("metasploit", "http://localhost:5000"),  # Default MCP endpoint
-            tool_name=manifest.module_id.split(":")[-1],
-        )
-
-    async def _register_mcp_manifest(self, manifest: ToolManifest):
-        """Register an MCP manifest (e.g., for auto-generated MCP tools)."""
-        existing = self.collection.get(ids=[manifest.module_id], include=[])
-        if existing and existing.get("ids"):
-            return
-
-        vector = await self._embed_text(manifest.internal_semantic_capability)
-        self.collection.add(
-            ids=[manifest.module_id],
-            embeddings=[vector],
-            metadatas=[{
-                "internal_semantics": manifest.internal_semantics,
-                "external_description": manifest.external_sanitized_description,
-                "implementation_path": manifest.implementation_path,
-                "transport": manifest.transport.value,
-                "endpoint": manifest.endpoint,
-                "tool_name": manifest.tool_name,
-            }],
-            documents=[manifest.internal_semantic_capability]
-        )
     def discover_local_tools(self, root: Optional[str | Path] = None, include_tests: bool = False):
         """Discover Python modules in the workspace and convert them into ToolManifest objects.
 
@@ -306,16 +265,6 @@ class ToolRegistry:
         for i, manifest in enumerate(discovered, 1):
             print(f"[{i}/{len(discovered)}] Registering {manifest.module_id}...")
             await self.register_tool(manifest)
-
-        # Ingest tools from known MCP servers
-        for server_name, server_url in KNOWN_MCP_SERVERS.items():
-            print(f"[bootstrap] Ingesting tools from MCP server: {server_name} ({server_url})...")
-            try:
-                await self.ingest_mcp_server(server_url, server_name)
-                print(f"[bootstrap] Successfully ingested tools from {server_name}.")
-            except Exception as exc:
-                print(f"[bootstrap] Failed to ingest tools from {server_name}: {exc}")
-
         total = len(self.collection.get(include=[]).get("ids", []))
         print(f"[bootstrap] Complete! Total tools registered: {total}")
         return total
@@ -400,20 +349,6 @@ class ToolRegistry:
                 print(f"[MCP] Executing MCP wrapper: {manifest.module_id}")
             return await self._execute_local_script(manifest.implementation_path, arguments)
 
-        elif manifest.transport == TransportType.MCP_HTTP:
-            if not manifest.endpoint or not manifest.tool_name:
-                raise ValueError("endpoint and tool_name required for MCP_HTTP transport")
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{manifest.endpoint.rstrip('/')}/tools/call",
-                    json={
-                        "tool_name": manifest.tool_name,
-                        "arguments": arguments or {}
-                    }
-                )
-                response.raise_for_status()
-                return response.json()
-
         raise ValueError(f"Unsupported transport type: {manifest.transport}")
     
     async def _execute_local_script(self, script_path: str, arguments: dict):
@@ -451,7 +386,7 @@ if __name__ == "__main__":
     # we need a startup script to scan the repo for its tools and register them into the vector database for the main model to use. 
     import sys
     try:
-        registry = ToolRegistry(embedding_model="nomic-embed-text", mcp_servers=KNOWN_MCP_SERVERS)
+        registry = ToolRegistry(embedding_model=OllamaEmbeddingFunction())
         
         # Clear the collection if --clear flag is passed
         if "--clear" in sys.argv:
@@ -471,4 +406,5 @@ if __name__ == "__main__":
         print(f"[bootstrap] Error: {e}")
         import traceback
         traceback.print_exc()
+
 

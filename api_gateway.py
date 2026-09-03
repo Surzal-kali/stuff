@@ -21,7 +21,6 @@ class APIGateway:
         self.tool_registry = tool_registry
         self.memory_service = memory_service
         self.app = FastAPI()
-
         @self.app.post("/tools/execute")
         async def execute_tool(req: ToolRequest):
             manifest = await self.tool_registry.find_best_tool(req.intent)
@@ -45,15 +44,14 @@ class APIGateway:
                 query_embedding=req.query_embedding,
                 limit=req.limit,
             )
-
-if __name__ == "__main__":
+async def run(loader, host="127.0.0.1", port=6000):
     # Initialize the embedding function
     embedding_function = OllamaEmbeddingFunction(model_name="nomic-embed-text")
 
     # Initialize ToolRegistry with the embedding function
     tool_registry = ToolRegistry(
         embedding_model=embedding_function,
-        mcp_servers={"metasploit": "http://localhost:55552"},
+        rpc_servers={"metasploit": "http://localhost:55552"},
     )
 
     # Initialize MemoryService
@@ -63,4 +61,6 @@ if __name__ == "__main__":
     # Start the API gateway
     api_gateway = APIGateway(tool_registry, memory_service)
     import uvicorn
-    uvicorn.run(api_gateway.app, host="127.0.0.1", port=6000)
+    config = uvicorn.Config(api_gateway.app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
