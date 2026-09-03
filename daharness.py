@@ -322,6 +322,9 @@ class ToolRegistry:
         meta = metadatas[0][0]
         doc = documents[0][0]
 
+        # LOGGING: Record the tool being selected for the given intent
+        logger.info(f"[TOOL_ACTIVATION] Intent: '{user_intent}' -> Selected Tool ID: {best_id} | Capability: {doc}")
+
         # Fix: Cast metadata values to str to satisfy ToolManifest type requirements
         return ToolManifest(
             module_id=best_id,
@@ -342,6 +345,9 @@ class ToolRegistry:
 
     async def execute_tool(self, manifest: ToolManifest, arguments: dict):
         manifest = self._ensure_valid_manifest(manifest)
+
+        # LOGGING: Record actual execution start
+        logger.info(f"[TOOL_EXECUTE] Executing Tool ID: {manifest.module_id} | Path: {manifest.implementation_path} | Args: {arguments}")
 
         if manifest.transport == TransportType.LOCAL_FILE:
             # If this is an MCP wrapper, log it
@@ -374,7 +380,8 @@ class ToolRegistry:
             return {
                 "stdout": result.stdout,
                 "stderr": result.stderr,
-                "return_code": result.returncode
+                "return_code": result.returncode,
+                "status": "Success" if result.returncode == 0 else "Failed"
             }
         except subprocess.TimeoutExpired:
             return {"error": "Script execution timed out", "return_code": -1}

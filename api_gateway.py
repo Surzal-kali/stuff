@@ -7,6 +7,9 @@ class ToolRequest(BaseModel):
     intent: str
     arguments: Optional[dict] = None
 
+class ToolLookupRequest(BaseModel):
+    tool_id: str
+
 class MemorySearchRequest(BaseModel):
     namespace: str
     query_text: Optional[str] = None
@@ -26,7 +29,22 @@ class APIGateway:
             manifest = await self.tool_registry.find_best_tool(req.intent)
             if not manifest:
                 raise HTTPException(404, "No tool found for intent")
-            return await self.tool_registry.execute_tool(manifest, req.arguments or {})
+            
+            execution_result = await self.tool_registry.execute_tool(manifest, req.arguments or {})
+            
+            # Return the result along with identifying information about the tool used
+            return {
+                "tool_id": manifest.module_id,
+                "tool_name": manifest.external_sanitized_description,
+                "result": execution_result
+            }
+
+        @self.app.post("/tools/lookup")
+        async def lookup_tool(req: ToolLookupRequest):
+            manifest = await self.tool_registry.get_tool_by_id(req.tool_id)
+            if not manifest:
+                raise HTTPException(404, "Tool ID not found")
+            return self.tool_registry.get_sanitized_view(manifest)
 
         @self.app.post("/memory/search")
         async def search_memory(req: MemorySearchRequest):
