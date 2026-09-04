@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -33,18 +35,13 @@ class APIGateway:
             execution_result = await self.tool_registry.execute_tool(manifest, req.arguments or {})
             
             # Return the result along with identifying information about the tool used
+            logging.info(f"Executed tool {manifest.module_id} for intent '{req.intent}' with result: {execution_result}")
             return {
                 "tool_id": manifest.module_id,
                 "tool_name": manifest.external_sanitized_description,
                 "result": execution_result
             }
-
-        @self.app.post("/tools/lookup")
-        async def lookup_tool(req: ToolLookupRequest):
-            manifest = await self.tool_registry.get_tool_by_id(req.tool_id)
-            if not manifest:
-                raise HTTPException(404, "Tool ID not found")
-            return self.tool_registry.get_sanitized_view(manifest)
+        logging.basicConfig(level=logging.INFO)
 
         @self.app.post("/memory/search")
         async def search_memory(req: MemorySearchRequest):

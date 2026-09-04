@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 FRAMEWORK_ROOT = Path(__file__).parent
-MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://localhost:3000").rstrip("/")
+MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://localhost:55552").rstrip("/")
 MCP_STARTUP_DELAY = float(os.getenv("MCP_STARTUP_DELAY", "5"))
 MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
-MSF_RPC_PASSWORD = os.getenv("MSF_RPC_PASSWORD", "msfadmin4824")
+MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55552"))
 
 # --- Async Background Runner ---
@@ -115,7 +115,7 @@ class FrameworkLoader:
 
                     from pymetasploit3.msfrpc import MsfRpcClient
                     client = MsfRpcClient(
-                        password=MSF_RPC_PASSWORD,
+                        password=MSGRPC_PASSWORD,
                         port=MSF_RPC_PORT,
                         ssl=False
                     )
@@ -220,6 +220,7 @@ class FrameworkLoader:
         self.active_tasks.append(asyncio.create_task(self.start_brain_server()))
         self.active_tasks.append(asyncio.create_task(self.start_ssl_server()))
         self.active_tasks.append(asyncio.create_task(self.start_api_server()))
+        self.active_tasks.append(asyncio.create_task(self.start_metasploit_mcp()))
 
         # Blocking: Metasploit RPC
         await self.start_metasploit_mcp()
