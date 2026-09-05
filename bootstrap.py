@@ -114,22 +114,11 @@ class FrameworkLoader:
                     logger.info("[+] Connecting to MSF RPC for tool discovery...")
                     await asyncio.sleep(MCP_STARTUP_DELAY)
 
-                    from pymetasploit3.msfrpc import MsfRpcClient
-                    client = MsfRpcClient(
-                        password=MSGRPC_PASSWORD,
-                        port=MSF_RPC_PORT,
-                        ssl=False
-                    )
-                    logger.info("[+] MSF RPC connection established.")
-                    modules = client.modules.search(match="")
-                    
-                    # modules might be a ModuleManager or a list depending on the version/query
-                    module_list = modules if isinstance(modules, list) else getattr(modules, 'modules', [])
-                    logger.info("[+] %d modules retrieved from MSF RPC.", len(module_list))
-
-                    total = await self.vector_registry.register_tool(module_list)
-                    registered_count = len(total) if isinstance(total, list) else total
-                    logger.info("[+] RPC Vectorization complete. %d tools registered.", registered_count)
+                    # Instead of indexing all MSF modules, we rely on the dynamic 
+                    # discovery of @framework_tool functions in metasploiting.py
+                    # performed by discover_local_tools().
+                    logger.info("[+] Skipping full MSF RPC module indexing to reduce noise.")
+                    logger.info("[+] Indexing only high-level framework tools.")
                 except Exception as rpc_exc:
                     logger.error("[!] MSF RPC connection failed: %s", rpc_exc, exc_info=True)
 
@@ -222,9 +211,8 @@ class FrameworkLoader:
         self.active_tasks.append(asyncio.create_task(self.start_ssl_server()))
         self.active_tasks.append(asyncio.create_task(self.start_api_server()))
         self.active_tasks.append(asyncio.create_task(self.start_metasploit_mcp()))
-
-        # Blocking: Metasploit RPC
-        await self.start_metasploit_mcp()
+        
+        
         logger.info("[+] API Control Panel started on port 6000")
         logger.info("[*] Background servers initialized.")
 
@@ -243,9 +231,11 @@ async def run_framework():
             await shutdown_event.wait()
         else:
             # Interactive mode (restricted)
+            logger.info("[*] Indexing framework tools...")
+            await loader.vector_registry.bootstrap_registry()
             logger.info("[*] Entering interactive mode. Type 'exit' to quit.")
             while True:
-                    await _chat(registry=ToolRegistry(embedding_model=OllamaEmbeddingFunction(), rpc_servers={"metasploit": MCP_ENDPOINT}))
+                    await _chat(registry=loader.vector_registry)
                     break
     except Exception as e:
         logger.error("[-] Exception in main: %s", e, exc_info=True)

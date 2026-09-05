@@ -3,15 +3,8 @@ import importlib.util
 from impacket.smbconnection import SMBConnection
 from pathlib import Path
 
-from listeners.thebrain import framework_tool
-
-_FRAMING_PATH = Path(__file__).resolve().parent.parent / "listeners" / "framing.py"
-_FRAMING_SPEC = importlib.util.spec_from_file_location("framing", _FRAMING_PATH)
-if _FRAMING_SPEC is None or _FRAMING_SPEC.loader is None:
-    raise ImportError(f"Unable to load framing module from {_FRAMING_PATH}")
-_FRAMING = importlib.util.module_from_spec(_FRAMING_SPEC)
-_FRAMING_SPEC.loader.exec_module(_FRAMING)
-pack_message = _FRAMING.pack_message
+from constants import framework_tool
+from listeners.thebrain import pack_message
 
 class SMBScanner:
     def __init__(self, brain_socket="/tmp/brain.sock"):

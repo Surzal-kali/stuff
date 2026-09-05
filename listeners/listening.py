@@ -7,8 +7,8 @@ import socket
 from asyncio import StreamReader, StreamWriter
 import argparse
 
-from framing import pack_message
-from listeners.thebrain import framework_tool
+from listeners.thebrain import pack_message
+from constants import framework_tool
 
 class TCPListener:
     def __init__(self, host='0.0.0.0', port=8888):

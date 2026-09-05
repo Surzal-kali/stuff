@@ -272,6 +272,10 @@ class ToolRegistry:
         # take a full-metadata summary dict and return a truthy value to approve.
         self.confirmer = confirmer or _cli_confirmer
         self.secretary = self._init_secretary_agent()
+        
+        # Removed automatic background bootstrap to avoid race conditions 
+        # and duplicate indexing when called explicitly from bootstrap.py
+
 
     def _init_secretary_agent(self, model: Optional[Any] = None):
         """Build the conversational tool secretary.
@@ -597,59 +601,6 @@ class ToolRegistry:
 
                 rel_path = path.relative_to(WORKSPACE_ROOT)
                 
-                # --- PASS 1: Static Analysis (Legacy LOCAL_FILE) ---
-                profile = self.extract_module_profile(path)
-                if profile["docstring"] or profile["options"]:
-                    module_id = f"local:{rel_path.as_posix()}"
-                    docstring = profile["docstring"].strip()
-                    
-                    parts = [docstring]
-                    if profile["options"]:
-                        opts = "; ".join(
-                            f"{o['flag']}: {o['help']}" if o["help"] else o["flag"]
-                            for o in profile["options"]
-                        )
-                        parts.append(f"Inputs: {opts}")
-                    embedding_text = "\n".join(p for p in parts if p).strip()
-                    if not embedding_text:
-                        semantic = " ".join(
-                            part
-                            for part in rel_path.with_suffix("").parts
-                            if part != "__init__"
-                        )
-                        embedding_text = semantic
-
-                    sanitized = (
-                        docstring.splitlines()[0].strip()
-                        if docstring
-                        else f"Local tool module: {rel_path.stem.replace('_', ' ')}"
-                    )
-
-                    parameters = {}
-                    if profile["options"]:
-                        parameters = {
-                            "type": "object",
-                            "properties": {
-                                o["name"]: {"type": o["type"], "description": o["help"]}
-                                for o in profile["options"]
-                            },
-                            "required": [
-                                o["name"] for o in profile["options"] if o["required"]
-                            ],
-                        }
-
-                    manifests.append(
-                        ToolManifest(
-                            module_id=module_id,
-                            internal_semantic_capability=embedding_text,
-                            external_sanitized_description=sanitized,
-                            parameters=parameters,
-                            implementation_path=rel_path.as_posix(),
-                            internal_semantics=f"local repository module: {rel_path.stem}",
-                            transport=TransportType.LOCAL_FILE,
-                        )
-                    )
-
                 # --- PASS 2: Dynamic Analysis (BRAIN_DISPATCH) ---
                 try:
                     # Ensure root is in path for the import to work
@@ -658,6 +609,7 @@ class ToolRegistry:
                     
                     module_name = rel_path.with_suffix("").as_posix().replace("/", ".")
                     mod = importlib.import_module(module_name)
+            
                     
                     for name, obj in inspect.getmembers(mod):
                         if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
@@ -689,7 +641,7 @@ class ToolRegistry:
                                 )
                             )
                 except Exception as e:
-                    logger.debug(f"[discovery] Dynamic scan failed for {rel_path}: {e}")
+                    logger.error(f"[discovery] Dynamic scan failed for {rel_path}: {e}", exc_info=True)
 
         return manifests
 
@@ -854,14 +806,6 @@ class ToolRegistry:
         logger.info(
             f"[TOOL_EXECUTE] Executing Tool ID: {manifest.module_id} | Path: {manifest.implementation_path} | Args: {arguments}"
         )
-
-        if manifest.transport == TransportType.LOCAL_FILE:
-            # If this is an MCP wrapper, log it
-            if "MCP wrapper" in manifest.internal_semantics:
-                print(f"[MCP] Executing MCP wrapper: {manifest.module_id}")
-            return await self._execute_local_script(
-                manifest.implementation_path, arguments
-            )
 
         if manifest.transport == TransportType.BRAIN_DISPATCH:
             return await self._execute_brain_tool(manifest.module_id, arguments)

@@ -1,6 +1,6 @@
 import subprocess
 
-from listeners.thebrain import framework_tool
+from constants import framework_tool
 
 
 class Nmap:

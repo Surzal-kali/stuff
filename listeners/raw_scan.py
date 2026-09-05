@@ -2,7 +2,7 @@ import os
 import ctypes
 from pathlib import Path
 
-from listeners.thebrain import framework_tool
+from constants import framework_tool
 
 LIB_PATH = Path(__file__).resolve().parent / "plugins" / "raw_scan.so"
 

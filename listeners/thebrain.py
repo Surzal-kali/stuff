@@ -6,23 +6,14 @@ import inspect
 import importlib
 import functools
 import json
+import struct
 import sys
 from pathlib import Path
 from typing import Dict, Callable, Any, Optional
 from enum import Enum
-from constants import TransportType
-from listeners.framing import pack_message, read_message
+from constants import TransportType, framework_tool
 
 EVENT_HANDLERS = {}
-
-def framework_tool(doc: str = None, transport: TransportType = TransportType.BRAIN_DISPATCH):
-    """Decorator to mark a function as a framework tool callable by the Brain."""
-    def decorator(func):
-        func._is_framework_tool = True
-        func._tool_doc = doc or (func.__doc__ or "No description provided.")
-        func._transport = transport  # <--- The tag!
-        return func
-    return decorator
 
 class FunctionRegistry:
     def __init__(self):
@@ -59,6 +50,9 @@ class FrameworkEvent(ctypes.Structure):
 # Get the directory where this script is located
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIB_PATH = os.path.join(SCRIPT_DIR, "plugins", "frameit.so")
+HEADER_FORMAT = "!I"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # guard against bogus/oversized length headers
 
 lib = ctypes.CDLL(LIB_PATH)
 socket_path = "/tmp/brain.sock"
@@ -69,6 +63,24 @@ lib.send_event.restype = None
 
 if os.path.exists(socket_path):
     os.remove(socket_path)
+
+def pack_message(payload: bytes) -> bytes:
+    """Prefix payload with its 4-byte big-endian length."""
+    return struct.pack(HEADER_FORMAT, len(payload)) + payload
+
+
+async def read_message(reader: asyncio.StreamReader) -> bytes:
+    """Read one length-prefixed message from a StreamReader.
+
+    Raises asyncio.IncompleteReadError if the stream closes mid-message, and
+    ValueError if the declared length is absurd (protects against a corrupt
+    or malicious header driving an unbounded read).
+    """
+    header = await reader.readexactly(HEADER_SIZE)
+    (length,) = struct.unpack(HEADER_FORMAT, header)
+    if length > MAX_MESSAGE_SIZE:
+        raise ValueError(f"declared message length {length} exceeds max {MAX_MESSAGE_SIZE}")
+    return await reader.readexactly(length)
 
 async def start_brain():
     async def handle_client(reader, writer):
