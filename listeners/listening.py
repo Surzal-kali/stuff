@@ -8,6 +8,7 @@ from asyncio import StreamReader, StreamWriter
 import argparse
 
 from framing import pack_message
+from listeners.thebrain import framework_tool
 
 class TCPListener:
     def __init__(self, host='0.0.0.0', port=8888):
@@ -15,6 +16,7 @@ class TCPListener:
         self.port = port
         self.brain_socket = "/tmp/brain.sock"
 
+    @framework_tool("Send a message to the Brain via the Unix socket.")
     async def send_to_brain(self, event_type, session_id, data):
         try:
             reader, writer = await asyncio.open_unix_connection(self.brain_socket)
@@ -35,6 +37,7 @@ class TCPListener:
 
         async with server:
             await server.serve_forever()
+            
     async def handle_client(self, reader: StreamReader, writer: StreamWriter):
         addr = writer.get_extra_info('peername')
         session_id = hash(addr) & 0xFFFFFFFF
@@ -70,7 +73,7 @@ class TCPListener:
             print(f"[*] Closing session {addr}")
             writer.close()
             await writer.wait_closed()
-
+    @framework_tool("Listen for incoming TCP connections and handle sessions.")
     async def listen(self, host, port):
         # start_server is the async equivalent of socket.bind + listen + accept
         server = await asyncio.start_server(self.handle_client, host, port)
@@ -100,7 +103,8 @@ class TCPListener:
             )
         except KeyboardInterrupt:
             print("\n[!] Shutting down listener...")
-
+        except Exception as e:
+            print(f"[!] Listener encountered an error: {e}")
 if __name__ == "__main__":
     listener = TCPListener()  # Replace with the actual class name
     import asyncio, argparse

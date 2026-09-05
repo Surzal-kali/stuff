@@ -3,6 +3,8 @@ import importlib.util
 from impacket.smbconnection import SMBConnection
 from pathlib import Path
 
+from listeners.thebrain import framework_tool
+
 _FRAMING_PATH = Path(__file__).resolve().parent.parent / "listeners" / "framing.py"
 _FRAMING_SPEC = importlib.util.spec_from_file_location("framing", _FRAMING_PATH)
 if _FRAMING_SPEC is None or _FRAMING_SPEC.loader is None:
@@ -30,6 +32,7 @@ class SMBScanner:
         except Exception as e:
             print(f"[!] Brain reporting failed: {e}")
 
+    @framework_tool("Check if a target is vulnerable to Null Sessions.")
     def check_null_session(self, target, remote):
         """Attempts a Null Session connection to a target SMB share."""
         try:
@@ -41,7 +44,7 @@ class SMBScanner:
             return True
         except Exception:
             return False
-
+    
     async def scan_subnet(self, targets: list):
         """Iterates through targets and reports vulnerabilities."""
         print(f"[*] Starting SMB Null Session scan on {len(targets)} targets...")
@@ -57,6 +60,7 @@ class SMBScanner:
                 print(f"[-] Target {target} secure.")
 
 # Integration Example for bootstrap.py
+@framework_tool("Run an SMB Null Session scan on a list of targets.")
 async def run_smb_recon(targets):
     scanner = SMBScanner()
     await scanner.scan_subnet(targets)

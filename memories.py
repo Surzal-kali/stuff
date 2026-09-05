@@ -5,6 +5,8 @@ from typing import Any
 
 import chromadb
 
+from listeners.thebrain import framework_tool
+
 
 class MemoryService:
     """Persistent, namespaced vector memory for cross-harness recall."""
@@ -66,7 +68,7 @@ class MemoryService:
             if name.startswith("memory_"):
                 names.append(name.replace("memory_", "", 1))
         return sorted(names)
-
+    @framework_tool("Store a memory entry with text and embedding in a namespace.")
     def remember(
         self,
         namespace: str,
@@ -88,7 +90,7 @@ class MemoryService:
             metadatas=[payload],
         )
         return str(memory_id)
-
+    @framework_tool("Search for memory entries in a namespace using keyword matching.")
     def search(
         self,
         namespace: str,
@@ -125,6 +127,7 @@ class MemoryService:
                 break
         return hits
 
+    @framework_tool("Recall memory entries in a namespace using vector similarity.")
     def recall(
         self,
         namespace: str,
@@ -156,7 +159,7 @@ class MemoryService:
                 }
             )
         return hits
-
+    @framework_tool("Retrieve a specific memory entry by ID from a namespace.")
     def get(self, namespace: str, memory_id: str, session_id: str | None = None) -> dict[str, Any] | None:
         collection = self._get_collection(namespace)
         result = collection.get(
@@ -176,6 +179,7 @@ class MemoryService:
             "embedding": result.get("embeddings", [None])[index],
         }
 
+    @framework_tool("Remove a memory entry by ID from a namespace.")
     def forget(self, namespace: str, memory_id: str) -> None:
         collection = self._get_collection(namespace)
         collection.delete(ids=[str(memory_id)])

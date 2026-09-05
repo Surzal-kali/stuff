@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any
 import socket
 import time
+from daharness import _chat, ToolRegistry, OllamaEmbeddingFunction
 # --- Setup Logging ---
 logging.basicConfig(
     level=logging.INFO,
@@ -244,20 +245,7 @@ async def run_framework():
             # Interactive mode (restricted)
             logger.info("[*] Entering interactive mode. Type 'exit' to quit.")
             while True:
-                try:
-                    user_input = await asyncio.to_thread(input, ">>> ")
-                    if user_input.strip() == "exit":
-                        break
-                    elif user_input.startswith("reload "):
-                        module_name = user_input.split(" ", 1)[1].strip()
-                        try:
-                            module = importlib.import_module(module_name)
-                            await loader.reload_module(module)
-                        except ModuleNotFoundError:
-                            logger.error("[-] Module %s not found.", module_name)
-                    else:
-                        logger.warning("[-] Interactive commands are restricted.")
-                except EOFError:
+                    await _chat(registry=ToolRegistry(embedding_model=OllamaEmbeddingFunction(), rpc_servers={"metasploit": MCP_ENDPOINT}))
                     break
     except Exception as e:
         logger.error("[-] Exception in main: %s", e, exc_info=True)

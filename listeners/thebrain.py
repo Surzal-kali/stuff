@@ -2,10 +2,51 @@ import asyncio
 import os
 import socket
 import ctypes
-
-from framing import pack_message, read_message
+import inspect
+import importlib
+import functools
+import json
+import sys
+from pathlib import Path
+from typing import Dict, Callable, Any, Optional
+from enum import Enum
+from constants import TransportType
+from listeners.framing import pack_message, read_message
 
 EVENT_HANDLERS = {}
+
+def framework_tool(doc: str = None, transport: TransportType = TransportType.BRAIN_DISPATCH):
+    """Decorator to mark a function as a framework tool callable by the Brain."""
+    def decorator(func):
+        func._is_framework_tool = True
+        func._tool_doc = doc or (func.__doc__ or "No description provided.")
+        func._transport = transport  # <--- The tag!
+        return func
+    return decorator
+
+class FunctionRegistry:
+    def __init__(self):
+        self.tools: Dict[str, Callable] = {}
+        self.metadata: Dict[str, Dict] = {}
+
+    def register(self, name: str, func: Callable, doc: str):
+        self.tools[name] = func
+        self.metadata[name] = {"doc": doc, "args": inspect.signature(func)}
+
+    def get_tool(self, name: str) -> Optional[Callable]:
+        return self.tools.get(name)
+
+    def get_metadata(self, name: str) -> Optional[Dict]:
+        return self.metadata.get(name)
+
+    def scan_module(self, module):
+        for name, obj in inspect.getmembers(module):
+            if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
+                tool_id = f"{module.__name__}.{name}"
+                self.register(tool_id, obj, getattr(obj, "_tool_doc", ""))
+                print(f"[+] Registered framework tool: {tool_id}")
+
+registry = FunctionRegistry()
 
 class FrameworkEvent(ctypes.Structure):
     _fields_ = [
@@ -16,7 +57,7 @@ class FrameworkEvent(ctypes.Structure):
     ]
 
 # Get the directory where this script is located
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = Path(__file__).resolve().parent
 LIB_PATH = os.path.join(SCRIPT_DIR, "plugins", "frameit.so")
 
 lib = ctypes.CDLL(LIB_PATH)
@@ -60,8 +101,9 @@ async def start_brain():
         event.data = payload.encode()[:1023]
         event.data_len = len(payload)
         
-        await dispatch(event)
-        writer.write(pack_message(b"Event dispatched."))
+        result = await dispatch(event)
+        response = result.encode() if result else b"Event dispatched."
+        writer.write(pack_message(response))
         await writer.drain()
         writer.close()
     server = await asyncio.start_unix_server(handle_client, path=socket_path)
@@ -70,6 +112,84 @@ async def start_brain():
 
 async def dispatch(event):
     event_type = event.event_type.decode().strip('\x00')
+    
+    # Handle tool discovery: "SCAN_TOOLS|session_id|path/to/scan"
+    if event_type == "SCAN_TOOLS":
+        try:
+            scan_path = event.data.decode().strip('\x00')
+            if not scan_path:
+                # Default to framework root if no path provided
+                scan_path = SCRIPT_DIR.parent 
+            
+            path = Path(scan_path)
+            found_tools = []
+            
+            for root, _, files in os.walk(path):
+                for file in files:
+                    if file.endswith(".py") and file != "thebrain.py":
+                        module_name = Path(root).relative_to(path).as_posix()
+                        if module_name:
+                            # Handle package structure
+                            module_path = f"{module_name.replace('/', '.')}.{Path(file).stem}"
+                        else:
+                            module_path = Path(file).stem
+                        
+                        try:
+                            # Import the module dynamically
+                            # Ensure the framework root is in sys.path to resolve absolute imports like 'listeners.xxx'
+                            root_path = str(path)
+                            if root_path not in sys.path:
+                                sys.path.insert(0, root_path)
+                            
+                            mod = importlib.import_module(module_path)
+                            registry.scan_module(mod)
+                            
+                            # Collect metadata for the response
+                            for tool_id in registry.tools:
+                                if tool_id.startswith(module_path):
+                                    found_tools.append(f"{tool_id}:{registry.metadata[tool_id]['doc']}")
+                        except Exception as e:
+                            print(f"[!] Failed to scan module {module_path}: {e}")
+            
+            return "SCAN_COMPLETE|" + ",".join(found_tools)
+        except Exception as e:
+            return f"ERROR: Scan failed: {str(e)}"
+
+    # Handle tool calls via the Brain
+    if event_type == "CALL_TOOL":
+        try:
+            # Expecting data as "tool_id|arg1,arg2..." or JSON
+            payload = event.data.decode().strip('\x00')
+            if '|' in payload:
+                tool_id, args_str = payload.split('|', 1)
+                args = args_str.split(',') if args_str else []
+            else:
+                # Fallback to JSON for complex args
+                try:
+                    parsed = json.loads(payload)
+                    tool_id = parsed.get("tool_id")
+                    args = parsed.get("args", [])
+                except json.JSONDecodeError:
+                    tool_id = payload
+                    args = []
+
+            tool = registry.get_tool(tool_id)
+            if tool:
+                # Execute tool in a thread to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                # Handle both positional and keyword args
+                if isinstance(args, dict):
+                    result = await loop.run_in_executor(None, functools.partial(tool, **args))
+                else:
+                    result = await loop.run_in_executor(None, functools.partial(tool, *args))
+                
+                print(f"[+] Tool {tool_id} executed successfully: {result}")
+                return f"SUCCESS: {result}"
+            else:
+                return f"ERROR: Tool {tool_id} not found in registry."
+        except Exception as e:
+            return f"ERROR: Execution failed: {str(e)}"
+
     handler = EVENT_HANDLERS.get(event_type)
     
     if handler:

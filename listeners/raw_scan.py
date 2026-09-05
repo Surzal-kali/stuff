@@ -2,6 +2,8 @@ import os
 import ctypes
 from pathlib import Path
 
+from listeners.thebrain import framework_tool
+
 LIB_PATH = Path(__file__).resolve().parent / "plugins" / "raw_scan.so"
 
 def load_lib():
@@ -15,6 +17,7 @@ def load_lib():
     lib.raw_syn_scan.restype = ctypes.c_int
     return lib
 
+@framework_tool("Perform a raw SYN scan on a target IP and port.")
 def syn_scan(target_ip: str, port: int, source_ip: str | None = None, timeout_ms: int = 250):
     lib = load_lib()
     if os.geteuid() != 0:
