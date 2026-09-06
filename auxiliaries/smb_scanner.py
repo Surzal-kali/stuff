@@ -26,11 +26,11 @@ class SMBScanner:
             print(f"[!] Brain reporting failed: {e}")
 
     @framework_tool("Check if a target is vulnerable to Null Sessions.")
-    def check_null_session(self, target, remote):
+    def check_null_session(self, target, remoteName=False):
         """Attempts a Null Session connection to a target SMB share."""
         try:
             # timeout=2 to keep the scan moving
-            conn = SMBConnection(target, target, remoteName=False, timeout=2)
+            conn = SMBConnection(target, target, timeout=2)
             # Attempt login with empty user and empty password
             conn.login('', '') 
             conn.logoff()
@@ -44,7 +44,7 @@ class SMBScanner:
         for target in targets:
             # Run the blocking Impacket call in a thread to avoid freezing the loop
             loop = asyncio.get_event_loop()
-            is_vuln = await loop.run_in_executor(None, self.check_null_session, target, "C$")
+            is_vuln = await loop.run_in_executor(None, self.check_null_session, target)
             
             if is_vuln:
                 print(f"[+] Target {target} is vulnerable to Null Sessions!")
