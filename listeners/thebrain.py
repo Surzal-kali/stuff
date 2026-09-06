@@ -362,6 +362,7 @@ async def dispatch(event):
 
     # Handle tool calls via the Brain
     if event_type == "CALL_TOOL":
+        tool_id = "unknown"
         try:
             # Expecting data as "tool_id|args_json" (dict -> kwargs, list -> positional)
             payload = event.data.decode().strip('\x00')
@@ -401,11 +402,32 @@ async def dispatch(event):
                     result = await loop.run_in_executor(None, call)
 
                 print(f"[+] Tool {tool_id} executed successfully: {result}")
-                return f"SUCCESS: {result}"
+                # JSON status envelope — the harness parses this structurally
+                # instead of string-matching on "SUCCESS"/"ERROR".  The result
+                # is included as-is when JSON-serializable, stringified
+                # otherwise so structured callers can read typed fields.
+                try:
+                    json.dumps(result)
+                    serializable_result = result
+                except (TypeError, ValueError):
+                    serializable_result = str(result)
+                return json.dumps({
+                    "status": "success",
+                    "tool_id": tool_id,
+                    "result": serializable_result,
+                })
             else:
-                return f"ERROR: Tool {tool_id} not found in registry."
+                return json.dumps({
+                    "status": "error",
+                    "tool_id": tool_id,
+                    "error": f"Tool {tool_id} not found in registry.",
+                })
         except Exception as e:
-            return f"ERROR: Execution failed: {str(e)}"
+            return json.dumps({
+                "status": "error",
+                "tool_id": tool_id,
+                "error": f"Execution failed: {str(e)}",
+            })
 
     handler = EVENT_HANDLERS.get(event_type)
     
