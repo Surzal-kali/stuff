@@ -1299,7 +1299,7 @@ async def _chat(registry: "ToolRegistry") -> None:
     """Interactive conversation with the secretary; one session, full history."""
     deps = SecretaryDeps(registry=registry)
     history = None
-    print("[chat] Secretary ready. Type 'exit' to quit.")
+    print("[chat] Secretary ready. Type 'exit' to quit. Type '/stream <brain|msf>' to watch logs (Ctrl+C to stop).")
     while True:
         try:
             user_input = await asyncio.to_thread(input, "\nyou> ")
@@ -1310,6 +1310,36 @@ async def _chat(registry: "ToolRegistry") -> None:
             break
         if not user_input.strip():
             continue
+
+        if user_input.strip().startswith("/stream"):
+            parts = user_input.strip().split()
+            if len(parts) < 2:
+                print("[chat] Usage: /stream <brain|msf>")
+                continue
+            log_type = parts[1]
+            from utils.log_reader import stream_logs
+            import threading
+            stop_event = threading.Event()
+            print(f"[chat] Streaming {log_type} logs... (Press Ctrl+C to stop)")
+            
+            def run_stream():
+                for line in stream_logs(log_type, stop_event):
+                    print(f"[{log_type}] {line}", end="")
+            
+            # Start streaming in a thread
+            stream_thread = threading.Thread(target=run_stream, daemon=True)
+            stream_thread.start()
+            
+            try:
+                while stream_thread.is_alive():
+                    # We use a short sleep in a thread to keep the main loop 
+                    # responsive to SIGINT (Ctrl+C)
+                    await asyncio.sleep(0.1)
+            except KeyboardInterrupt:
+                stop_event.set()
+                print(f"\n[chat] Stopped streaming {log_type} logs.")
+            continue
+
         with capture_run_messages() as messages:
             try:
                 result = await registry.run_secretary(

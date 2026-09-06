@@ -1,3 +1,4 @@
+from pydoc import Helper
 import subprocess
 
 import asyncio
@@ -8,6 +9,7 @@ import dotenv
 from dotenv import load_dotenv
 
 from constants import framework_tool
+from pymetasploit3.msfrpc import MsfRpcClient
 
 load_dotenv()
 
@@ -19,97 +21,66 @@ class MetasploitClient:
 
     def __init__(self, mcp_path="msfconsole"):
         self.mcp_path = mcp_path
-        self.process = None
 
     @classmethod
     def get_instance(cls) -> "MetasploitClient":
         """Return the shared client so bootstrap and in-process tool launches
-        bind to the SAME msfconsole handle (fixes 'console is not running'
-        caused by each caller building its own instance)."""
+        bind to the SAME msfconsole handle."""
         if cls._shared is None:
             cls._shared = cls()
         return cls._shared
 
     async def _ensure_running(self) -> bool:
-        """Ensure a live msfconsole handle exists, lazily starting one if needed.
-
-        Returns False (and explains why) instead of silently returning None,
-        which upstream used to report as 'Success'.
+        """Check if a live msgrpc RPC connection exists.
+        
+        Returns False if the client is not initialized.
         """
-        if self.process is None:
-            print("[i] No msfconsole handle on this client; attempting lazy start...")
-            process = await self.start_mcp()
-            if process is None:
-                print(
-                    "[!] Metasploit console is not running and could not be "
-                    "started (if msfconsole is already running externally, it "
-                    "has no shared handle here)."
-                )
-                return False
+        if not hasattr(self, 'client') or self.client is None:
+            print("[!] Metasploit RPC client is not initialized. Please ensure it was started during bootstrap.")
+            return False
         return True
-
-    async def _mirror_logs(self, process):
-        """Reads stdout and stderr and writes them to a log file."""
-        try:
-            with open("/tmp/msfconsole_mcp.log", "a") as log_file:
-                while True:
-                    line = await process.stdout.readline()
-                    if not line:
-                        break
-                    log_file.write(line.decode(errors="replace"))
-                    log_file.flush()
-        except Exception as e:
-            print(f"Logging error: {e}")
 
     async def start_mcp(self):
         """
-        Load and start MCP in the same Metasploit console session.
+        Load and start msgrpc in the Metasploit console session.
         """
         pwd = MSGRPC_PASSWORD
         try:
-            # Prevent double launch: Check if msfconsole is already running
+            # We check if msfconsole is running to ensure we can connect
             proc = await asyncio.create_subprocess_shell(
                 "pgrep -x msfconsole",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await proc.communicate()
-            if stdout:
-                print("[!] msfconsole is already running. Skipping launch.")
-                # In a real scenario, you'd attach or assume it's healthy.
-                # For now, we return a dummy process or handle the logic in bootstrap.
-                return None
-
-            # Log msfconsole output to a file and maintain pipe for reading
-            process = await asyncio.create_subprocess_exec(
-                self.mcp_path,
-                "-q",
-                "-x",
-                f"load msgrpc Pass={pwd}",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-
-            if process.stdin is None:
-                raise RuntimeError("Metasploit console stdin is unavailable")
-
-            # Start a background task to mirror stdout to the log file
-            asyncio.create_task(self._mirror_logs(process))
-
-            # Give the console a moment to actually load
-            await asyncio.sleep(5)
-
-            self.process = process
-            return process
+            
+            if not stdout:
+                print("[i] msfconsole is not running; launching it...")
+                # Launch msfconsole with msgrpc loaded
+                process = await asyncio.create_subprocess_exec(
+                    self.mcp_path,
+                    "-q",
+                    "-x",
+                    f"load msgrpc Pass={pwd}",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                # Give it time to boot
+                await asyncio.sleep(10)
+            
+            # Connect to the RPC interface
+            # Default msgrpc port is usually 55552
+            self.client = MsfRpcClient(password=pwd, port=55552)
+            return True
         except Exception as e:
-            print(f"An error occurred while trying to start MSF: {e}")
-            return None
+            print(f"An error occurred while trying to start MSF RPC: {e}")
+            return False
 
     # This one goes through the Brain's logic
     @framework_tool("Scan for MSF modules", transport=TransportType.BRAIN_DISPATCH)
-    async def search_module(self, module_type, module_name):
+    async def search_module(self, module_type=None, module_name=None):
         """
         Search for a Metasploit module by type and name.
         """
@@ -117,17 +88,29 @@ class MetasploitClient:
             return None
 
         try:
-            # Send the search command to the Metasploit console
-            # Use MSF keyword syntax; plain 'search exploit smb' would treat
-            # 'exploit' as a search term instead of a type filter.
-            command = f"search type:{module_type} name:{module_name}\n"
-            self.process.stdin.write(command.encode())
-            await self.process.stdin.drain()
+            # Use pymetasploit3 to search modules
+            # search() returns a list of module objects
+            query = ""
+            if module_type and module_name:
+                query = f"type:{module_type} name:{module_name}"
+            elif module_type:
+                query = f"type:{module_type}"
+            elif module_name:
+                query = module_name
+            else:
+                return "Please provide either a module_type or a module_name to search."
 
-            # Read the output from the console
-            await asyncio.sleep(2)  # Wait for the command to execute
-            output = await self.process.stdout.read(4096)
-            return output.decode()
+            results = self.client.modules.search(query)
+            
+            if not results:
+                return f"No modules found matching query: {query}"
+
+            # Format results for the model
+            formatted_results = []
+            for mod in results:
+                formatted_results.append(f"{mod.name} ({mod.type})")
+            
+            return "\n".join(formatted_results)
         except Exception as e:
             print(f"An error occurred while searching for the module: {e}")
             return None
@@ -142,20 +125,14 @@ class MetasploitClient:
             return None
 
         try:
-            # Construct the command to use the module and set options
-            command = f"use {module_path}\n"
+            # Use pymetasploit3 to select module and set options
+            module = self.client.modules.load(module_path)
             for option, value in options.items():
-                command += f"set {option} {value}\n"
-            command += "run\n"
-
-            # Send the command to the Metasploit console
-            self.process.stdin.write(command.encode())
-            await self.process.stdin.drain()
-
-            # Read the output from the console
-            await asyncio.sleep(5)  # Wait for the module to execute
-            output = await self.process.stdout.read(4096)
-            return output.decode()
+                module.set_option(option, value)
+            
+            # Execute the module
+            result = module.execute()
+            return result
         except Exception as e:
             print(f"An error occurred while executing the module: {e}")
             return None
@@ -179,9 +156,7 @@ class MetasploitClient:
             await self.process.stdin.drain()
 
             # Read the output from the console
-            await asyncio.sleep(2)  # Wait for the command to execute
-            output = await self.process.stdout.read(4096)
-            return output.decode()
+            return await self._capture_output()
         except Exception as e:
             print(f"An error occurred while setting the payload: {e}")
             return None
@@ -195,15 +170,58 @@ class MetasploitClient:
             return None
 
         try:
-            # Send the command to show options for the module
-            command = f"use {module_path}\nshow options\n"
-            self.process.stdin.write(command.encode())
-            await self.process.stdin.drain()
-
+            module = self.client.modules.load(module_path)
+            options = module.options
+            return str(options)
+        except Exception as e:
+            print(f"An error occurred while retrieving options: {e}")
+            return None
             # Read the output from the console
-            await asyncio.sleep(2)  # Wait for the command to execute
+            await asyncio.sleep(2)
             output = await self.process.stdout.read(4096)
             return output.decode()
         except Exception as e:
-            print(f"An error occurred while retrieving module options: {e}")
+            print(f"An error occurred while retrieving options: {e}")
+            return None
+
+    @framework_tool("List all active Metasploit sessions")
+    async def list_sessions(self):
+        """
+        List all active Metasploit sessions.
+        """
+        if not await self._ensure_running():
+            return None
+
+        try:
+            sessions = self.client.sessions.list
+            if not sessions:
+                return "No active sessions."
+            
+            session_list = [f"ID: {s.id}, Info: {s.info}" for s in sessions]
+            return "\n".join(session_list)
+        except Exception as e:
+            print(f"An error occurred while listing sessions: {e}")
+            return None
+
+    @framework_tool("Interact with a specific Metasploit session")
+    async def interact_session(self, session_id: int, command: str):
+        """
+        Send a command to a specific active Metasploit session.
+        
+        Args:
+            session_id: The numeric ID of the session.
+            command: The command to execute within the session.
+        """
+        if not await self._ensure_running():
+            return None
+
+        try:
+            session = self.client.sessions.get(session_id)
+            if not session:
+                return f"Session {session_id} not found."
+            
+            result = session.write(command)
+            return result
+        except Exception as e:
+            print(f"An error occurred while interacting with session {session_id}: {e}")
             return None
