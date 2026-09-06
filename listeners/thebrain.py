@@ -6,11 +6,20 @@ import inspect
 import importlib
 import functools
 import json
+import signal
 import struct
 import sys
 from pathlib import Path
 from typing import Dict, Callable, Any, Optional
 from enum import Enum
+
+# This file is often launched directly (python listeners/thebrain.py), which
+# puts listeners/ -- not the framework root -- on sys.path, so top-level
+# imports like 'constants' and 'listeners.*' would fail. Add the root first.
+_FRAMEWORK_ROOT = Path(__file__).resolve().parent.parent
+if str(_FRAMEWORK_ROOT) not in sys.path:
+    sys.path.insert(0, str(_FRAMEWORK_ROOT))
+
 from constants import TransportType, framework_tool
 
 EVENT_HANDLERS = {}
@@ -19,6 +28,8 @@ class FunctionRegistry:
     def __init__(self):
         self.tools: Dict[str, Callable] = {}
         self.metadata: Dict[str, Dict] = {}
+        # One instance per class, so stateful tool clients keep their handles.
+        self._instances: Dict[str, Any] = {}
 
     def register(self, name: str, func: Callable, doc: str):
         self.tools[name] = func
@@ -30,14 +41,124 @@ class FunctionRegistry:
     def get_metadata(self, name: str) -> Optional[Dict]:
         return self.metadata.get(name)
 
+    def _instance_for(self, cls):
+        key = f"{cls.__module__}.{cls.__qualname__}"
+        if key not in self._instances:
+            self._instances[key] = cls()
+        return self._instances[key]
+
     def scan_module(self, module):
         for name, obj in inspect.getmembers(module):
             if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
                 tool_id = f"{module.__name__}.{name}"
                 self.register(tool_id, obj, getattr(obj, "_tool_doc", ""))
                 print(f"[+] Registered framework tool: {tool_id}")
+            elif inspect.isclass(obj) and obj.__module__ == module.__name__:
+                # @framework_tool methods on classes defined in THIS module
+                for m_name, m_obj in inspect.getmembers(obj, inspect.isfunction):
+                    if getattr(m_obj, "_is_framework_tool", False):
+                        tool_id = f"{module.__name__}.{obj.__name__}.{m_name}"
+                        try:
+                            instance = self._instance_for(obj)
+                            bound = getattr(instance, m_name)
+                            self.register(tool_id, bound, getattr(m_obj, "_tool_doc", ""))
+                            print(f"[+] Registered framework tool: {tool_id}")
+                        except TypeError as e:
+                            print(f"[!] Skipping {tool_id}: class needs constructor args ({e})")
 
 registry = FunctionRegistry()
+
+# Directories holding pythonic @framework_tool wrappers, scanned at sidecar
+# startup. Deliberately narrow: metasploiting.py contributes 4 wrapper
+# FUNCTIONS -- per-module MSF indexing stays out of the Brain entirely
+# (bootstrap skips it separately). Excluded by default because they add
+# startup weight or side effects, not tools: utils/ (heavy scapy import,
+# zero tools), memories.py (instantiates MemoryService/chroma at import),
+# bootstrap/api_gateway/daharness (harness machinery).
+# Override with BRAIN_SCAN_DIRS="auxiliaries,memories.py"; empty disables.
+DEFAULT_SCAN_DIRS = ("auxiliaries", "listeners", "payloads")
+
+
+def scan_tools(scan_path: str) -> str:
+    """Import modules under `scan_path` and register their @framework_tool
+    callables. Accepts a directory (walked recursively) or a single .py file.
+
+    Returns the same "SCAN_COMPLETE|..." / "ERROR: ..." string the SCAN_TOOLS
+    event replies with.
+    """
+    try:
+        path = Path(scan_path).resolve()
+        found_tools = []
+
+        if path.is_file():
+            # Single module: its parent (normally the framework root) must be
+            # importable from so 'from listeners.x import y' style imports work.
+            if str(path.parent) not in sys.path:
+                sys.path.insert(0, str(path.parent))
+        elif (path / "__init__.py").exists():
+            # If the scanned directory is itself a package, import its children
+            # as pkg.child with the PARENT on sys.path. Otherwise a scan of e.g.
+            # 'auxiliaries' derives the bare module name 'nmap', which collides
+            # with the python-nmap library installed in the venv -- scanning the
+            # WRONG module and registering nothing.
+            if str(path.parent) not in sys.path:
+                sys.path.insert(0, str(path.parent))
+        elif str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+        if path.is_file():
+            candidates = [path]
+        else:
+            candidates = [Path(root) / f for root, _, files in os.walk(path) for f in files]
+
+        for candidate in candidates:
+            if not (candidate.name.endswith(".py") and candidate.name != "thebrain.py"):
+                continue
+            if candidate.parent == path or path.is_file():
+                parts: List[str] = []
+            else:
+                parts = [p for p in candidate.parent.relative_to(path).parts
+                         if p not in ("", ".")]
+            prefix = path.name + "." if (path.is_dir() and (path / "__init__.py").exists()) else ""
+            if parts or prefix:
+                module_path = ".".join([prefix.rstrip(".")] + parts + [candidate.stem])
+            else:
+                module_path = candidate.stem
+
+            try:
+                mod = importlib.import_module(module_path)
+                registry.scan_module(mod)
+
+                # Collect metadata for the response
+                for tool_id in registry.tools:
+                    if tool_id.startswith(module_path):
+                        found_tools.append(f"{tool_id}:{registry.metadata[tool_id]['doc']}")
+            except Exception as e:
+                print(f"[!] Failed to scan module {module_path}: {e}")
+
+        return "SCAN_COMPLETE|" + ",".join(found_tools)
+    except Exception as e:
+        return f"ERROR: Scan failed: {str(e)}"
+
+
+def _startup_scan():
+    """Prime the registry at sidecar startup so CALL_TOOL works immediately,
+    without anyone having to send SCAN_TOOLS first."""
+    raw = os.environ.get("BRAIN_SCAN_DIRS", ",".join(DEFAULT_SCAN_DIRS)).strip()
+    if not raw:
+        print("[*] BRAIN_SCAN_DIRS empty; skipping startup scan")
+        return
+    total = 0
+    for entry in [e.strip() for e in raw.split(",") if e.strip()]:
+        p = Path(entry)
+        if not p.is_absolute():
+            p = _FRAMEWORK_ROOT / entry
+        before = len(registry.tools)
+        status = scan_tools(str(p)).split("|", 1)[0]
+        added = len(registry.tools) - before
+        total += added
+        print(f"[+] Startup scan {p.name}: {status} (+{added} tools)")
+    print(f"[+] Brain registry primed: {total} tools available at startup")
 
 class FrameworkEvent(ctypes.Structure):
     _fields_ = [
@@ -61,8 +182,6 @@ socket_path = "/tmp/brain.sock"
 lib.send_event.argtypes = [ctypes.POINTER(FrameworkEvent)]
 lib.send_event.restype = None
 
-if os.path.exists(socket_path):
-    os.remove(socket_path)
 
 def pack_message(payload: bytes) -> bytes:
     """Prefix payload with its 4-byte big-endian length."""
@@ -83,6 +202,40 @@ async def read_message(reader: asyncio.StreamReader) -> bytes:
     return await reader.readexactly(length)
 
 async def start_brain():
+    loop = asyncio.get_running_loop()
+    # SIGTERM (what bootstrap.stop() sends) would otherwise kill the process
+    # outright -- no Python unwinding, no cleanup -- leaving a stale socket
+    # behind that passes every Path.exists() check while nothing listens on it.
+    # Route both signals through task cancellation so the finally below runs.
+    main_task = asyncio.current_task()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, main_task.cancel)
+        except NotImplementedError:
+            pass  # non-unix event loop; best effort only
+
+    # Unlink a STALE socket file before binding. This must NOT run at module
+    # import time: any process importing listeners.thebrain (the harness
+    # dispatch path, smb_scanner, listening.py, even this sidecar importing a
+    # scanned module that imports it back) would delete the LIVE sidecar's
+    # socket file, leaving the Brain serving on an unlinked inode while every
+    # subsequent connect() failed with ENOENT. Guarded with a live-listener
+    # probe so a second sidecar can never clobber a running one either.
+    if os.path.exists(socket_path):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            if probe.connect_ex(socket_path) == 0:
+                raise RuntimeError(
+                    f"{socket_path} already has a live listener; refusing to start a second Brain"
+                )
+        finally:
+            probe.close()
+        os.remove(socket_path)
+
+    # Prime the registry BEFORE binding the socket, so the connect-probe in
+    # bootstrap only reports "ready" once tools are actually callable.
+    _startup_scan()
+
     async def handle_client(reader, writer):
         try:
             data = await read_message(reader)
@@ -119,82 +272,79 @@ async def start_brain():
         await writer.drain()
         writer.close()
     server = await asyncio.start_unix_server(handle_client, path=socket_path)
-    async with server:
-        await server.serve_forever()
+    # Remember which socket file inode WE bound, so the shutdown unlink below
+    # can never delete a newer sidecar's live socket after we lingered past it.
+    try:
+        bound_ino = os.stat(socket_path).st_ino
+    except OSError:
+        bound_ino = None
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        # The kernel does not unlink a socket when the owning process dies, so
+        # a killed sidecar leaves a stale file that looks alive to every
+        # Path.exists() check. Unlink on every exit path we can reach (SIGINT
+        # via asyncio.run's cancellation, SIGTERM via the handler above) -- but
+        # only if the file is still the one we bound. SIGKILL still leaks the
+        # file; bootstrap's connect-probe sees through it.
+        try:
+            if bound_ino is not None and os.stat(socket_path).st_ino == bound_ino:
+                os.unlink(socket_path)
+        except (FileNotFoundError, OSError):
+            pass
 
 async def dispatch(event):
     event_type = event.event_type.decode().strip('\x00')
     
     # Handle tool discovery: "SCAN_TOOLS|session_id|path/to/scan"
     if event_type == "SCAN_TOOLS":
-        try:
-            scan_path = event.data.decode().strip('\x00')
-            if not scan_path:
-                # Default to framework root if no path provided
-                scan_path = SCRIPT_DIR.parent 
-            
-            path = Path(scan_path)
-            found_tools = []
-            
-            for root, _, files in os.walk(path):
-                for file in files:
-                    if file.endswith(".py") and file != "thebrain.py":
-                        module_name = Path(root).relative_to(path).as_posix()
-                        if module_name:
-                            # Handle package structure
-                            module_path = f"{module_name.replace('/', '.')}.{Path(file).stem}"
-                        else:
-                            module_path = Path(file).stem
-                        
-                        try:
-                            # Import the module dynamically
-                            # Ensure the framework root is in sys.path to resolve absolute imports like 'listeners.xxx'
-                            root_path = str(path)
-                            if root_path not in sys.path:
-                                sys.path.insert(0, root_path)
-                            
-                            mod = importlib.import_module(module_path)
-                            registry.scan_module(mod)
-                            
-                            # Collect metadata for the response
-                            for tool_id in registry.tools:
-                                if tool_id.startswith(module_path):
-                                    found_tools.append(f"{tool_id}:{registry.metadata[tool_id]['doc']}")
-                        except Exception as e:
-                            print(f"[!] Failed to scan module {module_path}: {e}")
-            
-            return "SCAN_COMPLETE|" + ",".join(found_tools)
-        except Exception as e:
-            return f"ERROR: Scan failed: {str(e)}"
+        scan_path = event.data.decode().strip('\x00')
+        if not scan_path:
+            # Default to framework root if no path provided
+            scan_path = str(SCRIPT_DIR.parent)
+        return scan_tools(scan_path)
 
     # Handle tool calls via the Brain
     if event_type == "CALL_TOOL":
         try:
-            # Expecting data as "tool_id|arg1,arg2..." or JSON
+            # Expecting data as "tool_id|args_json" (dict -> kwargs, list -> positional)
             payload = event.data.decode().strip('\x00')
+            kwargs: Dict[str, Any] = {}
+            args: list = []
             if '|' in payload:
                 tool_id, args_str = payload.split('|', 1)
-                args = args_str.split(',') if args_str else []
+                args_str = args_str.strip()
+                if args_str:
+                    try:
+                        parsed = json.loads(args_str)
+                        if isinstance(parsed, dict):
+                            kwargs = parsed
+                        elif isinstance(parsed, list):
+                            args = parsed
+                        else:
+                            args = [parsed]
+                    except json.JSONDecodeError:
+                        # Legacy fallback: bare comma-separated positional args
+                        args = [a for a in args_str.split(',') if a]
             else:
-                # Fallback to JSON for complex args
-                try:
-                    parsed = json.loads(payload)
-                    tool_id = parsed.get("tool_id")
-                    args = parsed.get("args", [])
-                except json.JSONDecodeError:
-                    tool_id = payload
-                    args = []
+                tool_id = payload
 
             tool = registry.get_tool(tool_id)
             if tool:
-                # Execute tool in a thread to avoid blocking the event loop
+                # Execute tool without blocking the event loop. Coroutine
+                # functions MUST be awaited directly — run_in_executor on them
+                # silently creates a coroutine that never runs.
                 loop = asyncio.get_event_loop()
-                # Handle both positional and keyword args
-                if isinstance(args, dict):
-                    result = await loop.run_in_executor(None, functools.partial(tool, **args))
+                if inspect.iscoroutinefunction(tool):
+                    result = await tool(**kwargs) if kwargs else await tool(*args)
                 else:
-                    result = await loop.run_in_executor(None, functools.partial(tool, *args))
-                
+                    if kwargs:
+                        call = functools.partial(tool, **kwargs)
+                    else:
+                        call = functools.partial(tool, *args)
+                    result = await loop.run_in_executor(None, call)
+
                 print(f"[+] Tool {tool_id} executed successfully: {result}")
                 return f"SUCCESS: {result}"
             else:
@@ -212,7 +362,12 @@ async def dispatch(event):
         loop.run_in_executor(None, lib.send_event, ctypes.byref(event))
 
 if __name__ == "__main__":
-    asyncio.run(start_brain())
+    try:
+        asyncio.run(start_brain())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Cancellation unwound start_brain, whose finally already unlinked the
+        # socket. Swallow the noise so the sidecar exits cleanly on signal.
+        pass
 
 
 

@@ -94,7 +94,9 @@ class FrameworkLoader:
         try:
             logger.info("[+] Starting Metasploit console for RPC discovery...")
             from payloads.metasploiting import MetasploitClient
-            metasploit_client = MetasploitClient()
+            # Shared instance: tool launches resolve to the same client, so
+            # they see the live msfconsole handle started here.
+            metasploit_client = MetasploitClient.get_instance()
             process = await metasploit_client.start_mcp()
             if process is None:
                 return None
@@ -137,12 +139,60 @@ class FrameworkLoader:
                 return
 
             logger.info("[+] Starting Brain sidecar...")
+            # Stream the Brain's output to a log file instead of PIPEs: nothing
+            # ever drains PIPEs here, so once the Brain prints enough output the
+            # pipe buffer fills, the sidecar blocks on write and effectively
+            # dies -- taking /tmp/brain.sock down with it (it unlinks the socket
+            # on startup, so a crashed sidecar leaves NO socket behind).
+            brain_log = open("/tmp/brain.log", "ab")
             process = await asyncio.create_subprocess_exec(
                 sys.executable, str(brain_script),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stdout=brain_log,
+                stderr=asyncio.subprocess.STDOUT,
+                # Own session: a Ctrl+C on the parent terminal SIGINTs the whole
+                # foreground process group, which killed the sidecar and left a
+                # stale socket behind. bootstrap.stop() still terminates it.
+                start_new_session=True,
             )
             self.active_tasks.append(process)
+
+            # Wait for the socket so dispatchers don't race the sidecar
+            socket_path = "/tmp/brain.sock"
+
+            async def _brain_ready() -> bool:
+                """True only when something is actually LISTENING on the socket.
+
+                Path.exists() is a lie for stale sockets: the kernel does not
+                unlink a socket when its owner dies, so a killed sidecar leaves
+                a file that passes every existence check while connect() bounces
+                off it. Probe with a real connection instead.
+                """
+                try:
+                    _, writer = await asyncio.open_unix_connection(socket_path)
+                    writer.close()
+                    await writer.wait_closed()
+                    return True
+                except (FileNotFoundError, ConnectionError, OSError):
+                    return False
+
+            for _ in range(150):  # ~15s; the sidecar runs its startup tool scan
+                # BEFORE binding the socket, so cold imports (impacket, dotenv)
+                # can take a few seconds past process launch.
+                if await _brain_ready():
+                    logger.info("[+] Brain socket ready at %s", socket_path)
+                    return process
+                if process.returncode is not None:
+                    logger.error(
+                        "[!] Brain sidecar exited early (code %s); see /tmp/brain.log",
+                        process.returncode,
+                    )
+                    return process
+                await asyncio.sleep(0.1)
+            logger.warning(
+                "[!] Nothing listening on %s within 5s; dispatch will fall back to in-process launches",
+                socket_path,
+            )
+            return process
         except Exception as e:
             logger.error("[!] Brain sidecar failed to launch: %s", e, exc_info=True)
 

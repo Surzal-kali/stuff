@@ -15,9 +15,38 @@ MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 
 
 class MetasploitClient:
+    _shared: "MetasploitClient | None" = None
+
     def __init__(self, mcp_path="msfconsole"):
         self.mcp_path = mcp_path
         self.process = None
+
+    @classmethod
+    def get_instance(cls) -> "MetasploitClient":
+        """Return the shared client so bootstrap and in-process tool launches
+        bind to the SAME msfconsole handle (fixes 'console is not running'
+        caused by each caller building its own instance)."""
+        if cls._shared is None:
+            cls._shared = cls()
+        return cls._shared
+
+    async def _ensure_running(self) -> bool:
+        """Ensure a live msfconsole handle exists, lazily starting one if needed.
+
+        Returns False (and explains why) instead of silently returning None,
+        which upstream used to report as 'Success'.
+        """
+        if self.process is None:
+            print("[i] No msfconsole handle on this client; attempting lazy start...")
+            process = await self.start_mcp()
+            if process is None:
+                print(
+                    "[!] Metasploit console is not running and could not be "
+                    "started (if msfconsole is already running externally, it "
+                    "has no shared handle here)."
+                )
+                return False
+        return True
 
     async def _mirror_logs(self, process):
         """Reads stdout and stderr and writes them to a log file."""
@@ -84,13 +113,14 @@ class MetasploitClient:
         """
         Search for a Metasploit module by type and name.
         """
-        if self.process is None:
-            print("[!] Metasploit console is not running.")
+        if not await self._ensure_running():
             return None
 
         try:
             # Send the search command to the Metasploit console
-            command = f"search {module_type} {module_name}\n"
+            # Use MSF keyword syntax; plain 'search exploit smb' would treat
+            # 'exploit' as a search term instead of a type filter.
+            command = f"search type:{module_type} name:{module_name}\n"
             self.process.stdin.write(command.encode())
             await self.process.stdin.drain()
 
@@ -108,8 +138,7 @@ class MetasploitClient:
         """
         Execute a Metasploit module with specified options.
         """
-        if self.process is None:
-            print("[!] Metasploit console is not running.")
+        if not await self._ensure_running():
             return None
 
         try:
@@ -136,8 +165,7 @@ class MetasploitClient:
         """
         Set a payload with specified options.
         """
-        if self.process is None:
-            print("[!] Metasploit console is not running.")
+        if not await self._ensure_running():
             return None
 
         try:
@@ -163,8 +191,7 @@ class MetasploitClient:
         """
         Retrieve the options for a given Metasploit module.
         """
-        if self.process is None:
-            print("[!] Metasploit console is not running.")
+        if not await self._ensure_running():
             return None
 
         try:

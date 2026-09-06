@@ -9,6 +9,7 @@ import logging
 import asyncio
 import inspect
 import textwrap
+import functools
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ from pydantic_ai import (
     Tool,
     ToolApproved,
     ToolDenied,
+    capture_run_messages,
 )
 from scapy.compat import raw
 
@@ -48,9 +50,9 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "9000"))
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # The non-thinking LFM2.5 variant reliably drives the tool loop; the -thinking
 # variant hallucinated tools/executions in live testing instead of calling them.
-SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "lfm2.5:latest")
+SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gemma4:12b")
 SECRETARY_MAX_TOP_K = 10
-SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "8"))
+SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "10"))
 ALLOWED_TOOL_ROOTS = [
     (WORKSPACE_ROOT / "auxiliaries").resolve(),
     (WORKSPACE_ROOT / "payloads").resolve(),
@@ -215,21 +217,33 @@ async def secretary_search_tools(
     """
     registry = ctx.deps.registry
     limit = max(1, min(int(top_k or 5), SECRETARY_MAX_TOP_K))
+    logger.info(f"[secretary] search_tools query={query!r} top_k={limit}")
     manifests = await registry.find_tools(query, top_k=limit)
     ctx.deps.record_surfaced(manifests)
     return [registry.describe_manifest(m) for m in manifests]
 
 
 async def secretary_execute_tool(
-    ctx: RunContext[SecretaryDeps], tool_id: str, arguments: Dict[str, Any]
+    ctx: RunContext[SecretaryDeps],
+    tool_id: str,
+    arguments: Union[Dict[str, Any], str, None] = None,
 ) -> Dict[str, Any]:
     """Execute a tool that was surfaced by `search_tools` in this conversation.
 
     This call requires human approval; a confirmation showing the full module
     metadata and the arguments is presented before anything runs.
+
+    `arguments` tolerates a JSON-encoded string because small secretary models
+    routinely emit the nested object as a string; a malformed payload is
+    normalized (or wrapped as `{"_raw": ...}`) here instead of burning the
+    tool's retry budget on a schema validation error.
     """
     registry = ctx.deps.registry
     tool_id = (tool_id or "").strip()
+    args = _parse_tool_args(arguments)
+    logger.info(
+        f"[secretary] execute_tool requested: {tool_id} args={json.dumps(args, default=str)[:300]}"
+    )
 
     manifest = ctx.deps.get_surfaced(tool_id)
     if manifest is None:
@@ -242,12 +256,55 @@ async def secretary_execute_tool(
             f"Unknown tool_id '{tool_id}'. Call `search_tools` first and use a tool_id taken verbatim from its results."
         )
 
-    args = arguments or {}
+    if isinstance(args, dict) and "_raw" in args:
+        logger.warning(
+            f"[secretary] execute_tool '{tool_id}': arguments were not a valid "
+            f"JSON object; passing raw payload {str(args.get('_raw'))[:200]!r}"
+        )
     warnings = registry.validate_arguments(manifest, args)
     result = await registry.execute_tool(manifest, args)
     if isinstance(result, dict) and warnings:
         result = {**result, "argument_warnings": warnings}
+
+    # Post-execution log dump: this function body only runs once pydantic-ai
+    # has granted approval (execute_tool is declared requires_approval=True),
+    # so by the time we get here the operator said "go" and the tool already
+    # produced its side effects. Tailing the framework logs right after gives
+    # us visibility into what the Brain sidecar and MSF console actually did.
+    if isinstance(result, dict):
+        log_tail = await _tail_framework_logs()
+        if log_tail:
+            result = {**result, "post_execution_logs": log_tail}
+
     return result
+
+
+async def _tail_framework_logs() -> Dict[str, str]:
+    """Read the tail of the Brain and MSF log files after an approved tool run.
+
+    Imported lazily so utils/log_reader.py isn't pulled in at module load
+    (it imports constants, which would create a circular import otherwise).
+    Errors are swallowed: a missing/unreadable log is not a reason to fail
+    the whole tool call, just a visibility gap.
+    """
+    try:
+        from utils.log_reader import read_logs
+    except Exception as import_err:
+        logger.warning(f"[secretary] could not import read_logs: {import_err}")
+        return {}
+
+    tails: Dict[str, str] = {}
+    for log_type in ("brain", "msf"):
+        try:
+            tail = await asyncio.to_thread(read_logs, log_type, 50)
+        except Exception as tail_err:
+            logger.warning(f"[secretary] post-exec log tail ({log_type}) failed: {tail_err}")
+            continue
+        if isinstance(tail, str) and not tail.startswith("Error"):
+            tails[log_type] = tail
+        elif isinstance(tail, str):
+            logger.info(f"[secretary] post-exec log ({log_type}): {tail}")
+    return tails
 
 
 # --- Tool Registry ---
@@ -272,7 +329,12 @@ class ToolRegistry:
         # take a full-metadata summary dict and return a truthy value to approve.
         self.confirmer = confirmer or _cli_confirmer
         self.secretary = self._init_secretary_agent()
-        
+        # Lazily-created class instances for in-process launches of
+        # @framework_tool methods (e.g. MetasploitClient, SMBScanner).
+        # One instance per class per registry, so stateful clients keep
+        # their process/handles across calls.
+        self._tool_instances: Dict[str, Any] = {}
+
         # Removed automatic background bootstrap to avoid race conditions 
         # and duplicate indexing when called explicitly from bootstrap.py
 
@@ -437,9 +499,27 @@ class ToolRegistry:
                 m.implementation_path = str(
                     self._resolve_script_path(m.implementation_path)
                 )
-            existing = self.collection.get(ids=[m.module_id], include=[])
+            existing = self.collection.get(
+                ids=[m.module_id], include=["documents", "metadatas"]
+            )
             if existing and existing.get("ids"):
-                continue
+                old_doc = (existing.get("documents") or [""])[0] or ""
+                old_meta = (existing.get("metadatas") or [{}])[0] or {}
+                new_meta_json = json.dumps(m.parameters or {})
+                unchanged = (
+                    old_doc == m.internal_semantic_capability
+                    and str(old_meta.get("implementation_path", "")) == m.implementation_path
+                    and old_meta.get("transport") == m.transport.value
+                    and old_meta.get("parameters_json") == new_meta_json
+                )
+                if unchanged:
+                    continue
+                # Definition changed (doc/args/transport/path): drop the stale
+                # vector so the re-embed below refreshes it.
+                logger.info(
+                    f"[register] Tool '{m.module_id}' changed; re-embedding"
+                )
+                self.collection.delete(ids=[m.module_id])
 
             vector = await self._embed_text(m.internal_semantic_capability)
             self.collection.add(
@@ -574,7 +654,6 @@ class ToolRegistry:
         }
 
         skip_files = {
-            "framing.py",
             "bootstrap.py",
             "daharness.py",
             "memories.py",
@@ -600,46 +679,99 @@ class ToolRegistry:
                     continue
 
                 rel_path = path.relative_to(WORKSPACE_ROOT)
-                
+
+                # --- PASS 1: Static Analysis (LOCAL_FILE) ---
+                profile = self.extract_module_profile(path)
+                if profile["docstring"]:
+                    # Use the module's top-level docstring as the capability
+                    # map the argparse options to parameters
+                    params = {"type": "object", "properties": {}}
+                    required = []
+                    for opt in profile["options"]:
+                        params["properties"][opt["name"]] = {
+                            "type": opt["type"],
+                            "description": opt["help"]
+                        }
+                        if opt["required"]:
+                            required.append(opt["name"])
+                    params["required"] = required
+
+                    module_id = rel_path.with_suffix("").as_posix().replace("/", ".")
+                    manifests.append(
+                        ToolManifest(
+                            module_id=module_id,
+                            internal_semantic_capability=profile["docstring"],
+                            external_sanitized_description=profile["docstring"],
+                            parameters=params,
+                            implementation_path=str(rel_path),
+                            internal_semantics=f"Static argparse module: {module_id}",
+                            transport=TransportType.LOCAL_FILE,
+                        )
+                    )
+
                 # --- PASS 2: Dynamic Analysis (BRAIN_DISPATCH) ---
                 try:
                     # Ensure root is in path for the import to work
                     if str(WORKSPACE_ROOT) not in sys.path:
                         sys.path.insert(0, str(WORKSPACE_ROOT))
-                    
+
                     module_name = rel_path.with_suffix("").as_posix().replace("/", ".")
                     mod = importlib.import_module(module_name)
-            
-                    
-                    for name, obj in inspect.getmembers(mod):
-                        if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
-                            tool_id = f"{module_name}.{name}"
-                            doc = getattr(obj, "_tool_doc", "No description")
-                            
-                            # Extract args from signature
-                            sig = inspect.signature(obj)
-                            params = {"type": "object", "properties": {}}
-                            required = []
-                            for p_name, p_param in sig.parameters.items():
-                                params["properties"][p_name] = {
-                                    "type": "string", 
-                                    "description": f"Parameter {p_name}"
-                                }
-                                if p_param.default is inspect.Parameter.empty:
-                                    required.append(p_name)
-                            params["required"] = required
 
-                            manifests.append(
-                                ToolManifest(
-                                    module_id=tool_id,
-                                    internal_semantic_capability=doc,
-                                    external_sanitized_description=doc,
-                                    parameters=params,
-                                    implementation_path=tool_id,
-                                    internal_semantics=f"Brain-dispatched function: {tool_id}",
-                                    transport=TransportType.BRAIN_DISPATCH,
-                                )
+                    # Candidates: (tool_id, function, is_method)
+                    candidates: List[tuple] = []
+                    for name, obj in inspect.getmembers(mod):
+                        # Module-level @framework_tool functions
+                        if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
+                            candidates.append((f"{module_name}.{name}", obj, False))
+                        # @framework_tool METHODS on classes defined in THIS module.
+                        # The __module__ guard stops imported classes from being
+                        # re-minted under the wrong module_id.
+                        elif inspect.isclass(obj) and obj.__module__ == module_name:
+                            for m_name, m_obj in inspect.getmembers(obj, inspect.isfunction):
+                                if getattr(m_obj, "_is_framework_tool", False):
+                                    candidates.append(
+                                        (
+                                            f"{module_name}.{obj.__name__}.{m_name}",
+                                            m_obj,
+                                            True,
+                                        )
+                                    )
+
+                    for tool_id, func, is_method in candidates:
+                        doc = getattr(func, "_tool_doc", "No description")
+
+                        # Extract args from signature
+                        sig = inspect.signature(func)
+                        params = {"type": "object", "properties": {}}
+                        required = []
+                        for idx, (p_name, p_param) in enumerate(sig.parameters.items()):
+                            if is_method and idx == 0 and p_name in ("self", "cls"):
+                                continue  # bound at launch time via a class instance
+                            params["properties"][p_name] = {
+                                "type": "string",
+                                "description": f"Parameter {p_name}",
+                            }
+                            if p_param.default is inspect.Parameter.empty:
+                                required.append(p_name)
+                        params["required"] = required
+
+                        semantics = (
+                            f"Brain-dispatched method: {tool_id} (launched in-process via class instance)"
+                            if is_method
+                            else f"Brain-dispatched function: {tool_id}"
+                        )
+                        manifests.append(
+                            ToolManifest(
+                                module_id=tool_id,
+                                internal_semantic_capability=doc,
+                                external_sanitized_description=doc,
+                                parameters=params,
+                                implementation_path=tool_id,
+                                internal_semantics=semantics,
+                                transport=TransportType.BRAIN_DISPATCH,
                             )
+                        )
                 except Exception as e:
                     logger.error(f"[discovery] Dynamic scan failed for {rel_path}: {e}", exc_info=True)
 
@@ -807,6 +939,14 @@ class ToolRegistry:
             f"[TOOL_EXECUTE] Executing Tool ID: {manifest.module_id} | Path: {manifest.implementation_path} | Args: {arguments}"
         )
 
+        if manifest.transport == TransportType.LOCAL_FILE:
+            # Static-scan manifests (argparse modules) run as subprocesses of
+            # the script itself; _execute_local_script also enforces the
+            # ALLOWED_TOOL_ROOTS path check.
+            return await self._execute_local_script(
+                manifest.implementation_path, arguments
+            )
+
         if manifest.transport == TransportType.BRAIN_DISPATCH:
             return await self._execute_brain_tool(manifest.module_id, arguments)
 
@@ -819,33 +959,214 @@ class ToolRegistry:
         raise ValueError(f"Unsupported transport type: {manifest.transport}")
 
     async def _execute_brain_tool(self, tool_id: str, arguments: dict):
-        """Dispatch a tool call to the Brain via Unix Domain Socket."""
+        """Dispatch a tool call, launching the decorated function directly.
+
+        Order of preference:
+        1. Brain UDS socket (`/tmp/brain.sock`) when it is up and knows the tool.
+        2. In-process launch of the pythonic function — this is the fallback that
+           keeps tools runnable when the Brain sidecar is down (its startup code
+           unlinks the socket, and if the sidecar dies the socket goes with it,
+           surfacing as FileNotFoundError: [Errno 2] No such file or directory).
+        """
+        brain_result = await self._dispatch_via_brain(tool_id, arguments)
+        if brain_result is not None:
+            return brain_result
+
+        logger.info(
+            f"[BRAIN_DISPATCH] Socket unavailable or tool unknown; launching {tool_id} in-process"
+        )
+        return await self._launch_in_process(tool_id, arguments)
+
+    async def _dispatch_via_brain(
+        self, tool_id: str, arguments: dict
+    ) -> Optional[Dict[str, Any]]:
+        """Try the Brain socket. Returns None when the socket is unusable or the
+        Brain does not know the tool, so the caller can fall back in-process.
+
+        Returns a real result dict when the Brain actually ran (or genuinely
+        failed) the tool — those are NOT retried in-process to avoid double
+        side effects.
+        """
         socket_path = "/tmp/brain.sock"
+        # A tool that never returns (a listener, a wedged subprocess) used to
+        # hang this read forever and freeze the whole conversation. Bound it.
+        dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "180"))
         try:
             # Prepare the payload: "CALL_TOOL|session_id|tool_id|args"
             # We use session 0 for framework-level calls
             args_json = json.dumps(arguments)
             message = f"CALL_TOOL|0|{tool_id}|{args_json}"
-            
+
             # Use asyncio for non-blocking socket I/O
-            reader, writer = await asyncio.open_unix_connection(socket_path)
-            
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(socket_path), dispatch_timeout
+            )
+
             # Use the framing logic to send/receive (consistent with the Brain)
-            from listeners.framing import pack_message, read_message
+            from listeners.thebrain import pack_message, read_message
             writer.write(pack_message(message.encode()))
             await writer.drain()
-            
-            data = await read_message(reader)
+
+            data = await asyncio.wait_for(read_message(reader), dispatch_timeout)
             writer.close()
             await writer.wait_closed()
-            
+
+            text = data.decode(errors="replace")
+            if "not found in registry" in text:
+                # The Brain never registered this tool (e.g. a class method it
+                # has not scanned) — fall back in-process.
+                logger.info(f"[BRAIN_DISPATCH] Brain does not know '{tool_id}'; falling back in-process")
+                return None
+
             return {
-                "stdout": data.decode(),
-                "status": "Success" if "ERROR" not in data.decode() else "Failed"
+                "stdout": text,
+                "status": "Success" if "ERROR" not in text else "Failed",
             }
+        except FileNotFoundError:
+            logger.info(f"[BRAIN_DISPATCH] {socket_path} does not exist; Brain sidecar is down")
+            return None
+        except asyncio.TimeoutError:
+            # Abandon the connection cleanly: an unclosed writer leaks the fd
+            # (and the socket pair) for as long as the tool keeps running.
+            try:
+                writer.close()
+            except (NameError, UnboundLocalError):
+                pass  # never connected
+            # The Brain accepted the call and is still executing it. Report a
+            # failure but do NOT fall back in-process: that would run the tool
+            # a second time with real side effects (scans, listeners, payloads).
+            logger.error(
+                f"[BRAIN_DISPATCH] {tool_id}: no reply within {dispatch_timeout}s; "
+                "the tool may still be running on the Brain"
+            )
+            return {
+                "error": (
+                    f"Tool '{tool_id}' did not return a result within {dispatch_timeout:.0f}s. "
+                    "It may still be running on the Brain; check the sidecar logs before retrying."
+                ),
+                "status": "Failed",
+            }
+        except (ConnectionError, OSError) as e:
+            logger.info(f"[BRAIN_DISPATCH] Socket connect failed ({e}); falling back in-process")
+            return None
         except Exception as e:
             logger.error(f"[BRAIN_ERROR] Failed to dispatch tool {tool_id}: {e}")
             return {"error": f"Brain dispatch failed: {str(e)}", "status": "Failed"}
+
+    def _resolve_callable(self, tool_id: str) -> tuple:
+        """Resolve a tool_id like 'pkg.mod.func' or 'pkg.mod.Class.func' to a
+        runnable callable, instantiating the owning class if needed.
+
+        Returns (callable, error_message); exactly one of the two is populated.
+        """
+        parts = tool_id.split(".")
+        if len(parts) < 2:
+            return None, f"Tool id '{tool_id}' is not a dotted module path"
+
+        # Longest importable module prefix wins, so 'pkg.mod.Class.func'
+        # resolves the module 'pkg.mod' and walks the remaining attrs.
+        mod = None
+        mod_len = 0
+        for i in range(len(parts) - 1, 0, -1):
+            try:
+                mod = importlib.import_module(".".join(parts[:i]))
+                mod_len = i
+                break
+            except ImportError:
+                continue
+        if mod is None:
+            return None, f"No importable module found for '{tool_id}'"
+
+        obj: Any = mod
+        cls: Any = None
+        cls_key = ""
+        walked: List[str] = []
+        for attr in parts[mod_len:]:
+            walked.append(attr)
+            nxt = getattr(obj, attr, None)
+            if nxt is None:
+                return None, f"Attribute '{'.'.join(walked)}' not found in '{tool_id}'"
+            if inspect.isclass(nxt):
+                cls = nxt
+                cls_key = f"{mod.__name__}.{'.'.join(walked)}"
+            obj = nxt
+
+        if cls is not None and inspect.isfunction(obj):
+            # Unbound method: bind it to a cached class instance so stateful
+            # clients (MetasploitClient, SMBScanner, ...) keep their handles.
+            if cls_key not in self._tool_instances:
+                try:
+                    # Prefer an explicit shared-instance classmethod so stateful
+                    # clients (MetasploitClient, SMBScanner, ...) reuse the same
+                    # live handles bootstrap created instead of a dead twin.
+                    factory = getattr(cls, "get_instance", None)
+                    if callable(factory):
+                        self._tool_instances[cls_key] = factory()
+                    else:
+                        self._tool_instances[cls_key] = cls()
+                except TypeError as e:
+                    return None, (
+                        f"Class {cls.__name__} requires constructor arguments "
+                        f"and cannot be auto-instantiated: {e}"
+                    )
+            obj = getattr(self._tool_instances[cls_key], parts[-1])
+
+        if not callable(obj):
+            return None, f"'{tool_id}' resolved to non-callable {type(obj).__name__}"
+        return obj, ""
+
+    async def _launch_in_process(self, tool_id: str, arguments: dict):
+        """Launch the decorated pythonic function directly in this process.
+
+        Async tools are awaited on the running loop; sync tools run in a worker
+        thread so blocking calls (impacket, nmap) don't freeze the loop.
+        """
+        try:
+            func, error = self._resolve_callable(tool_id)
+            if func is None:
+                logger.error(f"[INPROC_LAUNCH] {tool_id}: {error}")
+                return {"error": error, "status": "Failed"}
+
+            args = dict(arguments or {})
+            # The secretary wraps unparseable argument payloads as {"_raw": ...}
+            # and passes them through; leaving it in place makes every tool die
+            # with "unexpected keyword argument '_raw'" instead of a clear
+            # missing-argument error.
+            args.pop("_raw", None)
+            if inspect.iscoroutinefunction(func):
+                result = await func(**args)
+            else:
+                result = await asyncio.to_thread(functools.partial(func, **args))
+
+            return self._wrap_launch_result(result)
+        except TypeError as e:
+            return {"error": f"Bad arguments for {tool_id}: {e}", "status": "Failed"}
+        except Exception as e:
+            logger.error(f"[INPROC_LAUNCH] {tool_id} failed: {e}", exc_info=True)
+            return {"error": f"In-process launch failed: {e}", "status": "Failed"}
+
+    @staticmethod
+    def _wrap_launch_result(result: Any) -> Dict[str, Any]:
+        """Shape an in-process result like the Brain's {'stdout', 'status'}."""
+        if result is None:
+            # A None return usually means a precondition failed (e.g. the
+            # Metasploit console handle is missing). Reporting that as
+            # 'Success' made the secretary narrate failures as successes.
+            return {
+                "stdout": "",
+                "result": None,
+                "status": "Failed",
+                "error": "Tool returned no result (precondition likely not met)",
+            }
+        if isinstance(result, str):
+            return {"stdout": result, "status": "Success"}
+        if isinstance(result, (dict, list, int, float, bool)):
+            return {
+                "stdout": json.dumps(result, default=str),
+                "result": result,
+                "status": "Success",
+            }
+        return {"stdout": str(result), "status": "Success"}
 
     def _pending_call_summary(self, call: Any, deps: SecretaryDeps) -> Dict[str, Any]:
         """Full-metadata summary of a pending execution for the human confirmer."""
@@ -952,6 +1273,28 @@ class ToolRegistry:
 
 
 
+def _dump_turn_tool_activity(messages: List[Any], limit: int = 300) -> None:
+    """Print the current turn's model activity: tool calls and retry feedback.
+
+    Splits the captured history at the last UserPromptPart so only the failed
+    turn's parts are printed, not the whole conversation.
+    """
+    start = 0
+    for index, message in enumerate(messages):
+        parts = getattr(message, "parts", None) or []
+        if any(type(part).__name__ == "UserPromptPart" for part in parts):
+            start = index
+    print("[chat] --- model activity this turn ---")
+    for message in messages[start:]:
+        for part in getattr(message, "parts", None) or []:
+            kind = type(part).__name__
+            if kind == "ToolCallPart":
+                print(f"[chat]   called {part.tool_name} args={str(part.args)[:limit]!r}")
+            elif kind == "RetryPromptPart":
+                print(f"[chat]   retry feedback: {str(part.content)[:limit]!r}")
+    print("[chat] -------------------------------------")
+
+
 async def _chat(registry: "ToolRegistry") -> None:
     """Interactive conversation with the secretary; one session, full history."""
     deps = SecretaryDeps(registry=registry)
@@ -967,13 +1310,18 @@ async def _chat(registry: "ToolRegistry") -> None:
             break
         if not user_input.strip():
             continue
-        try:
-            result = await registry.run_secretary(
-                user_input.strip(), deps=deps, message_history=history
-            )
-        except Exception as exc:
-            print(f"[chat] Error: {exc}")
-            continue
+        with capture_run_messages() as messages:
+            try:
+                result = await registry.run_secretary(
+                    user_input.strip(), deps=deps, message_history=history
+                )
+            except Exception as exc:
+                print(f"[chat] Error: {exc}")
+                cause = exc.__cause__
+                if cause is not None:
+                    print(f"[chat]   caused by {type(cause).__name__}: {cause}")
+                _dump_turn_tool_activity(messages)
+                continue
         history = result.all_messages()
         print(f"secretary> {result.output}")
 

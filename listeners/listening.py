@@ -1,11 +1,6 @@
-from logging.config import listen
-import re
-import sys
-import os
 import asyncio
-import socket
-from asyncio import StreamReader, StreamWriter
 import argparse
+from asyncio import StreamReader, StreamWriter
 
 from listeners.thebrain import pack_message
 from constants import framework_tool
@@ -73,7 +68,7 @@ class TCPListener:
             print(f"[*] Closing session {addr}")
             writer.close()
             await writer.wait_closed()
-    @framework_tool("Listen for incoming TCP connections and handle sessions.")
+    @framework_tool("Start a TCP listener on host:port. Returns immediately; the listener keeps serving in the background.")
     async def listen(self, host, port):
         # start_server is the async equivalent of socket.bind + listen + accept
         server = await asyncio.start_server(self.handle_client, host, port)
@@ -81,8 +76,30 @@ class TCPListener:
         addr = server.sockets[0].getsockname()
         print(f"[*] Listening on {addr}... Press Ctrl+C to stop.")
 
-        async with server:
-            await server.serve_forever()
+        # A listener is a *service*, not a computation: serve_forever() never
+        # returns, so awaiting it here would hang whichever loop called this
+        # tool (the Brain's CALL_TOOL handler replies only after the tool
+        # returns, and the harness awaits that reply with no timeout). Bind
+        # here, hand serving off to a background task, and report back.
+        self._server_task = asyncio.create_task(server.serve_forever())
+        return (
+            f"Listener started on {addr[0]}:{addr[1]} and is serving in the "
+            "background. Incoming sessions are logged; this call returned "
+            "instead of blocking so the conversation can continue."
+        )
+
+    async def stop(self):
+        """Stop the background listener started by `listen`, if any."""
+        task = getattr(self, "_server_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._server_task = None
+            return "Listener stopped."
+        return "No background listener running."
     async def background_task(self):
         while True:
             await asyncio.sleep(1)
