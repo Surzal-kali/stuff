@@ -50,7 +50,7 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "9000"))
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # The non-thinking LFM2.5 variant reliably drives the tool loop; the -thinking
 # variant hallucinated tools/executions in live testing instead of calling them.
-SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gemma4:12b")
+SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "glm-5.3-flash:cloud")
 SECRETARY_MAX_TOP_K = 10
 SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
 SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "300"))  # 5 min wall-clock
@@ -241,7 +241,7 @@ async def secretary_search_tools(
     logger.info(f"[secretary] search_tools query={query!r} top_k={limit} (call #{ctx.deps.search_calls}/{ctx.deps.max_search_calls})")
     manifests = await registry.find_tools(query, top_k=limit)
     ctx.deps.record_surfaced(manifests)
-    return [registry.describe_manifest(m) for m in manifests]
+    return [registry.describe_manifest(m, lean=True) for m in manifests]
 
 
 async def secretary_execute_tool(
@@ -409,6 +409,9 @@ class ToolRegistry:
             - When interacting with a shell session, a result like "[SUCCESS exit=0]" means the
               command worked even if there was no stdout. Do NOT retry a successful command.
             - Report results concisely. Do not repeat the full tool output verbatim.
+            - When a tool returns structured JSON with labeled fields (e.g. "module_path"),
+              copy the field value VERBATIM into your next tool call. Never abbreviate,
+              shorten, or paraphrase values like module paths, session IDs, or tool IDs.
             """)
 
         return Agent(
@@ -709,7 +712,14 @@ class ToolRegistry:
 
                 # --- PASS 1: Static Analysis (LOCAL_FILE) ---
                 profile = self.extract_module_profile(path)
-                if profile["docstring"]:
+                # Only index as a LOCAL_FILE tool if the module has BOTH a
+                # docstring (embedding text) AND at least one argparse option
+                # (i.e. it's actually a CLI script). A docstring with no
+                # add_argument calls means it's a library module (e.g.
+                # utils.session_manager, utils.paramiko_client) whose large
+                # module-level docstring pollutes the vector space with
+                # non-tool noise.
+                if profile["docstring"] and profile["options"]:
                     # Use the module's top-level docstring as the capability
                     # map the argparse options to parameters
                     params = {"type": "object", "properties": {}}
@@ -788,6 +798,12 @@ class ToolRegistry:
                             if is_method
                             else f"Brain-dispatched function: {tool_id}"
                         )
+                        # Respect the transport set by @framework_tool instead
+                        # of hardcoding BRAIN_DISPATCH. The decorator stores it
+                        # on _transport; default to BRAIN_DISPATCH if missing.
+                        tool_transport = getattr(
+                            func, "_transport", TransportType.BRAIN_DISPATCH
+                        )
                         manifests.append(
                             ToolManifest(
                                 module_id=tool_id,
@@ -796,7 +812,7 @@ class ToolRegistry:
                                 parameters=params,
                                 implementation_path=tool_id,
                                 internal_semantics=semantics,
-                                transport=TransportType.BRAIN_DISPATCH,
+                                transport=tool_transport,
                             )
                         )
                 except Exception as e:
@@ -918,8 +934,23 @@ class ToolRegistry:
         manifests = await self.find_tools(user_intent, top_k=top_k)
         return manifests[0] if manifests else None
 
-    def describe_manifest(self, manifest: ToolManifest) -> Dict[str, Any]:
-        """Full (non-sanitized) view of a manifest for the secretary and the confirmer."""
+    def describe_manifest(self, manifest: ToolManifest, lean: bool = False) -> Dict[str, Any]:
+        """Full (non-sanitized) view of a manifest for the secretary and the confirmer.
+
+        When lean=True, returns only the fields the secretary model needs to
+        choose a tool and construct arguments (tool_id, capability, parameters).
+        The full fields (description, implementation_path, transport,
+        internal_semantics) are only needed by the human confirmer and the
+        registry's execution dispatch — not by the model's reasoning loop.
+        Trimming these saves ~70 tokens per manifest, which compounds across
+        multi-turn conversations with multiple search calls.
+        """
+        if lean:
+            return {
+                "tool_id": manifest.module_id,
+                "capability": manifest.internal_semantic_capability,
+                "parameters": manifest.parameters,
+            }
         return {
             "tool_id": manifest.module_id,
             "capability": manifest.internal_semantic_capability,

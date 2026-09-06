@@ -149,17 +149,32 @@ class MetasploitClient:
             return None
 
     # This one goes through the Brain's logic
-    @framework_tool("Scan for MSF modules", transport=TransportType.BRAIN_DISPATCH)
-    async def search_module(self, module_type=None, module_name=None):
+    @framework_tool(
+        "Search for Metasploit modules by type and name. Use this to find "
+        "exploits, auxiliaries, payloads, and post-exploitation modules "
+        "matching a known vulnerability or service (e.g. vsftpd backdoor, "
+        "ssh_login, samba usermap_script). Returns a JSON list of objects "
+        "with a 'module_path' field — copy that value VERBATIM (including "
+        "the type prefix, e.g. 'auxiliary/scanner/ssh/ssh_login') as the "
+        "module_path argument to execute_module. Do not abbreviate or "
+        "shorten the path.",
+        transport=TransportType.BRAIN_DISPATCH,
+    )
+    async def search_module(self, module_type=None, module_name=None, limit=15):
         """
         Search for a Metasploit module by type and name.
+
+        Args:
+            module_type: Optional module type filter (exploit, auxiliary, payload, post).
+            module_name: Module name or keyword to search for (e.g. 'ssh', 'vsftpd').
+            limit: Maximum number of results to return (default 15). Caps
+                   result size so the secretary model's context isn't flooded
+                   with 50+ matches, which causes it to abbreviate paths.
         """
         if not await self._ensure_running():
             return None
 
         try:
-            # Use pymetasploit3 to search modules
-            # search() returns a list of module objects
             query = ""
             if module_type and module_name:
                 query = f"type:{module_type} name:{module_name}"
@@ -171,49 +186,93 @@ class MetasploitClient:
                 return "Please provide either a module_type or a module_name to search."
 
             results = self.client.modules.search(query)
-            
+
             if not results:
                 return f"No modules found matching query: {query}"
 
-            # MSF RPC module.search returns a dict keyed by module type, e.g.:
-            #   {'auxiliary': [{'path': 'auxiliary/scanner/ssh/ssh_login',
-            #                   'name': 'SSH Login Check Scanner', ...}]}
-            # NOT a list of objects with .name/.type attributes. Iterate the
-            # dict structure to build a readable, flat result list.
-            formatted_results = []
+            # Build a structured list with a clearly-labeled module_path
+            # field. Returning JSON (instead of formatted text like
+            # "path (type) — name") makes it much harder for the secretary
+            # model to abbreviate or mangle the path when it passes it to
+            # execute_module. The model copies a labeled JSON value far more
+            # reliably than it parses and re-types a formatted string.
+            structured = []
             if isinstance(results, dict):
                 for mod_type, mod_list in results.items():
                     if not isinstance(mod_list, list):
-                        # Single-module entry (dict) rather than a list
                         mod_list = [mod_list]
                     for mod in mod_list:
                         if isinstance(mod, dict):
                             path = mod.get('path', mod.get('name', '?'))
-                            display = mod.get('name', path)
-                            formatted_results.append(f"{path} ({mod_type}) — {display}")
+                            structured.append({
+                                "module_path": path,
+                                "type": mod_type,
+                                "name": mod.get('name', path),
+                            })
                         else:
-                            formatted_results.append(f"{mod} ({mod_type})")
+                            structured.append({
+                                "module_path": str(mod),
+                                "type": mod_type,
+                                "name": str(mod),
+                            })
             elif isinstance(results, list):
                 for mod in results:
                     if isinstance(mod, dict):
                         path = mod.get('path', mod.get('name', '?'))
-                        display = mod.get('name', path)
-                        mtype = mod.get('type', '?')
-                        formatted_results.append(f"{path} ({mtype}) — {display}")
+                        structured.append({
+                            "module_path": path,
+                            "type": mod.get('type', '?'),
+                            "name": mod.get('name', path),
+                        })
                     elif hasattr(mod, 'name') and hasattr(mod, 'type'):
-                        formatted_results.append(f"{mod.name} ({mod.type})")
+                        structured.append({
+                            "module_path": mod.name,
+                            "type": mod.type,
+                            "name": mod.name,
+                        })
                     else:
-                        formatted_results.append(str(mod))
+                        structured.append({
+                            "module_path": str(mod),
+                            "type": "?",
+                            "name": str(mod),
+                        })
             else:
                 return str(results)
-            
-            return "\n".join(formatted_results) if formatted_results else f"No modules found matching query: {query}"
+
+            # Cap the result count so the model's context window isn't
+            # overwhelmed by a long list (which causes abbreviation/truncation).
+            max_results = int(limit) if limit else 15
+            total = len(structured)
+            if total > max_results:
+                structured = structured[:max_results]
+
+            if not structured:
+                return f"No modules found matching query: {query}"
+
+            return {
+                "query": query,
+                "total_matches": total,
+                "returned": len(structured),
+                "modules": structured,
+                "note": "Use the 'module_path' value verbatim as the module_path argument to execute_module. Do not abbreviate.",
+            }
         except Exception as e:
             print(f"An error occurred while searching for the module: {e}")
             return None
 
     # This one is tagged to use the direct RPC path
-    @framework_tool("Directly execute an MSF module and report any sessions created", transport=TransportType.MCP_RPC)
+    @framework_tool(
+        "Execute or fire a Metasploit exploit or auxiliary module against a "
+        "target host. Use this to exploit a vulnerability (e.g. vsftpd "
+        "backdoor, ssh_login, samba usermap_script) and obtain a shell or "
+        "meterpreter session on the compromised target. Accepts the full "
+        "module path (e.g. exploit/unix/ftp/vsftpd_234_backdoor) and a dict "
+        "of options (RHOSTS, USERNAME, PASSWORD, PAYLOAD, LHOST, LPORT). "
+        "The module_path MUST be the exact value returned by search_module's "
+        "module_path field — do not abbreviate, shorten, or paraphrase it. "
+        "Polls for new sessions and reports their IDs.",
+        transport=TransportType.MCP_RPC,
+    )
     async def execute_module(self, module_path, options):
         """
         Execute a Metasploit module with specified options.
@@ -293,6 +352,21 @@ class MetasploitClient:
                     coerced = _coerce(option, value, module)
                     module[option] = coerced
 
+            # CRITICAL: For exploit modules with a reverse payload, set
+            # ExitOnSession=false so the handler job stays alive after the
+            # first session connects.  The MSF default (ExitOnSession=true)
+            # causes the handler to exit the instant a session is created;
+            # for staged payloads (e.g. windows/meterpreter/reverse_tcp) the
+            # stage transfer is still in flight when the handler dies, so the
+            # TCP connection drops and the session closes within ~1 second.
+            # The caller can still override this by passing ExitOnSession in
+            # options, but the safe default is false.
+            if mtype == "exploit" and payload_name and "ExitOnSession" in module.options:
+                if "ExitOnSession" not in opts:
+                    module["ExitOnSession"] = False
+                # If the caller explicitly passed it, _coerce already set it
+                # in the loop above.
+
             # Build the payload argument for execute().
             payload_arg = None
             if payload_name:
@@ -320,12 +394,28 @@ class MetasploitClient:
             # Poll for new sessions.  ssh_login and similar auxiliaries take
             # a few seconds to connect and create a session; without this
             # loop the tool returns before the session exists.
+            #
+            # We also track TRANSIENT sessions — session IDs that appeared
+            # briefly and then vanished before the next poll.  This happens
+            # when a session is created but dies almost immediately (staged
+            # payload staging failure, AV killing the payload process, etc.).
+            # Without this tracking, the loop would simply never see the
+            # session and report "No new sessions detected", hiding the real
+            # failure from the caller.
             new_sessions = []
+            transient_sessions = set()
+            seen_once = set()  # session IDs we observed at least once
             deadline = _time.time() + MSF_SESSION_POLL_SECONDS
             while _time.time() < deadline:
                 await asyncio.sleep(MSF_SESSION_POLL_INTERVAL)
                 after = set(self.client.sessions.list.keys())
-                new_sessions = sorted(after - before, key=int)
+                current_new = after - before
+                # Detect sessions that appeared since the last poll but are
+                # already gone — they were transient.
+                gone = seen_once - after
+                transient_sessions |= gone
+                seen_once |= current_new
+                new_sessions = sorted(current_new, key=int)
                 if new_sessions:
                     break
 
@@ -341,11 +431,35 @@ class MetasploitClient:
                 )
 
             if session_summaries:
-                return (
+                msg = (
                     f"Module {module_path} executed. "
                     f"{len(new_sessions)} new session(s) created:\n"
                     + "\n".join(session_summaries)
                     + "\nUse interact_session with the session ID(s) above to run commands."
+                )
+                if transient_sessions:
+                    msg += (
+                        f"\n\n[!] WARNING: {len(transient_sessions)} additional "
+                        f"session(s) were created but died immediately (IDs: "
+                        f"{sorted(transient_sessions, key=int)}). This usually "
+                        "means the staged payload's handler exited before the "
+                        "stage transfer completed (ExitOnSession was true), or "
+                        "the payload process was killed on the target (AV/EDR)."
+                    )
+                return msg
+            elif transient_sessions:
+                return (
+                    f"Module {module_path} executed (job_id={result}). "
+                    f"{len(transient_sessions)} session(s) were created but "
+                    f"closed immediately (IDs: {sorted(transient_sessions, key=int)}). "
+                    "The payload likely connected back but the session died "
+                    "before stabilizing. Common causes:\n"
+                    "  - Handler exited before staging completed (ExitOnSession)\n"
+                    "  - AV/EDR killed the payload process on the target\n"
+                    "  - Architecture/platform mismatch in the payload\n"
+                    "  - Network instability dropping the reverse connection\n"
+                    "Check the msfconsole log for details. Consider a stageless "
+                    "payload or verify the payload architecture matches the target."
                 )
             else:
                 return (
@@ -357,7 +471,11 @@ class MetasploitClient:
             print(f"An error occurred while executing the module: {e}")
             return None
 
-    @framework_tool("Set a payload with specified options.")
+    @framework_tool(
+        "Configure a Metasploit payload (e.g. cmd/unix/reverse, "
+        "windows/meterpreter/reverse_tcp) with options like LHOST and LPORT. "
+        "Use this to set up the payload before executing an exploit module."
+    )
     async def set_payload(self, payload_name, options):
         """
         Configure a Metasploit payload with specified options.
@@ -381,7 +499,11 @@ class MetasploitClient:
             print(f"An error occurred while setting the payload: {e}")
             return None
 
-    @framework_tool("Retrieve the options for a given Metasploit module.")
+    @framework_tool(
+        "Show the available options and required parameters for a specific "
+        "Metasploit module (e.g. RHOSTS, USERNAME, PAYLOAD, LHOST). Use this "
+        "before executing a module to see what needs to be set."
+    )
     async def get_options(self, module_path):
         """
         Retrieve the options for a given Metasploit module.
@@ -402,7 +524,11 @@ class MetasploitClient:
             print(f"An error occurred while retrieving options: {e}")
             return None
 
-    @framework_tool("List all active Metasploit sessions")
+    @framework_tool(
+        "List all active Metasploit sessions (shell and meterpreter). Shows "
+        "session IDs, types, target hosts, and descriptions. Use this to "
+        "check which sessions are alive after running exploit modules."
+    )
     async def list_sessions(self):
         """
         List all active Metasploit sessions (shell and meterpreter).
@@ -428,7 +554,13 @@ class MetasploitClient:
             print(f"An error occurred while listing sessions: {e}")
             return None
 
-    @framework_tool("Interact with a specific Metasploit session (shell or meterpreter)")
+    @framework_tool(
+        "Run a command on an active Metasploit session (shell or meterpreter). "
+        "Use this after execute_module creates a session to run commands like "
+        "'id', 'whoami', 'cat /etc/shadow' on the compromised target. Pass the "
+        "session ID and the command string. The session stays alive for "
+        "follow-up commands."
+    )
     async def interact_session(self, session_id, command):
         """
         Send a command to a specific active Metasploit session and read the
@@ -535,7 +667,10 @@ class MetasploitClient:
             print(f"An error occurred while interacting with session {session_id}: {e}")
             return f"MSF session interaction error: {e}"
 
-    @framework_tool("Close/kill a specific Metasploit session")
+    @framework_tool(
+        "Close and kill a specific Metasploit session by ID. Use this to "
+        "clean up after exploitation when the session is no longer needed."
+    )
     async def close_msf_session(self, session_id):
         """
         Kill and remove a Metasploit session.
