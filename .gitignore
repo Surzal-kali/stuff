@@ -24,3 +24,6 @@ tests/__pycache__/*
 *.txt
 dockertings/weaviate_data/*
 chroma-data/
+payloads/__pycache__/
+listeners/__pycache__/
+daharness/__pycache__/
