@@ -62,6 +62,12 @@ ALLOWED_TOOL_ROOTS = [
 ]
 
 
+# Allow running this file directly as a script (e.g.
+# `python3 daharness/core.py --clear`) in addition to
+# `python3 -m daharness.core`. As a script, sys.path[0] is daharness/, not the
+# project root, so the absolute `from constants import ...` below would fail.
+# Put the project root (parent of this package dir) on sys.path to fix that.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from constants import TransportType
 
 
