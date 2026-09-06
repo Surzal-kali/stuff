@@ -43,8 +43,11 @@ class MetasploitClient:
         """
         if not hasattr(self, 'client') or self.client is None:
             print("[i] No MSF RPC client on this instance; attempting lazy start...")
-            ok = await self.start_mcp()
-            if not ok:
+            await self.start_mcp()
+            # start_mcp returns a Process or None (None when it reused an
+            # already-running msfconsole, or on failure); success is signalled
+            # by the client actually being populated, not by the return value.
+            if not getattr(self, 'client', None):
                 print(
                     "[!] Metasploit RPC could not be started (msfconsole may "
                     "not be running or msgrpc failed to load)."
@@ -66,10 +69,11 @@ class MetasploitClient:
             )
             stdout, _ = await proc.communicate()
             
+            launched_process = None
             if not stdout:
                 print("[i] msfconsole is not running; launching it...")
                 # Launch msfconsole with msgrpc loaded
-                process = await asyncio.create_subprocess_exec(
+                launched_process = await asyncio.create_subprocess_exec(
                     self.mcp_path,
                     "-q",
                     "-x",
@@ -81,14 +85,16 @@ class MetasploitClient:
                 )
                 # Give it time to boot
                 await asyncio.sleep(10)
-            
+
             # Connect to the RPC interface
             # Default msgrpc port is usually 55552
             self.client = MsfRpcClient(password=pwd, port=55552)
-            return True
+            # Return the Process we own so bootstrap can reap it, or None if we
+            # reused an already-running msfconsole (nothing for us to kill).
+            return launched_process
         except Exception as e:
             print(f"An error occurred while trying to start MSF RPC: {e}")
-            return False
+            return None
 
     # This one goes through the Brain's logic
     @framework_tool("Scan for MSF modules", transport=TransportType.BRAIN_DISPATCH)

@@ -52,6 +52,8 @@ class FrameworkLoader:
         self.framework_root = framework_root
         self.runner = AsyncBackgroundRunner()
         self.active_tasks: List[Any] = []
+        self.api_server = None   # uvicorn.Server, set by api_gateway.run()
+        self.api_task = None     # the asyncio task wrapping start_api_server
         self.tool_registry: Dict[str, tuple] = {}
         self.packet_tool = None
         self.vector_registry = None
@@ -98,11 +100,16 @@ class FrameworkLoader:
             # they see the live msfconsole handle started here.
             metasploit_client = MetasploitClient.get_instance()
             process = await metasploit_client.start_mcp()
-            if process is None:
-                return None
+            # start_mcp returns the Process it launched, or None when it reused
+            # an already-running msfconsole (nothing to reap) OR on failure.
+            # Distinguish the two by whether the RPC client actually connected.
+            if process is not None:
+                self.active_tasks.append(process)
+            if not getattr(metasploit_client, 'client', None):
+                logger.warning("[!] MSF RPC client not connected; skipping tool discovery.")
+                return process
 
-            self.active_tasks.append(process)
-            logger.info("[+] MSF console launched. Waiting for RPC port...")
+            logger.info("[+] MSF console ready. Waiting for RPC port...")
 
             # Wait for RPC port to be available
             rpc_ready = await self._wait_for_rpc_port(port=MSF_RPC_PORT)
@@ -138,24 +145,6 @@ class FrameworkLoader:
                 logger.error("[!] Brain script not found at %s", brain_script)
                 return
 
-            logger.info("[+] Starting Brain sidecar...")
-            # Stream the Brain's output to a log file instead of PIPEs: nothing
-            # ever drains PIPEs here, so once the Brain prints enough output the
-            # pipe buffer fills, the sidecar blocks on write and effectively
-            # dies -- taking /tmp/brain.sock down with it (it unlinks the socket
-            # on startup, so a crashed sidecar leaves NO socket behind).
-            brain_log = open("/tmp/brain.log", "ab")
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, str(brain_script),
-                stdout=brain_log,
-                stderr=asyncio.subprocess.STDOUT,
-                # Own session: a Ctrl+C on the parent terminal SIGINTs the whole
-                # foreground process group, which killed the sidecar and left a
-                # stale socket behind. bootstrap.stop() still terminates it.
-                start_new_session=True,
-            )
-            self.active_tasks.append(process)
-
             # Wait for the socket so dispatchers don't race the sidecar
             socket_path = "/tmp/brain.sock"
 
@@ -174,6 +163,38 @@ class FrameworkLoader:
                     return True
                 except (FileNotFoundError, ConnectionError, OSError):
                     return False
+
+            # Reuse a live Brain if one is already listening. This is the
+            # common case after a bootstrap restart whose previous brain
+            # survived (start_new_session=True) and is still serving: spawning a
+            # second would either bounce off the brain's flock/socket guard and
+            # log "exited early", or -- if /tmp/brain.sock was swept while the
+            # orphan listens on an unlinked inode -- slip past that guard and
+            # produce TWO listeners on one path (the duplicate-brain bug).
+            # Returning without appending a process to active_tasks is fine:
+            # stop() only terminates tasks we own, and a reused/orphaned brain
+            # is intentionally left for its own (or another) bootstrap to reap.
+            if await _brain_ready():
+                logger.info("[+] Brain already listening at %s; reusing it", socket_path)
+                return None
+
+            logger.info("[+] Starting Brain sidecar...")
+            # Stream the Brain's output to a log file instead of PIPEs: nothing
+            # ever drains PIPEs here, so once the Brain prints enough output the
+            # pipe buffer fills, the sidecar blocks on write and effectively
+            # dies -- taking /tmp/brain.sock down with it (it unlinks the socket
+            # on startup, so a crashed sidecar leaves NO socket behind).
+            brain_log = open("/tmp/brain.log", "ab")
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(brain_script),
+                stdout=brain_log,
+                stderr=asyncio.subprocess.STDOUT,
+                # Own session: a Ctrl+C on the parent terminal SIGINTs the whole
+                # foreground process group, which killed the sidecar and left a
+                # stale socket behind. bootstrap.stop() still terminates it.
+                start_new_session=True,
+            )
+            self.active_tasks.append(process)
 
             for _ in range(150):  # ~15s; the sidecar runs its startup tool scan
                 # BEFORE binding the socket, so cold imports (impacket, dotenv)
@@ -211,6 +232,7 @@ class FrameworkLoader:
                 stderr=asyncio.subprocess.PIPE
             )
             self.active_tasks.append(process)
+        
         except Exception as e:
             logger.error("[!] SSL server exception: %s", e, exc_info=True)
 
@@ -236,18 +258,100 @@ class FrameworkLoader:
             logger.error("[!] API server failed to start: %s", e, exc_info=True)
 
     async def stop(self):
-        """Stops all background tasks and the event loop."""
+        """Stop all background tasks and WAIT for child processes to exit.
+
+        The old version fired terminate()/cancel() and returned without
+        awaiting: SIGTERM was sent but the child's finally-block cleanup (the
+        Brain unlinking /tmp/brain.sock, the SSL server tearing down) was never
+        confirmed before the parent exited. Worse, in interactive mode there's
+        no SIGINT handler, so a second impatient Ctrl+C aborted this loop
+        mid-iteration -- some children never got terminate() at all and were
+        left orphaned (PPID=1), still holding a live socket on an unlinked
+        inode. Now: SIGTERM every child, await each exit concurrently with a
+        grace period, SIGKILL stragglers, then await cancelled asyncio tasks.
+        """
         logger.info("[*] Stopping background tasks...")
-        for task in self.active_tasks:
-            if isinstance(task, asyncio.subprocess.Process):
-                try:
-                    task.terminate()
-                except ProcessLookupError:
-                    pass
-            else:
-                    task.cancel()
+        procs = [t for t in self.active_tasks if isinstance(t, asyncio.subprocess.Process)]
+        tasks = [t for t in self.active_tasks if not isinstance(t, asyncio.subprocess.Process)]
+
+        # --- Graceful uvicorn shutdown -------------------------------------------------
+        # Cancelling the API-server task mid-serve() leaves starlette's lifespan
+        # handler parked on `await receive()`, which surfaces as a noisy
+        # CancelledError traceback. Instead, flip uvicorn's should_exit flag so
+        # serve() returns cleanly via its own shutdown path, then await the task
+        # with a short grace period. If it doesn't wind down in time (or there
+        # is no server reference), it falls through to the cancel loop below.
+        if self.api_server is not None:
+            self.api_server.should_exit = True
+        if self.api_task is not None and not self.api_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self.api_task), timeout=3)
+            except asyncio.TimeoutError:
+                logger.warning("[!] API server didn't shut down in 3s; will cancel its task")
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # serve() may raise on forced exit; the task is done either way
+
+        # Cancel any remaining asyncio tasks (API task may already be done now)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for p in procs:
+            try:
+                p.terminate()  # SIGTERM
+            except ProcessLookupError:
+                pass
+
+        async def _reap_proc(p):
+            try:
+                await asyncio.wait_for(p.wait(), timeout=5)
+                return
+            except asyncio.TimeoutError:
+                logger.warning("[!] Child pid %s didn't exit on SIGTERM; sending SIGKILL", p.pid)
+            except ProcessLookupError:
+                return
+            except Exception as e:
+                logger.warning("[!] Error awaiting child pid %s: %s", p.pid, e)
+                return
+            try:
+                p.kill()  # SIGKILL
+            except ProcessLookupError:
+                return
+            try:
+                await p.wait()
+            except Exception:
+                pass
+
+        async def _reap():
+            if tasks:
+                await asyncio.gather(*(t for t in tasks), return_exceptions=True)
+            if procs:
+                await asyncio.gather(*(_reap_proc(p) for p in procs), return_exceptions=True)
+
+        # Shield so a task cancellation (asyncio.run's KeyboardInterrupt path)
+        # can't cut reaping short; children already got SIGTERM above, and the
+        # Brain's own SIGTERM handler unlinks its socket regardless.
+        try:
+            await asyncio.shield(_reap())
+        except asyncio.CancelledError:
+            pass
+
         self.runner.stop()
         logger.info("[*] All background tasks stopped.")
+
+    def _hard_kill_children(self):
+        """Last-resort SIGKILL of every child process we know about. Called
+        when a second KeyboardInterrupt aborts stop() before it can finish
+        reaping, so no sidecar is left orphaned on a live socket."""
+        for t in self.active_tasks:
+            if isinstance(t, asyncio.subprocess.Process):
+                try:
+                    t.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
 
     async def launch_all(self):
         """Launches all servers in the background."""
@@ -259,7 +363,8 @@ class FrameworkLoader:
         # Start services
         self.active_tasks.append(asyncio.create_task(self.start_brain_server()))
         self.active_tasks.append(asyncio.create_task(self.start_ssl_server()))
-        self.active_tasks.append(asyncio.create_task(self.start_api_server()))
+        self.api_task = asyncio.create_task(self.start_api_server())
+        self.active_tasks.append(self.api_task)
         self.active_tasks.append(asyncio.create_task(self.start_metasploit_mcp()))
         
         
@@ -270,6 +375,27 @@ class FrameworkLoader:
 async def run_framework():
     daemon_mode = "--daemon" in sys.argv
     loader = FrameworkLoader(FRAMEWORK_ROOT)
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    sigint_count = 0
+
+    def _graceful_sigint():
+        """First Ctrl+C: cancel the main task so it flows into the finally ->
+        stop() reaping path (clean socket unlink, awaited child exits). Second
+        Ctrl+C: don't wait for graceful stop() -- it may be stuck -- hard-kill
+        children and exit immediately so nothing is orphaned on a live socket.
+        """
+        nonlocal sigint_count
+        sigint_count += 1
+        if sigint_count == 1:
+            logger.info("[*] Interrupt received; shutting down gracefully "
+                        "(Ctrl+C again to force-quit)...")
+            main_task.cancel()
+        else:
+            logger.warning("[!] Second interrupt: force-killing children and exiting")
+            loader._hard_kill_children()
+            os._exit(130)  # 128 + SIGINT(2); bypasses finally -- children already killed
+
     try:
         await loader.launch_all()
         if daemon_mode:
@@ -280,13 +406,29 @@ async def run_framework():
             signal.signal(signal.SIGINT, request_shutdown)
             await shutdown_event.wait()
         else:
-            # Interactive mode (restricted)
+            # Interactive mode (restricted). Install a graceful SIGINT handler
+            # so a single Ctrl+C cancels the main task and flows into the
+            # finally -> stop() reaping path, instead of raising a raw
+            # KeyboardInterrupt mid-await that could leave cleanup half-done and
+            # children orphaned. add_signal_handler dispatches the callback on
+            # the loop thread (safe to cancel a task); fall back to signal.signal
+            # on platforms (e.g. Windows) that don't implement it.
+            try:
+                loop.add_signal_handler(signal.SIGINT, _graceful_sigint)
+            except NotImplementedError:
+                signal.signal(signal.SIGINT, lambda *_: _graceful_sigint())
             logger.info("[*] Indexing framework tools...")
             await loader.vector_registry.bootstrap_registry()
             logger.info("[*] Entering interactive mode. Type 'exit' to quit.")
             while True:
                     await _chat(registry=loader.vector_registry)
                     break
+    except asyncio.CancelledError:
+        # Expected: our SIGINT handler cancelled main_task. Swallow it and fall
+        # through to the finally so stop() can reap children gracefully. (We
+        # deliberately suppress the cancellation here -- this is the graceful
+        # shutdown path, not an error.)
+        pass
     except Exception as e:
         logger.error("[-] Exception in main: %s", e, exc_info=True)
         try:
@@ -295,7 +437,16 @@ async def run_framework():
         except Exception:
             pass
     finally:
-        await loader.stop()
+        try:
+            await loader.stop()
+        except KeyboardInterrupt:
+            # Defence in depth: a raw KeyboardInterrupt still reached stop()
+            # (e.g. SIGTERM in interactive mode, or a platform where the
+            # add_signal_handler fallback didn't take). Force-kill children so
+            # none are orphaned on a live socket, then propagate.
+            logger.warning("[!] Interrupt during shutdown: force-killing child processes")
+            loader._hard_kill_children()
+            raise
 
 if __name__ == "__main__":
     asyncio.run(run_framework())

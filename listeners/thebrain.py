@@ -2,6 +2,7 @@ import asyncio
 import os
 import socket
 import ctypes
+import fcntl
 import inspect
 import importlib
 import functools
@@ -201,6 +202,26 @@ async def read_message(reader: asyncio.StreamReader) -> bytes:
         raise ValueError(f"declared message length {length} exceeds max {MAX_MESSAGE_SIZE}")
     return await reader.readexactly(length)
 
+def _cleanup_brain_log():
+    """Truncate /tmp/brain.log on Brain exit.
+
+    Runs from start_brain()'s finally, which is reached on every controlled
+    exit path: serve_forever() returning, and SIGINT/SIGTERM (both routed
+    through task cancellation so the finally unwinds). SIGKILL still skips it.
+    Truncates in place rather than unlinking so a concurrent reader never
+    races on a vanished file; the inode stays, contents are emptied.
+    """
+    log_path = "/tmp/brain.log"
+    try:
+        if os.path.exists(log_path):
+            with open(log_path, "w") as fh:
+                fh.truncate(0)
+            print(f"[+] Cleared {log_path} on exit")
+    except OSError as e:
+        # Best-effort: never let log cleanup mask or abort a real shutdown.
+        print(f"[!] Could not clear {log_path}: {e}")
+
+
 async def start_brain():
     loop = asyncio.get_running_loop()
     # SIGTERM (what bootstrap.stop() sends) would otherwise kill the process
@@ -213,6 +234,29 @@ async def start_brain():
             loop.add_signal_handler(sig, main_task.cancel)
         except NotImplementedError:
             pass  # non-unix event loop; best effort only
+
+    # Singleton guard via an exclusive flock on a separate lockfile. The
+    # connect-probe below only catches a second Brain when the FIRST one's
+    # socket file is still on disk -- but a reparented orphan (parent
+    # bootstrap died; start_new_session=True keeps the brain alive, reparented
+    # to init) goes on listening on an UNLINKED inode after /tmp is swept by
+    # systemd-tmpfiles, invisible to Path.exists()/connect(). The flock catches
+    # that: the orphan holds it, a new instance can't acquire it, and the
+    # kernel releases it on death (even SIGKILL) so it can never go stale.
+    # Acquired here in start_brain() ONLY -- never at import time -- so the
+    # harness dispatch path and other modules importing listeners.thebrain
+    # never contend on it. lock_fh is deliberately kept referenced for the
+    # lifetime of serve_forever(); closing it (implicit on exit) releases the
+    # lock.
+    lock_fh = open("/tmp/brain.lock", "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as e:
+        lock_fh.close()
+        raise RuntimeError(
+            f"another Brain holds /tmp/brain.lock; refusing to start a second "
+            f"Brain (orphan listening on an unlinked socket?). {e}"
+        ) from e
 
     # Unlink a STALE socket file before binding. This must NOT run at module
     # import time: any process importing listeners.thebrain (the harness
@@ -244,33 +288,43 @@ async def start_brain():
             writer.close()
             return
 
-        message = data.decode()
-
-        # Parse the event triplet: "event|session_id|data"
         try:
-            event_type, session_id, payload = message.split('|', 2)
-            session_id = int(session_id)
-        except ValueError:
-            print(f"Malformed event received: {message}")
-            writer.write(pack_message(b"Error: Malformed event"))
-            await writer.drain()
-            writer.close()
-            return
+            message = data.decode()
 
-        print(f"Received {event_type} for session {session_id}: {payload}")
-        
-        # Create the event struct
-        event = FrameworkEvent()
-        event.event_type = event_type.encode()[:31]
-        event.session_id = session_id
-        event.data = payload.encode()[:1023]
-        event.data_len = len(payload)
-        
-        result = await dispatch(event)
-        response = result.encode() if result else b"Event dispatched."
-        writer.write(pack_message(response))
-        await writer.drain()
-        writer.close()
+            # Parse the event triplet: "event|session_id|data"
+            try:
+                event_type, session_id, payload = message.split('|', 2)
+                session_id = int(session_id)
+            except ValueError:
+                print(f"Malformed event received: {message}")
+                writer.write(pack_message(b"Error: Malformed event"))
+                await writer.drain()
+                return
+
+            print(f"Received {event_type} for session {session_id}: {payload}")
+            
+            # Create the event struct
+            event = FrameworkEvent()
+            event.event_type = event_type.encode()[:31]
+            event.session_id = session_id
+            event.data = payload.encode()[:1023]
+            event.data_len = len(payload)
+            
+            result = await dispatch(event)
+            response = result.encode() if result else b"Event dispatched."
+            writer.write(pack_message(response))
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
+            # Client hung up before we finished sending the response. Harmless
+            # to the server -- asyncio isolates per-connection callbacks -- but
+            # unhandled it spams the log as "Unhandled exception in
+            # client_connected_cb" with a full traceback. Log quietly instead.
+            print(f"Client disconnected before response completed: {e}")
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
     server = await asyncio.start_unix_server(handle_client, path=socket_path)
     # Remember which socket file inode WE bound, so the shutdown unlink below
     # can never delete a newer sidecar's live socket after we lingered past it.
@@ -293,6 +347,7 @@ async def start_brain():
                 os.unlink(socket_path)
         except (FileNotFoundError, OSError):
             pass
+        _cleanup_brain_log()
 
 async def dispatch(event):
     event_type = event.event_type.decode().strip('\x00')

@@ -78,4 +78,8 @@ async def run(loader, host="127.0.0.1", port=6000):
     import uvicorn
     config = uvicorn.Config(api_gateway.app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
+    # Expose the server so bootstrap.stop() can request a graceful shutdown
+    # (should_exit=True) instead of cancelling our task mid-lifespan, which
+    # would surface as a CancelledError traceback from starlette's receive().
+    loader.api_server = server
     await server.serve()
