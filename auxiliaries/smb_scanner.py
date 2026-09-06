@@ -30,7 +30,7 @@ class SMBScanner:
         """Attempts a Null Session connection to a target SMB share."""
         try:
             # timeout=2 to keep the scan moving
-            conn = SMBConnection(target, target, remoteByName=False, timeout=2)
+            conn = SMBConnection(target, target, remoteName=False, timeout=2)
             # Attempt login with empty user and empty password
             conn.login('', '') 
             conn.logoff()
