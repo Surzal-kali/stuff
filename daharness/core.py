@@ -52,7 +52,8 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # variant hallucinated tools/executions in live testing instead of calling them.
 SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gemma4:12b")
 SECRETARY_MAX_TOP_K = 10
-SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "10"))
+SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
+SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "300"))  # 5 min wall-clock
 ALLOWED_TOOL_ROOTS = [
     (WORKSPACE_ROOT / "auxiliaries").resolve(),
     (WORKSPACE_ROOT / "payloads").resolve(),
@@ -171,6 +172,13 @@ class SecretaryDeps:
 
     registry: "ToolRegistry"
     surfaced_tools: Dict[str, ToolManifest] = field(default_factory=dict)
+    search_calls: int = 0
+    execute_calls: int = 0
+    # Hard limit on search_tools calls within a single run_secretary turn.
+    # Without this, a confused small model can loop on search_tools (which
+    # needs no approval) dozens of times within one run(), pegging the GPU
+    # at 100% for minutes without ever calling execute_tool.
+    max_search_calls: int = field(default_factory=lambda: int(os.getenv("SECRETARY_MAX_SEARCH_CALLS", "5")))
 
     def record_surfaced(self, manifests: List[ToolManifest]) -> None:
         for manifest in manifests:
@@ -223,7 +231,14 @@ async def secretary_search_tools(
     """
     registry = ctx.deps.registry
     limit = max(1, min(int(top_k or 5), SECRETARY_MAX_TOP_K))
-    logger.info(f"[secretary] search_tools query={query!r} top_k={limit}")
+    ctx.deps.search_calls += 1
+    if ctx.deps.search_calls > ctx.deps.max_search_calls:
+        raise ModelRetry(
+            f"You have called search_tools {ctx.deps.search_calls} times in this turn without converging. "
+            "Either pick a tool from the results you already have and call execute_tool, "
+            "or tell the user you cannot fulfill the request. Do NOT search again."
+        )
+    logger.info(f"[secretary] search_tools query={query!r} top_k={limit} (call #{ctx.deps.search_calls}/{ctx.deps.max_search_calls})")
     manifests = await registry.find_tools(query, top_k=limit)
     ctx.deps.record_surfaced(manifests)
     return [registry.describe_manifest(m) for m in manifests]
@@ -247,6 +262,7 @@ async def secretary_execute_tool(
     registry = ctx.deps.registry
     tool_id = (tool_id or "").strip()
     args = _parse_tool_args(arguments)
+    ctx.deps.execute_calls += 1
     logger.info(
         f"[secretary] execute_tool requested: {tool_id} args={json.dumps(args, default=str)[:300]}"
     )
@@ -302,7 +318,7 @@ async def _tail_framework_logs() -> Dict[str, str]:
     tails: Dict[str, str] = {}
     for log_type in ("brain", "msf"):
         try:
-            tail = await asyncio.to_thread(read_logs, log_type, 50)
+            tail = await asyncio.to_thread(read_logs, log_type, 15)
         except Exception as tail_err:
             logger.warning(f"[secretary] post-exec log tail ({log_type}) failed: {tail_err}")
             continue
@@ -388,6 +404,11 @@ class ToolRegistry:
             - If no search result matches the request, say so instead of executing something unrelated.
             - Never claim a module ran unless `execute_tool` returned a result to you in this turn.
             - Arguments are forwarded to the module as `--key value`; keep values simple and explicit.
+            - You may call `search_tools` at most 5 times per turn. If you cannot find the right tool
+              after searching, tell the user — do not keep searching.
+            - When interacting with a shell session, a result like "[SUCCESS exit=0]" means the
+              command worked even if there was no stdout. Do NOT retry a successful command.
+            - Report results concisely. Do not repeat the full tool output verbatim.
             """)
 
         return Agent(
@@ -957,10 +978,14 @@ class ToolRegistry:
             return await self._execute_brain_tool(manifest.module_id, arguments)
 
         if manifest.transport == TransportType.MCP_RPC:
-            # This would call the Metasploit MCP endpoint
-            # For now, we can route this through the Brain if the Brain handles MSF,
-            # or implement a direct RPC call here.
-            return {"status": "pending", "message": "MCP_RPC transport requires direct client implementation."}
+            # MCP_RPC tools (e.g. MetasploitClient.execute_module) are async
+            # methods on the same in-process class instances as the
+            # BRAIN_DISPATCH tools. There is no separate MCP endpoint to call,
+            # so route them through the identical Brain-first / in-process
+            # fallback path. The previous stub returned "pending" without ever
+            # invoking the method, which silently dropped every exploit
+            # execution (the module never fired, no session was created).
+            return await self._execute_brain_tool(manifest.module_id, arguments)
 
         raise ValueError(f"Unsupported transport type: {manifest.transport}")
 
@@ -1208,42 +1233,56 @@ class ToolRegistry:
         confirmer = confirmer or self.confirmer
         deps = deps or SecretaryDeps(registry=self)
 
-        result = await self.secretary.run(
-            user_prompt, deps=deps, message_history=message_history
-        )
+        # Reset per-turn counters so a new user prompt starts fresh.
+        deps.search_calls = 0
+        deps.execute_calls = 0
 
-        rounds = 0
-        while isinstance(result.output, DeferredToolRequests):
-            rounds += 1
-            if rounds > SECRETARY_MAX_APPROVAL_ROUNDS:
-                raise RuntimeError(
-                    f"Secretary exceeded {SECRETARY_MAX_APPROVAL_ROUNDS} approval rounds; aborting run."
-                )
-
-            approvals: Dict[str, Any] = {}
-            for call in result.output.approvals:
-                summary = self._pending_call_summary(call, deps)
-                logger.info(
-                    f"[TOOL_CONFIRM] Requesting approval: {json.dumps(summary, default=str)}"
-                )
-                approved = await _run_confirmer(confirmer, summary)
-                logger.info(
-                    f"[TOOL_CONFIRM] Decision for {call.tool_call_id}: {'approved' if approved else 'denied'}"
-                )
-                if approved:
-                    approvals[call.tool_call_id] = ToolApproved()
-                else:
-                    approvals[call.tool_call_id] = ToolDenied(
-                        message="The user denied this execution. Do not retry it without new instructions."
-                    )
-
+        async def _run():
             result = await self.secretary.run(
-                message_history=result.all_messages(),
-                deferred_tool_results=result.output.build_results(approvals=approvals),
-                deps=deps,
+                user_prompt, deps=deps, message_history=message_history
             )
 
-        return result
+            rounds = 0
+            while isinstance(result.output, DeferredToolRequests):
+                rounds += 1
+                if rounds > SECRETARY_MAX_APPROVAL_ROUNDS:
+                    raise RuntimeError(
+                        f"Secretary exceeded {SECRETARY_MAX_APPROVAL_ROUNDS} approval rounds; aborting run."
+                    )
+
+                approvals: Dict[str, Any] = {}
+                for call in result.output.approvals:
+                    summary = self._pending_call_summary(call, deps)
+                    logger.info(
+                        f"[TOOL_CONFIRM] Requesting approval: {json.dumps(summary, default=str)}"
+                    )
+                    approved = await _run_confirmer(confirmer, summary)
+                    logger.info(
+                        f"[TOOL_CONFIRM] Decision for {call.tool_call_id}: {'approved' if approved else 'denied'}"
+                    )
+                    if approved:
+                        approvals[call.tool_call_id] = ToolApproved()
+                    else:
+                        approvals[call.tool_call_id] = ToolDenied(
+                            message="The user denied this execution. Do not retry it without new instructions."
+                        )
+
+                result = await self.secretary.run(
+                    message_history=result.all_messages(),
+                    deferred_tool_results=result.output.build_results(approvals=approvals),
+                    deps=deps,
+                )
+
+            return result
+
+        try:
+            return await asyncio.wait_for(_run(), timeout=SECRETARY_TURN_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Secretary turn exceeded {SECRETARY_TURN_TIMEOUT:.0f}s wall-clock timeout. "
+                f"(search_calls={deps.search_calls}, execute_calls={deps.execute_calls}). "
+                "The model may be stuck in a loop; reduce context or try a simpler prompt."
+            )
 
     async def _execute_local_script(self, script_path: str, arguments: dict):
         """

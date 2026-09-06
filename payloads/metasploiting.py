@@ -55,20 +55,55 @@ class MetasploitClient:
                 return False
         return True
 
+    async def _wait_for_port(self, host="127.0.0.1", port=55552,
+                             timeout=90, interval=2):
+        """Poll until the msgrpc TCP port accepts a connection.
+
+        msfconsole can take 30-60+ seconds to boot and load the msgrpc plugin
+        (especially on first run while it builds the module cache).  Connecting
+        before the port is open causes MsfRpcClient.login() to fail with an
+        auth/connection error that the 3-try retry in post_request cannot
+        out-wait.  This poller gives the RPC server time to come up before we
+        attempt authentication.
+        """
+        import socket as _socket
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            try:
+                with _socket.create_connection((host, port), timeout=2):
+                    return True
+            except (ConnectionRefusedError, OSError, _socket.timeout):
+                pass
+            await asyncio.sleep(interval)
+        return False
+
     async def start_mcp(self):
         """
         Load and start msgrpc in the Metasploit console session.
         """
         pwd = MSGRPC_PASSWORD
         try:
-            # We check if msfconsole is running to ensure we can connect
-            proc = await asyncio.create_subprocess_shell(
-                "pgrep -x msfconsole",
+            # We check if msfconsole is running to ensure we can connect.
+            # Use -f (full cmdline match) not -x (exact process-name match):
+            # msfconsole is a Ruby script, so the kernel process name is
+            # "ruby", and `pgrep -x msfconsole` would never match it.
+            #
+            # The pattern '[m]sfconsole' is a regex that matches the literal
+            # string "msfconsole" (the [m] character class matches 'm'), but
+            # the pattern text itself does NOT contain "msfconsole", so pgrep
+            # cannot match its own command line or the shell running it.  This
+            # avoids the self-match that caused start_mcp to think msfconsole
+            # was already running and skip the launch.
+            #
+            # create_subprocess_exec (no shell) is used so there is no
+            # intermediate bash process whose argv could be matched either.
+            proc = await asyncio.create_subprocess_exec(
+                "pgrep", "-f", "[m]sfconsole",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await proc.communicate()
-            
+
             launched_process = None
             if not stdout:
                 print("[i] msfconsole is not running; launching it...")
@@ -83,12 +118,29 @@ class MetasploitClient:
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                 )
-                # Give it time to boot
-                await asyncio.sleep(10)
+            else:
+                # msfconsole is already running, but it may NOT have msgrpc
+                # loaded (e.g. a manually-started console).  If port 55552 is
+                # not listening yet, we need to load the plugin ourselves.
+                print("[i] msfconsole already running; checking for msgrpc port...")
 
-            # Connect to the RPC interface
-            # Default msgrpc port is usually 55552
-            self.client = MsfRpcClient(password=pwd, port=55552)
+            # Poll for the RPC port to come up before attempting to connect.
+            # This replaces the fixed 10-second sleep that was too short for
+            # cold boots, and also covers the "already running but no msgrpc"
+            # case (the port simply never opens and we fail clearly).
+            port = 55552
+            ready = await self._wait_for_port(port=port)
+            if not ready:
+                print(
+                    f"[!] msgrpc did not come up on port {port} within the "
+                    f"timeout. If msfconsole was already running without "
+                    f"msgrpc, load it manually:  load msgrpc Pass={pwd}"
+                )
+                self.client = None
+                return launched_process
+
+            # Connect to the RPC interface now that the port is confirmed open.
+            self.client = MsfRpcClient(password=pwd, port=port)
             # Return the Process we own so bootstrap can reap it, or None if we
             # reused an already-running msfconsole (nothing for us to kill).
             return launched_process
@@ -192,13 +244,78 @@ class MetasploitClient:
                 return f"Invalid module_path '{module_path}'. Expected 'type/name', e.g. 'auxiliary/scanner/ssh/ssh_login'."
             mtype, mname = parts[0], parts[1]
             module = self.client.modules.use(mtype, mname)
-            for option, value in options.items():
-                # pymetasploit3 uses dict-style assignment (__setitem__),
-                # not a set_option() method.
-                module[option] = value
+
+            # Type coercion: the secretary model passes all option values as
+            # strings (from JSON), but pymetasploit3 enforces types — boolean
+            # options raise TypeError if given "true"/"false" strings, and
+            # integer options may misbehave with string numbers.  Inspect each
+            # option against the module's option metadata and coerce.
+            def _coerce(opt_name, opt_val, target_module):
+                if opt_name not in target_module.options:
+                    return opt_val  # payload-level option, handle separately
+                # pymetasploit3 stores option metadata in _moptions
+                mopt = target_module._moptions.get(opt_name, {})
+                opt_type = mopt.get("type", "")
+                if opt_type == "bool":
+                    if isinstance(opt_val, str):
+                        return opt_val.lower() in ("true", "1", "yes")
+                    return bool(opt_val)
+                elif opt_type == "integer":
+                    try:
+                        return int(opt_val)
+                    except (ValueError, TypeError):
+                        return opt_val
+                return opt_val
+
+            # CRITICAL: pymetasploit3 exploit modules do NOT accept PAYLOAD,
+            # LHOST, or LPORT as regular datastore options (module['PAYLOAD']
+            # raises KeyError).  These are payload-level options that must be
+            # set on a PayloadModule object and passed to execute().  Worse,
+            # calling execute() with no payload kwarg sets
+            # DisablePayloadHandler=True — the exploit fires but never listens
+            # for the reverse shell, so no session is ever created.
+            #
+            # The fix: if PAYLOAD is in the options, load it as a
+            # PayloadModule, set LHOST/LPORT/etc. on it, and pass the
+            # PayloadModule to execute().  pymetasploit3's execute() merges
+            # the payload's runoptions (LHOST, LPORT, etc.) into the final
+            # RPC call — this is the ONLY way those values reach MSF.
+            opts = dict(options)  # copy so we don't mutate the caller's dict
+            payload_name = opts.pop("PAYLOAD", None)
+
+            # Set non-payload options on the module datastore first.
+            # Check against module.options (the list of valid option names),
+            # NOT `option in module` — __contains__ checks _runopts which is
+            # the runtime datastore and may not contain options that haven't
+            # been set yet, causing valid options like RHOSTS to be skipped.
+            for option, value in opts.items():
+                if option in module.options:
+                    coerced = _coerce(option, value, module)
+                    module[option] = coerced
+
+            # Build the payload argument for execute().
+            payload_arg = None
+            if payload_name:
+                # Load the payload as a PayloadModule so LHOST/LPORT can be
+                # set on it.  pymetasploit3's execute() only merges payload
+                # runoptions when it receives a PayloadModule, not a string.
+                payload_mod = self.client.modules.use("payload", payload_name)
+                # Set any payload-level options that the exploit module
+                # didn't accept (LHOST, LPORT, LURI, etc.).
+                for opt_name, opt_val in opts.items():
+                    if opt_name not in module.options and opt_name in payload_mod.options:
+                        coerced = _coerce(opt_name, opt_val, payload_mod)
+                        payload_mod[opt_name] = coerced
+                payload_arg = payload_mod
 
             # Execute the module (fires as a job, returns immediately).
-            result = module.execute()
+            # For exploit modules with a payload, the handler is enabled and
+            # LHOST/LPORT are properly set.  For auxiliaries, payload_arg is
+            # None and execute() behaves normally.
+            if payload_arg is not None:
+                result = module.execute(payload=payload_arg)
+            else:
+                result = module.execute()
 
             # Poll for new sessions.  ssh_login and similar auxiliaries take
             # a few seconds to connect and create a session; without this
@@ -321,6 +438,11 @@ class MetasploitClient:
         call interact_session again with the same session_id for follow-up
         commands.
 
+        For shell sessions, an exit-code marker is appended after the command
+        so the caller can tell whether a command that produced no stdout (like
+        'touch', 'mkdir', 'cp') actually succeeded.  The return string always
+        includes an explicit success/failure indicator.
+
         Args:
             session_id: The numeric ID of the MSF session (from list_sessions or execute_module).
             command: The command to execute within the session.
@@ -329,35 +451,86 @@ class MetasploitClient:
             return None
 
         try:
-            # client.sessions.session(sid) returns a ShellSession or
-            # MeterpreterSession object wrapping the live MSF session.
-            # The session itself persists in MSF across calls.
             sid = str(session_id)
             sessions = self.client.sessions.list
             if sid not in sessions:
                 return f"MSF session {session_id} not found. Call list_sessions to see active sessions."
 
             session = self.client.sessions.session(sid)
+            session_type = sessions[sid].get("type", "")
 
-            # Both ShellSession and MeterpreterSession have write() + read().
-            # write() appends a newline if missing; read() returns the output
-            # buffer.  We write, wait briefly, then read.
-            session.write(command)
-            await asyncio.sleep(1.5)
-
-            output = session.read()
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-
-            # If no output yet, try once more after a longer wait (meterpreter
-            # can be slow to respond).
-            if not output or not output.strip():
+            # --- Shell sessions: append an exit-code sentinel ---
+            # A bare 'touch /tmp/foo' produces no stdout — read() returns just
+            # the next prompt, which the LLM cannot interpret as success or
+            # failure.  By echoing a unique sentinel with the exit code, we
+            # can parse a definitive result regardless of stdout volume.
+            if "shell" in session_type:
+                sentinel = "__CMD_EXIT_CODE__"
+                full_cmd = f"{command}; echo {sentinel}_$?_"
+                session.write(full_cmd)
                 await asyncio.sleep(2.0)
+
                 output = session.read()
                 if isinstance(output, bytes):
                     output = output.decode("utf-8", errors="replace")
 
-            return output if output else f"(no output from session {session_id})"
+                # Drain any remaining output (slow shells may still be writing).
+                if sentinel not in output:
+                    await asyncio.sleep(1.5)
+                    more = session.read()
+                    if isinstance(more, bytes):
+                        more = more.decode("utf-8", errors="replace")
+                    output += more
+
+                # Parse the exit code sentinel: __CMD_EXIT_CODE___0_
+                exit_code = None
+                clean_output = output
+                import re as _re
+                m = _re.search(r"__CMD_EXIT_CODE__(?:_)?(\d+)(?:_)?", output)
+                if m:
+                    exit_code = int(m.group(1))
+                    # Strip the sentinel and everything after it from the
+                    # displayed output so the model sees only the command's
+                    # actual stdout.
+                    clean_output = output[:m.start()].strip()
+
+                # Also strip a leading echo of the sentinel command if the
+                # shell echoed it back (common in raw shells).
+                if full_cmd in clean_output:
+                    clean_output = clean_output.replace(full_cmd, "").strip()
+                # Strip leading prompt artifacts.
+                for prompt_char in ("$", "#", ">"):
+                    if clean_output.startswith(prompt_char):
+                        clean_output = clean_output[1:].lstrip()
+
+                if exit_code is not None and exit_code == 0:
+                    if clean_output:
+                        return f"[SUCCESS exit=0] {clean_output}"
+                    return f"[SUCCESS exit=0] Command completed with no stdout output (normal for touch/mkdir/cp/etc)."
+                elif exit_code is not None:
+                    return f"[FAILED exit={exit_code}] {clean_output or '(no stdout)'}"
+                else:
+                    # Sentinel not found — the command may still be running or
+                    # the shell is unresponsive.  Return what we have.
+                    return f"[UNKNOWN] Raw output: {output!r}"
+            else:
+                # --- Meterpreter sessions: use write/read directly ---
+                session.write(command)
+                await asyncio.sleep(2.0)
+
+                output = session.read()
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+
+                if not output or not output.strip():
+                    await asyncio.sleep(2.0)
+                    output = session.read()
+                    if isinstance(output, bytes):
+                        output = output.decode("utf-8", errors="replace")
+
+                if output and output.strip():
+                    return f"[OUTPUT] {output.strip()}"
+                return f"[NO OUTPUT] Command sent to meterpreter session {session_id}; no stdout returned (may be normal for this command type)."
         except Exception as e:
             print(f"An error occurred while interacting with session {session_id}: {e}")
             return f"MSF session interaction error: {e}"
