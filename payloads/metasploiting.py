@@ -14,6 +14,8 @@ from utils.handles import format_handle, parse_handle
 load_dotenv()
 
 MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
+MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
+MSF_RPC_HOST = os.getenv("MSF_RPC_HOST", "127.0.0.1")
 
 # How long execute_module polls for new sessions after firing the module.
 # ssh_login / similar auxiliaries take a few seconds to connect and create
@@ -58,7 +60,7 @@ def _render_module_result(result):
 class MetasploitClient:
     _shared: "MetasploitClient | None" = None
 
-    def __init__(self, mcp_path="msfconsole"):
+    def __init__(self, mcp_path="msfrpcd"):
         self.mcp_path = mcp_path
 
     @classmethod
@@ -83,22 +85,22 @@ class MetasploitClient:
             # by the client actually being populated, not by the return value.
             if not getattr(self, 'client', None):
                 print(
-                    "[!] Metasploit RPC could not be started (msfconsole may "
-                    "not be running or msgrpc failed to load)."
+                    "[!] Metasploit RPC could not be started (msfrpcd may "
+                    "not be running or failed to bind)."
                 )
                 return False
         return True
 
-    async def _wait_for_port(self, host="127.0.0.1", port=55552,
+    async def _wait_for_port(self, host=MSF_RPC_HOST, port=MSF_RPC_PORT,
                              timeout=90, interval=2):
-        """Poll until the msgrpc TCP port accepts a connection.
+        """Poll until the msfrpcd TCP port accepts a connection.
 
-        msfconsole can take 30-60+ seconds to boot and load the msgrpc plugin
-        (especially on first run while it builds the module cache).  Connecting
-        before the port is open causes MsfRpcClient.login() to fail with an
-        auth/connection error that the 3-try retry in post_request cannot
-        out-wait.  This poller gives the RPC server time to come up before we
-        attempt authentication.
+        msfrpcd can take 30-60+ seconds to boot and build the module cache
+        (especially on first run).  Connecting before the port is open
+        causes MsfRpcClient.login() to fail with an auth/connection error
+        that the 3-try retry in post_request cannot out-wait.  This poller
+        gives the RPC server time to come up before we attempt
+        authentication.
         """
         import socket as _socket
         deadline = _time.time() + timeout
@@ -113,26 +115,25 @@ class MetasploitClient:
 
     async def start_mcp(self):
         """
-        Load and start msgrpc in the Metasploit console session.
+        Start the Metasploit RPC daemon (msfrpcd) and connect to it.
+
+        Launches msfrpcd with a fixed set of credentials and binding options,
+        then polls until the RPC port is accepting connections before
+        creating the MsfRpcClient.
         """
+        user = "msfadmin"
         pwd = MSGRPC_PASSWORD
+        host = MSF_RPC_HOST
+        port = MSF_RPC_PORT
         try:
-            # We check if msfconsole is running to ensure we can connect.
-            # Use -f (full cmdline match) not -x (exact process-name match):
-            # msfconsole is a Ruby script, so the kernel process name is
-            # "ruby", and `pgrep -x msfconsole` would never match it.
-            #
-            # The pattern '[m]sfconsole' is a regex that matches the literal
-            # string "msfconsole" (the [m] character class matches 'm'), but
-            # the pattern text itself does NOT contain "msfconsole", so pgrep
-            # cannot match its own command line or the shell running it.  This
-            # avoids the self-match that caused start_mcp to think msfconsole
-            # was already running and skip the launch.
-            #
-            # create_subprocess_exec (no shell) is used so there is no
-            # intermediate bash process whose argv could be matched either.
+            # Check if msfrpcd is already running so we don't spawn a
+            # duplicate that would fail to bind the port.  Use -f (full
+            # cmdline match) and the '[m]sfrpcd' regex trick so pgrep
+            # cannot match its own command line or the shell running it.
+            # create_subprocess_exec (no shell) avoids an intermediate
+            # bash process whose argv could be matched.
             proc = await asyncio.create_subprocess_exec(
-                "pgrep", "-f", "[m]sfconsole",
+                "pgrep", "-f", "[m]sfrpcd",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -140,43 +141,38 @@ class MetasploitClient:
 
             launched_process = None
             if not stdout:
-                print("[i] msfconsole is not running; launching it...")
-                # Launch msfconsole with msgrpc loaded
+                print("[i] msfrpcd is not running; launching it...")
                 launched_process = await asyncio.create_subprocess_exec(
                     self.mcp_path,
-                    "-q",
-                    "-x",
-                    f"load msgrpc Pass={pwd}",
+                    "-U", user,
+                    "-P", pwd,
+                    "-S",
+                    "-a", host,
+                    "-p", str(port),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                 )
             else:
-                # msfconsole is already running, but it may NOT have msgrpc
-                # loaded (e.g. a manually-started console).  If port 55552 is
-                # not listening yet, we need to load the plugin ourselves.
-                print("[i] msfconsole already running; checking for msgrpc port...")
+                print("[i] msfrpcd already running; connecting to it...")
 
             # Poll for the RPC port to come up before attempting to connect.
-            # This replaces the fixed 10-second sleep that was too short for
-            # cold boots, and also covers the "already running but no msgrpc"
-            # case (the port simply never opens and we fail clearly).
-            port = 55552
-            ready = await self._wait_for_port(port=port)
+            ready = await self._wait_for_port(host=host, port=port)
             if not ready:
                 print(
-                    f"[!] msgrpc did not come up on port {port} within the "
-                    f"timeout. If msfconsole was already running without "
-                    f"msgrpc, load it manually:  load msgrpc Pass={pwd}"
+                    f"[!] msfrpcd did not come up on {host}:{port} within "
+                    f"the timeout."
                 )
                 self.client = None
                 return launched_process
 
             # Connect to the RPC interface now that the port is confirmed open.
-            self.client = MsfRpcClient(password=pwd, port=port)
-            # Return the Process we own so bootstrap can reap it, or None if we
-            # reused an already-running msfconsole (nothing for us to kill).
+            self.client = MsfRpcClient(
+                password=pwd, port=port, server=host, username=user
+            )
+            # Return the Process we own so bootstrap can reap it, or None if
+            # we reused an already-running msfrpcd (nothing for us to kill).
             return launched_process
         except Exception as e:
             print(f"An error occurred while trying to start MSF RPC: {e}")

@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 FRAMEWORK_ROOT = Path(__file__).parent
-MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://localhost:55552").rstrip("/")
+MCP_ENDPOINT = os.getenv("MCP_ENDPOINT", "http://127.0.0.1:55553").rstrip("/")
 MCP_STARTUP_DELAY = float(os.getenv("MCP_STARTUP_DELAY", "5"))
 MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
 MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
-MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55552"))
+MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
 
 # --- Async Background Runner ---
 class AsyncBackgroundRunner:
@@ -76,7 +76,7 @@ class FrameworkLoader:
         except Exception as exc:
             logger.warning("[!] PacketCraft unavailable: %s", exc)
 
-    async def _wait_for_rpc_port(self, host: str = "127.0.0.1", port: int = 55552, timeout: float = 30.0) -> bool:
+    async def _wait_for_rpc_port(self, host: str = "127.0.0.1", port: int = 55553, timeout: float = 30.0) -> bool:
         """Wait for the RPC port to become available."""
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -109,13 +109,8 @@ class FrameworkLoader:
                 logger.warning("[!] MSF RPC client not connected; skipping tool discovery.")
                 return process
 
-            logger.info("[+] MSF console ready. Waiting for RPC port...")
+            logger.info("[+] MSF RPC client connected; starting tool discovery.")
 
-            # Wait for RPC port to be available
-            rpc_ready = await self._wait_for_rpc_port(port=MSF_RPC_PORT)
-            if not rpc_ready:
-                logger.warning("[!] RPC port not available. Skipping tool discovery.")
-                return process
             async def _vectorize_tools():
                 try:
                     if not self.vector_registry:
