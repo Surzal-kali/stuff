@@ -1,6 +1,7 @@
 import subprocess
 import asyncio
 import os
+import json
 import time as _time
 from constants import TransportType
 import dotenv
@@ -20,6 +21,38 @@ MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 # and the caller never learns the session ID.
 MSF_SESSION_POLL_SECONDS = float(os.getenv("MSF_SESSION_POLL_SECONDS", "30"))
 MSF_SESSION_POLL_INTERVAL = float(os.getenv("MSF_SESSION_POLL_INTERVAL", "2"))
+
+# Hard cap on how much of a module's 'module.results' output we render into
+# the tool's return string.  A wide portscan or large cred dump can be many
+# KB; letting that flow straight into the model's context is wasteful and
+# noisy.  Truncate with a marker so the caller knows there's more.
+MSF_RESULT_RENDER_MAX = int(os.getenv("MSF_RESULT_RENDER_MAX", "2000"))
+
+
+def _render_module_result(result):
+    """Render the 'result' field from MSF 'module.results' into a short,
+    human-readable string.
+
+    The shape varies by module: a bare string ("Login Successful: ..."), a
+    single CheckCode hash ({"code":"...","reason":"..."}), or a hash of
+    host => result for multi-host auxiliaries.  We JSON-format structured
+    data and bound the length.
+    """
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        rendered = result.strip()
+    elif isinstance(result, dict):
+        # Common case: {"<host>": {"code":..., "reason":...}, ...} or a single
+        # check-code hash like {"code":"vulnerable","reason":"..."}.
+        rendered = json.dumps(result, indent=2, default=str, sort_keys=True)
+    elif isinstance(result, (list, tuple)):
+        rendered = json.dumps(list(result), indent=2, default=str)
+    else:
+        rendered = str(result)
+    if len(rendered) > MSF_RESULT_RENDER_MAX:
+        rendered = rendered[:MSF_RESULT_RENDER_MAX] + "\n...[truncated]"
+    return rendered
 
 
 class MetasploitClient:
@@ -197,54 +230,93 @@ class MetasploitClient:
             # model to abbreviate or mangle the path when it passes it to
             # execute_module. The model copies a labeled JSON value far more
             # reliably than it parses and re-types a formatted string.
+            #
+            # MSF RPC module.search returns results in variable formats
+            # depending on the Metasploit version and RPC client:
+            #   Format A: {"modules": [{"fullname": "type/name", "name": "Title", ...}]}
+            #   Format B: {"exploit": [{"fullname": "exploit/...", ...}], "auxiliary": [...]}
+            #   Format C: [{"fullname": "type/name", ...}]
+            # The 'fullname' key holds the full module path (e.g.
+            # 'exploit/unix/ftp/vsftpd_234_backdoor') and is the ONLY
+            # reliable source for the path. The 'name' key holds the
+            # human-readable TITLE (e.g. 'VSFTPD 2.3.4 Backdoor Command
+            # Execution') and must NOT be used as a module_path — it will
+            # cause execute_module to fail with "invalid module_path".
             structured = []
-            if isinstance(results, dict):
+
+            def _extract_module(mod, fallback_type="?"):
+                """Extract module_path, type, and display name from a search result dict.
+
+                Tries keys in priority order: fullname (the real path),
+                module_name, refname, path. Falls back to reconstructing
+                type/shortname when no path-like key is found. Never uses
+                the human-readable 'name'/'description' as a module_path.
+                """
+                if isinstance(mod, dict):
+                    # fullname is the authoritative full path in MSF RPC.
+                    path = mod.get('fullname')
+                    if path and '/' in path:
+                        return {
+                            "module_path": path,
+                            "type": path.split('/')[0],
+                            "name": mod.get('name', mod.get('description', path)),
+                        }
+                    # module_name / refname may hold the short path (after type/).
+                    for key in ('module_name', 'refname', 'path'):
+                        val = mod.get(key)
+                        if val and '/' in val:
+                            # Looks like a module path segment — reconstruct.
+                            full = f"{mod.get('type', fallback_type)}/{val}"
+                            return {
+                                "module_path": full,
+                                "type": mod.get('type', fallback_type),
+                                "name": mod.get('name', mod.get('description', full)),
+                            }
+                    # Last resort: if 'name' looks like a path (contains /),
+                    # use it. Otherwise reconstruct from type + whatever we have.
+                    raw_name = mod.get('name', '')
+                    if raw_name and '/' in raw_name:
+                        full = f"{mod.get('type', fallback_type)}/{raw_name}" if not raw_name.startswith(fallback_type) else raw_name
+                        return {
+                            "module_path": full,
+                            "type": mod.get('type', fallback_type),
+                            "name": mod.get('description', full),
+                        }
+                    # Give up — return what we have and flag it for the caller.
+                    return {
+                        "module_path": f"{fallback_type}/{raw_name or 'unknown'}",
+                        "type": mod.get('type', fallback_type),
+                        "name": mod.get('name', mod.get('description', 'unknown')),
+                    }
+                elif hasattr(mod, 'name') and hasattr(mod, 'type'):
+                    return {
+                        "module_path": getattr(mod, 'fullname', None) or getattr(mod, 'name', '?'),
+                        "type": getattr(mod, 'type', '?'),
+                        "name": getattr(mod, 'name', '?'),
+                    }
+                else:
+                    return {
+                        "module_path": str(mod),
+                        "type": fallback_type,
+                        "name": str(mod),
+                    }
+
+            # Unwrap the {"modules": [...]} envelope if present.
+            # MSF RPC sometimes wraps results this way; treat "modules" as
+            # a list, not as a module type name.
+            if isinstance(results, dict) and 'modules' in results and isinstance(results['modules'], list):
+                mod_list = results['modules']
+                for mod in mod_list:
+                    structured.append(_extract_module(mod))
+            elif isinstance(results, dict):
                 for mod_type, mod_list in results.items():
                     if not isinstance(mod_list, list):
                         mod_list = [mod_list]
                     for mod in mod_list:
-                        if isinstance(mod, dict):
-                            # MSF RPC module.search returns dicts keyed
-                            # 'fullname' (the real module path, e.g.
-                            # 'exploit/unix/ftp/vsftpd_234_backdoor') and
-                            # 'name' (the human-readable TITLE, e.g.
-                            # 'VSFTPD 2.3.4 Backdoor Command Execution').
-                            # Prefer fullname — returning the title as
-                            # module_path made execute_module/get_options
-                            # receive a non-path string and fail.
-                            path = mod.get('fullname') or mod.get('path') or mod.get('name', '?')
-                            structured.append({
-                                "module_path": path,
-                                "type": mod_type,
-                                "name": mod.get('name', path),
-                            })
-                        else:
-                            structured.append({
-                                "module_path": str(mod),
-                                "type": mod_type,
-                                "name": str(mod),
-                            })
+                        structured.append(_extract_module(mod, fallback_type=mod_type))
             elif isinstance(results, list):
                 for mod in results:
-                    if isinstance(mod, dict):
-                        path = mod.get('path', mod.get('name', '?'))
-                        structured.append({
-                            "module_path": path,
-                            "type": mod.get('type', '?'),
-                            "name": mod.get('name', path),
-                        })
-                    elif hasattr(mod, 'name') and hasattr(mod, 'type'):
-                        structured.append({
-                            "module_path": mod.name,
-                            "type": mod.type,
-                            "name": mod.name,
-                        })
-                    else:
-                        structured.append({
-                            "module_path": str(mod),
-                            "type": "?",
-                            "name": str(mod),
-                        })
+                    structured.append(_extract_module(mod))
             else:
                 return str(results)
 
@@ -400,6 +472,23 @@ class MetasploitClient:
             else:
                 result = module.execute()
 
+            # module.execute() returns {'job_id': <int>, 'uuid': <str>} from
+            # the MSF RPC 'module.execute' endpoint.  The job_id lets the
+            # caller track the running job; the uuid lets us poll
+            # 'module.results' to retrieve the module's ACTUAL output
+            # (auxiliary scanner findings, ssh_login success/failure, check
+            # codes, run errors) which MSF records per-run.  The previous
+            # code ignored this entirely — it only ever printed the result
+            # dict as "job_id={result}" and the session list, hiding login/
+            # scan results from the caller even when the module succeeded.
+            if isinstance(result, dict):
+                job_id = result.get("job_id", result.get("jobID", "?"))
+                run_uuid = result.get("uuid")
+            else:
+                # Older MSF/pymetasploit3 may return a bare job id.
+                job_id = result
+                run_uuid = None
+
             # Poll for new sessions.  ssh_login and similar auxiliaries take
             # a few seconds to connect and create a session; without this
             # loop the tool returns before the session exists.
@@ -411,9 +500,18 @@ class MetasploitClient:
             # Without this tracking, the loop would simply never see the
             # session and report "No new sessions detected", hiding the real
             # failure from the caller.
+            #
+            # In the same loop we poll 'module.results' by uuid so we can
+            # surface the module's own output (login results, scan findings,
+            # check codes, run errors) as soon as the run finishes.  For
+            # exploit handler jobs that stay alive (ExitOnSession=false) the
+            # status never leaves "running", so those rely on the session
+            # signal; scanners/ssh_login reach "completed" quickly and we
+            # break as soon as they do.
             new_sessions = []
             transient_sessions = set()
             seen_once = set()  # session IDs we observed at least once
+            module_result = None  # parsed module.results payload when finished
             deadline = _time.time() + MSF_SESSION_POLL_SECONDS
             while _time.time() < deadline:
                 await asyncio.sleep(MSF_SESSION_POLL_INTERVAL)
@@ -425,8 +523,40 @@ class MetasploitClient:
                 transient_sessions |= gone
                 seen_once |= current_new
                 new_sessions = sorted(current_new, key=int)
-                if new_sessions:
+
+                # Poll module.results by uuid.  Returns e.g.
+                # {"status":"completed","result":...},
+                # {"status":"running"}, or
+                # {"status":"errored","error":...}.  MSF builds/versions
+                # without a job_status_tracker answer with an error dict
+                # (no "status" key); treat that as "no data yet".
+                if run_uuid is not None and module_result is None:
+                    try:
+                        mr = self.client.jobs.info_by_uuid(run_uuid)
+                    except Exception:
+                        mr = None
+                    if isinstance(mr, dict) and "status" in mr:
+                        if mr["status"] in ("completed", "errored"):
+                            module_result = mr
+
+                if new_sessions or module_result is not None:
                     break
+
+            # Render the module's own output (the "good info" that used to be
+            # dropped).  Keep it bounded so a huge scan result doesn't blow
+            # up the model's context window.
+            results_blurb = ""
+            if module_result is not None:
+                status = module_result.get("status")
+                if status == "errored":
+                    results_blurb = (
+                        "\nModule run errored: "
+                        f"{module_result.get('error', '?')}"
+                    )
+                else:
+                    rendered = _render_module_result(module_result.get("result"))
+                    if rendered:
+                        results_blurb = "\nModule output:\n" + rendered
 
             # Build a readable summary of any new sessions.  Emit TYPED
             # handles (Layer 1) so the caller cannot confuse an MSF numeric
@@ -446,7 +576,7 @@ class MetasploitClient:
 
             if session_summaries:
                 msg = (
-                    f"Module {module_path} executed. "
+                    f"Module {module_path} executed (job_id={job_id}). "
                     f"{len(new_sessions)} new session(s) created:\n"
                     + "\n".join(session_summaries)
                     + "\nUse interact_session with the msf: handle(s) above to run commands."
@@ -460,10 +590,10 @@ class MetasploitClient:
                         "stage transfer completed (ExitOnSession was true), or "
                         "the payload process was killed on the target (AV/EDR)."
                     )
-                return msg
+                return msg + results_blurb
             elif transient_sessions:
                 return (
-                    f"Module {module_path} executed (job_id={result}). "
+                    f"Module {module_path} executed (job_id={job_id}). "
                     f"{len(transient_sessions)} session(s) were created but "
                     f"closed immediately (IDs: {sorted(transient_sessions, key=int)}). "
                     "The payload likely connected back but the session died "
@@ -474,12 +604,14 @@ class MetasploitClient:
                     "  - Network instability dropping the reverse connection\n"
                     "Check the msfconsole log for details. Consider a stageless "
                     "payload or verify the payload architecture matches the target."
+                    + results_blurb
                 )
             else:
                 return (
-                    f"Module {module_path} executed (job_id={result}). "
+                    f"Module {module_path} executed (job_id={job_id}). "
                     f"No new sessions detected within {MSF_SESSION_POLL_SECONDS:.0f}s. "
                     "The module may still be running; call list_sessions to check later."
+                    + results_blurb
                 )
         except Exception as e:
             print(f"An error occurred while executing the module: {e}")

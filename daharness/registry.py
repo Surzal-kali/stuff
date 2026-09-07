@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from constants import TransportType
 
+from ._param_docs import parse_param_docs, annotation_to_schema_type
 from .models import ToolManifest
 from .executor import ExecutorMixin
 from .agent import (
@@ -484,16 +485,27 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     for tool_id, func, is_method in candidates:
                         doc = getattr(func, "_tool_doc", "No description")
 
-                        # Extract args from signature
+                        # Extract per-parameter descriptions from the function
+                        # docstring (Google/NumPy Args: sections) and type
+                        # annotations so the manifest schema is informative
+                        # instead of generic "Parameter X" placeholders.
+                        param_docs = parse_param_docs(func)
+
+                        # Build parameter schema from the function signature,
+                        # using type annotations for JSON Schema types and
+                        # docstring-derived descriptions.
                         sig = inspect.signature(func)
                         params = {"type": "object", "properties": {}}
                         required = []
                         for idx, (p_name, p_param) in enumerate(sig.parameters.items()):
                             if is_method and idx == 0 and p_name in ("self", "cls"):
                                 continue  # bound at launch time via a class instance
+                            p_type = annotation_to_schema_type(p_param.annotation)
                             params["properties"][p_name] = {
-                                "type": "string",
-                                "description": f"Parameter {p_name}",
+                                "type": p_type,
+                                "description": param_docs.get(
+                                    p_name, f"Parameter {p_name}"
+                                ),
                             }
                             if p_param.default is inspect.Parameter.empty:
                                 required.append(p_name)
