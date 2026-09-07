@@ -102,7 +102,7 @@ Each row validates something specific about the framework, noted in the
 | # | Prompt to secretary | Tool that should surface | Expected pass signal | Validates |
 |---|---|---|---|---|
 | 4 | "Search exploit-db for samba 3.0.20" | `search_exploit` | returns the `usermap_script` entry (EDB-34845 / 16320) | subprocess tool with shlex splitting |
-| 5 | "Find metasploit modules for the vsftpd backdoor" | `search_module` | returns `exploit/unix/ftp/vsftpd_234_backdoor` | MSF RPC search; dict-structured result parsing |
+| 5 | "Find metasploit modules for the vsftpd backdoor" | `index_modules` | returns `exploit/unix/ftp/vsftpd_234_backdoor` | MSF RPC search; dict-structured result parsing |
 
 ### Phase C - Exploitation
 

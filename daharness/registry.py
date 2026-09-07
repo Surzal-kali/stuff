@@ -50,12 +50,13 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstr
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "9000"))
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
-# The non-thinking LFM2.5 variant reliably drives the tool loop; the -thinkingZ
-# variant hallucinated tools/executions in live testing instead of calling them.
+# A non-thinking chat model reliably drives the tool loop; reasoning/thinking
+# variants tend to hallucinate tools/executions instead of actually calling
+# them.  Override via the SECRETARY_MODEL env var to swap in another model.
 SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "qwen3:14b")
 SECRETARY_MAX_TOP_K = 10
 SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
-SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "300"))  # 5 min wall-clock
+SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "600"))  # 10 min wall-clock
 ALLOWED_TOOL_ROOTS = [
     (WORKSPACE_ROOT / "auxiliaries").resolve(),
     (WORKSPACE_ROOT / "payloads").resolve(),
@@ -233,11 +234,13 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 old_doc = (existing.get("documents") or [""])[0] or ""
                 old_meta = (existing.get("metadatas") or [{}])[0] or {}
                 new_meta_json = json.dumps(m.parameters or {})
+                new_kinds_json = json.dumps(list(m.accepted_handle_kinds or []))
                 unchanged = (
                     old_doc == m.internal_semantic_capability
                     and str(old_meta.get("implementation_path", "")) == m.implementation_path
                     and old_meta.get("transport") == m.transport.value
                     and old_meta.get("parameters_json") == new_meta_json
+                    and old_meta.get("accepted_handle_kinds") == new_kinds_json
                 )
                 if unchanged:
                     continue
@@ -259,6 +262,12 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         "implementation_path": m.implementation_path,
                         "transport": m.transport.value,
                         "parameters_json": json.dumps(m.parameters or {}),
+                        # Typed handle kinds (Layer 1).  Stored as a JSON list
+                        # so the secretary can validate handle args against the
+                        # tool's accepted namespaces after a re-index.
+                        "accepted_handle_kinds": json.dumps(
+                            list(m.accepted_handle_kinds or [])
+                        ),
                     }
                 ],
                 documents=[m.internal_semantic_capability],
@@ -501,6 +510,12 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         tool_transport = getattr(
                             func, "_transport", TransportType.BRAIN_DISPATCH
                         )
+                        # Typed session handle kinds this tool consumes (Layer 1).
+                        # Stored on the manifest so the secretary can validate
+                        # any `handle` arg against the tool's accepted namespaces
+                        # before execution (prevents cross-namespace calls like
+                        # passing an msf: handle to an ssh_exec tool).
+                        handle_kinds = getattr(func, "_accepted_handle_kinds", ()) or ()
                         manifests.append(
                             ToolManifest(
                                 module_id=tool_id,
@@ -510,6 +525,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                                 implementation_path=tool_id,
                                 internal_semantics=semantics,
                                 transport=tool_transport,
+                                accepted_handle_kinds=tuple(handle_kinds),
                             )
                         )
                 except Exception as e:
@@ -559,6 +575,9 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             transport=TransportType(
                 meta.get("transport", TransportType.LOCAL_FILE.value)
             ),
+            accepted_handle_kinds=self._safe_parse_kinds(
+                meta.get("accepted_handle_kinds")
+            ),
         )
 
     def _safe_parse_tool_args(self, raw: Any) -> dict:
@@ -581,6 +600,24 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             return parsed if isinstance(parsed, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
+
+    def _safe_parse_kinds(self, raw: Any) -> tuple:
+        """Parse the ``accepted_handle_kinds`` metadata (a JSON list) back to a
+        tuple.  Returns ``()`` for missing/empty/invalid values so the absence
+        of the field (e.g. tools indexed before Layer 1) degrades cleanly to
+        'no handle validation' rather than raising.
+        """
+        if raw is None:
+            return ()
+        if isinstance(raw, (list, tuple)):
+            return tuple(str(k) for k in raw)
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) and raw else None
+            if isinstance(parsed, list):
+                return tuple(str(k) for k in parsed)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return ()
 
     async def find_tools(self, user_intent: str, top_k: int = 5) -> List[ToolManifest]:
         """Semantic search using ChromaDB's HNSW index, returning up to `top_k` manifests."""
@@ -625,6 +662,9 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     transport=TransportType(
                         meta.get("transport", TransportType.LOCAL_FILE.value)
                     ),
+                    accepted_handle_kinds=self._safe_parse_kinds(
+                        meta.get("accepted_handle_kinds")
+                    ),
                     distance=round(float(dist), 4) if dist is not None else None,
                 )
             )
@@ -654,6 +694,11 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             }
             if manifest.distance is not None:
                 entry["distance"] = manifest.distance
+            if manifest.accepted_handle_kinds:
+                # Tells the model which session-handle kinds this tool accepts,
+                # so it can self-check before calling (e.g. a tool that accepts
+                # only "ssh" must be given an ssh: handle, not an msf: one).
+                entry["accepted_handle_kinds"] = list(manifest.accepted_handle_kinds)
             return entry
         return {
             "tool_id": manifest.module_id,
@@ -685,6 +730,51 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
         if warnings:
             logger.info(f"[TOOL_ARGS_WARN] {manifest.module_id}: {warnings}")
         return warnings
+
+    def normalize_handle_argument(
+        self, manifest: ToolManifest, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tolerate legacy ``session_id`` arguments on tools that now take a
+        typed ``handle``.
+
+        Small secretary models sometimes still emit ``session_id`` (the old
+        parameter name) instead of ``handle``.  Rather than burning a retry on
+        a schema mismatch, rename it in place when the tool declares a
+        ``handle`` parameter and the caller did not supply one.  Returns a
+        possibly-new arguments dict (does not mutate the caller's dict).
+        """
+        if not isinstance(arguments, dict) or not manifest.accepted_handle_kinds:
+            return arguments
+        params = manifest.parameters or {}
+        properties = params.get("properties") if isinstance(params, dict) else None
+        if not isinstance(properties, dict) or "handle" not in properties:
+            return arguments
+        if "handle" in arguments:
+            return arguments
+        # Accept both the legacy name and a couple of common variants.
+        for legacy in ("session_id", "session", "sid"):
+            if legacy in arguments:
+                return {**arguments, "handle": arguments[legacy]}
+        return arguments
+
+    def validate_handle_argument(
+        self, manifest: ToolManifest, arguments: Dict[str, Any]
+    ) -> Optional[str]:
+        """Return ``None`` if the tool's ``handle`` argument is acceptable,
+        otherwise a human-readable reason string suitable for a ``ModelRetry``.
+
+        This is the core Layer 1 disambiguation gate: it refuses to let a
+        handle from one namespace flow into a tool of another (e.g. an
+        ``msf:`` handle into ``ssh_exec``), and the reason string tells the
+        model which tool to use instead.
+        """
+        if not manifest.accepted_handle_kinds or not isinstance(arguments, dict):
+            return None
+        handle = arguments.get("handle")
+        if not isinstance(handle, str) or not handle:
+            return None
+        from utils.handles import validate_handle_for_tool
+        return validate_handle_for_tool(handle, manifest.accepted_handle_kinds)
 
     def get_sanitized_view(self, manifest: ToolManifest):
         """Returns only the opaque ID and the boring description for the main model."""

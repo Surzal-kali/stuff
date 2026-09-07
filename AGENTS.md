@@ -56,7 +56,7 @@ Two passes scan `ALLOWED_TOOL_ROOTS` (`auxiliaries/`, `payloads/`,
 2. **Dynamic import** (`BRAIN_DISPATCH` transport): imports the module and
    walks its members for `@framework_tool`-decorated functions and methods.
    Methods on classes defined in that module are minted with the class name
-   in the tool_id (e.g. `payloads.metasploiting.MetasploitClient.search_module`).
+   in the tool_id (e.g. `payloads.metasploiting.MetasploitClient.index_modules`).
    These dispatch via the Brain socket or fall back in-process.
 
 `__init__.py` files are **skipped**, not required. Skip dirs: `venv`,
@@ -174,7 +174,7 @@ it cannot see sessions the Brain was holding.
 
 `MetasploitClient` uses `pymetasploit3` RPC. Singleton via `get_instance()`
 so bootstrap's `start_mcp()` and in-process tool launches share the same
-`msfconsole` handle. Tools: `search_module`, `execute_module` (polls for new
+`msfconsole` handle. Tools: `index_modules`, `execute_module` (polls for new
 sessions), `set_payload`, `get_options`, `list_sessions`,
 `interact_session`, `close_msf_session`.
 

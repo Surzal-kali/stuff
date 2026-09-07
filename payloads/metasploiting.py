@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from constants import framework_tool
 from pymetasploit3.msfrpc import MsfRpcClient
+from utils.handles import format_handle, parse_handle
 
 load_dotenv()
 
@@ -160,7 +161,7 @@ class MetasploitClient:
         "shorten the path.",
         transport=TransportType.BRAIN_DISPATCH,
     )
-    async def search_module(self, module_type=None, module_name=None, limit=15):
+    async def index_modules(self, module_type=None, module_name=None, limit=15):
         """
         Search for a Metasploit module by type and name.
 
@@ -203,7 +204,15 @@ class MetasploitClient:
                         mod_list = [mod_list]
                     for mod in mod_list:
                         if isinstance(mod, dict):
-                            path = mod.get('path', mod.get('name', '?'))
+                            # MSF RPC module.search returns dicts keyed
+                            # 'fullname' (the real module path, e.g.
+                            # 'exploit/unix/ftp/vsftpd_234_backdoor') and
+                            # 'name' (the human-readable TITLE, e.g.
+                            # 'VSFTPD 2.3.4 Backdoor Command Execution').
+                            # Prefer fullname — returning the title as
+                            # module_path made execute_module/get_options
+                            # receive a non-path string and fail.
+                            path = mod.get('fullname') or mod.get('path') or mod.get('name', '?')
                             structured.append({
                                 "module_path": path,
                                 "type": mod_type,
@@ -268,7 +277,7 @@ class MetasploitClient:
         "meterpreter session on the compromised target. Accepts the full "
         "module path (e.g. exploit/unix/ftp/vsftpd_234_backdoor) and a dict "
         "of options (RHOSTS, USERNAME, PASSWORD, PAYLOAD, LHOST, LPORT). "
-        "The module_path MUST be the exact value returned by search_module's "
+        "The module_path MUST be the exact value returned by index_modules's "
         "module_path field — do not abbreviate, shorten, or paraphrase it. "
         "Polls for new sessions and reports their IDs.",
         transport=TransportType.MCP_RPC,
@@ -419,13 +428,18 @@ class MetasploitClient:
                 if new_sessions:
                     break
 
-            # Build a readable summary of any new sessions.
+            # Build a readable summary of any new sessions.  Emit TYPED
+            # handles (Layer 1) so the caller cannot confuse an MSF numeric
+            # session id with a paramiko "sess-NNNN" id — both are plausible-
+            # looking arguments to the wrong tool.  The "msf:" prefix ties
+            # the id to interact_session/close_msf_session unambiguously.
             session_summaries = []
             all_sessions = self.client.sessions.list
             for sid in new_sessions:
                 info = all_sessions.get(sid, {})
+                handle = format_handle("msf", str(sid))
                 session_summaries.append(
-                    f"  session {sid}: type={info.get('type', '?')} "
+                    f"  {handle}: type={info.get('type', '?')} "
                     f"target={info.get('target_host', '?')} "
                     f"desc={info.get('desc', '?')}"
                 )
@@ -435,7 +449,7 @@ class MetasploitClient:
                     f"Module {module_path} executed. "
                     f"{len(new_sessions)} new session(s) created:\n"
                     + "\n".join(session_summaries)
-                    + "\nUse interact_session with the session ID(s) above to run commands."
+                    + "\nUse interact_session with the msf: handle(s) above to run commands."
                 )
                 if transient_sessions:
                     msg += (
@@ -525,49 +539,20 @@ class MetasploitClient:
             return None
 
     @framework_tool(
-        "List all active Metasploit sessions (shell and meterpreter). Shows "
-        "session IDs, types, target hosts, and descriptions. Use this to "
-        "check which sessions are alive after running exploit modules."
-    )
-    async def list_sessions(self):
-        """
-        List all active Metasploit sessions (shell and meterpreter).
-        Shows session ID, type, target host, and description.
-        """
-        if not await self._ensure_running():
-            return None
-
-        try:
-            sessions = self.client.sessions.list
-            if not sessions:
-                return "No active MSF sessions."
-
-            lines = []
-            for sid, info in sorted(sessions.items(), key=lambda kv: int(kv[0])):
-                lines.append(
-                    f"  ID: {sid}, Type: {info.get('type', '?')}, "
-                    f"Target: {info.get('target_host', '?')}, "
-                    f"Desc: {info.get('desc', '?')}"
-                )
-            return "Active MSF sessions:\n" + "\n".join(lines)
-        except Exception as e:
-            print(f"An error occurred while listing sessions: {e}")
-            return None
-
-    @framework_tool(
         "Run a command on an active Metasploit session (shell or meterpreter). "
         "Use this after execute_module creates a session to run commands like "
         "'id', 'whoami', 'cat /etc/shadow' on the compromised target. Pass the "
-        "session ID and the command string. The session stays alive for "
-        "follow-up commands."
+        "'msf:' handle returned by execute_module (e.g. 'msf:1'). The session "
+        "stays alive for follow-up commands.",
+        accepted_handle_kinds=["msf"],
     )
-    async def interact_session(self, session_id, command):
+    async def interact_session(self, handle, command):
         """
         Send a command to a specific active Metasploit session and read the
         response.  Works with both shell and meterpreter sessions.
 
         The session stays alive in MSF after this call returns, so you can
-        call interact_session again with the same session_id for follow-up
+        call interact_session again with the same handle for follow-up
         commands.
 
         For shell sessions, an exit-code marker is appended after the command
@@ -576,17 +561,17 @@ class MetasploitClient:
         includes an explicit success/failure indicator.
 
         Args:
-            session_id: The numeric ID of the MSF session (from list_sessions or execute_module).
+            handle: The 'msf:' handle returned by execute_module (e.g. 'msf:1').
             command: The command to execute within the session.
         """
         if not await self._ensure_running():
             return None
 
         try:
-            sid = str(session_id)
+            kind, sid = parse_handle(handle)
             sessions = self.client.sessions.list
             if sid not in sessions:
-                return f"MSF session {session_id} not found. Call list_sessions to see active sessions."
+                return f"MSF session {handle} not found. Call list_sessions to see active sessions."
 
             session = self.client.sessions.session(sid)
             session_type = sessions[sid].get("type", "")
@@ -662,35 +647,37 @@ class MetasploitClient:
 
                 if output and output.strip():
                     return f"[OUTPUT] {output.strip()}"
-                return f"[NO OUTPUT] Command sent to meterpreter session {session_id}; no stdout returned (may be normal for this command type)."
+                return f"[NO OUTPUT] Command sent to meterpreter session {handle}; no stdout returned (may be normal for this command type)."
         except Exception as e:
-            print(f"An error occurred while interacting with session {session_id}: {e}")
+            print(f"An error occurred while interacting with session {handle}: {e}")
             return f"MSF session interaction error: {e}"
 
     @framework_tool(
-        "Close and kill a specific Metasploit session by ID. Use this to "
-        "clean up after exploitation when the session is no longer needed."
+        "Close and kill a specific Metasploit session. Pass the 'msf:' handle "
+        "returned by execute_module. Use this to clean up after exploitation "
+        "when the session is no longer needed.",
+        accepted_handle_kinds=["msf"],
     )
-    async def close_msf_session(self, session_id):
+    async def close_msf_session(self, handle):
         """
         Kill and remove a Metasploit session.
 
         Args:
-            session_id: The numeric ID of the MSF session to close.
+            handle: The 'msf:' handle of the MSF session to close (e.g. 'msf:1').
         """
         if not await self._ensure_running():
             return None
 
         try:
-            sid = str(session_id)
+            kind, sid = parse_handle(handle)
             sessions = self.client.sessions.list
             if sid not in sessions:
-                return f"MSF session {session_id} not found."
+                return f"MSF session {handle} not found."
 
             session = self.client.sessions.session(sid)
             # Both session types inherit stop() from MsfSession.
             session.stop()
-            return f"MSF session {session_id} closed."
+            return f"MSF session {handle} closed."
         except Exception as e:
-            print(f"An error occurred while closing session {session_id}: {e}")
+            print(f"An error occurred while closing session {handle}: {e}")
             return f"MSF session close error: {e}"

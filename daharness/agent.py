@@ -35,6 +35,43 @@ from .models import ToolManifest
 logger = logging.getLogger(__name__)
 
 
+# --- Per-turn live-session snapshot (Layer 4) ---
+
+
+def _session_state_block() -> str:
+    """Build a compact snapshot of live sessions to append to the user prompt
+    at the start of each turn — but ONLY when at least one session is visible.
+
+    Why the "only when non-empty" rule: appending a "(none visible here) …
+    call list_sessions first" block to *every* turn (including creation turns
+    like ssh_connect / open_listener) is pure noise that can nudge a small,
+    throughput-stressed model away from calling the right create tool. When
+    there is nothing to ground on, inject nothing; when there are live
+    sessions, list their typed handles so the model has fresh, copy-pasteable
+    references.
+
+    Best-effort w.r.t. the documented "process-local sessions" pitfall:
+    sessions created on the Brain sidecar live in that process's SessionManager
+    and are NOT visible to this (harness) process.  In that case nothing is
+    injected here, and the model should call ``list_sessions`` (which
+    dispatches through the Brain and sees them).
+    """
+    try:
+        from utils.session_manager import get_manager
+        handles = [
+            f"  - {s['kind']}:{s['sid']} -> {s['target']}"
+            for s in get_manager().list_sessions()
+        ]
+    except Exception:
+        return ""
+    if not handles:
+        return ""
+    return (
+        "\n[Active sessions visible to this process right now — when acting on "
+        "a session, copy the exact handle shown here]\n" + "\n".join(handles)
+    )
+
+
 # --- Secretary per-conversation state ---
 
 
@@ -194,6 +231,19 @@ async def secretary_execute_tool(
             f"[secretary] execute_tool '{tool_id}': arguments were not a valid "
             f"JSON object; passing raw payload {str(args.get('_raw'))[:200]!r}"
         )
+
+    # Layer 1: tolerate the legacy ``session_id`` argument name on tools that
+    # now take a typed ``handle`` (small models often still emit the old name).
+    args = registry.normalize_handle_argument(manifest, args)
+
+    # Layer 1: refuse to let a handle from the wrong namespace flow into a
+    # tool.  This is the disambiguation gate — it converts the silent
+    # cross-namespace failure (e.g. an msf: handle into ssh_exec) into a
+    # self-correcting ModelRetry that names the correct tool to use.
+    handle_reason = registry.validate_handle_argument(manifest, args)
+    if handle_reason is not None:
+        raise ModelRetry(handle_reason)
+
     warnings = registry.validate_arguments(manifest, args)
     result = await registry.execute_tool(manifest, args)
     if isinstance(result, dict) and warnings:
@@ -318,6 +368,39 @@ class SecretaryMixin:
             - When a tool returns structured JSON with labeled fields (e.g. "module_path"),
               copy the field value VERBATIM into your next tool call. Never abbreviate,
               shorten, or paraphrase values like module paths, session IDs, or tool IDs.
+
+            Session handles (IMPORTANT — this is where mistakes happen):
+            - Sessions are identified by TYPED handles of the form "<kind>:<id>":
+              "ssh:sess-0001" (paramiko SSH), "msf:1" (Metasploit), "listener:tcp-4444"
+              (a bound listener). The prefix names the namespace and is enforced: a tool
+              that accepts only ssh: handles will reject an msf: handle with a message
+              telling you which tool to use instead. Heed that message.
+            - ALWAYS copy a handle returned by a tool VERBATIM into the next tool's `handle`
+              argument. Never retype it, shorten it, or substitute one namespace's handle
+              for another tool's (e.g. do not pass an msf: handle to ssh_exec).
+            - Before interacting with a session when you are unsure which one to use, call
+              `list_sessions` (the one that lists ALL namespaces) and pick the matching
+              handle by its target/kind. Do not guess a handle from memory.
+            - Tools that take a handle declare `accepted_handle_kinds` in their manifest.
+            - Close sessions you no longer need: ssh_close for ssh:, close_msf_session for
+              msf:, close_listener for listener:.
+
+            Listeners vs backdoors (do not confuse these):
+            - A LISTENER is something YOU bind locally to RECEIVE a callback (e.g. for a
+              reverse shell payload). Use open_listener; it returns a listener: handle and
+              you stop it with close_listener. You do NOT connect to a listener.
+            - A BACKDOOR is already running on the target (e.g. vsftpd 2.3.4 on port 6200).
+              You do NOT bind anything for it — you pop it with a Metasploit exploit module
+              (execute_module), which returns an msf: handle you use with interact_session.
+
+            SSH login on a target:
+            - For a plain username/password SSH login, use ssh_connect (it handles old/legacy
+              SSH servers automatically and returns an ssh: handle). Do NOT reach for
+              Metasploit's ssh_login auxiliary just because the target is old — that creates
+              an msf: session in a DIFFERENT namespace and is the main source of "which
+              session do I use?" confusion. Reserve ssh_login for cases where you specifically
+              need a Metasploit session (e.g. to pivot through MSF), and when you do use it,
+              treat its result as an msf: handle, never as an ssh: handle.
             """)
 
         return Agent(
@@ -373,9 +456,17 @@ class SecretaryMixin:
         deps.search_calls = 0
         deps.execute_calls = 0
 
+        # Layer 4: re-ground the model on the live-session state at the start
+        # of every turn.  This is best-effort — sessions created on the Brain
+        # sidecar live in that process's SessionManager and may not be visible
+        # here (see AGENTS.md "Process-local sessions").  When nothing is
+        # visible we explicitly tell the model to call list_sessions, which
+        # dispatches through the Brain and sees those sessions correctly.
+        prompt_with_state = user_prompt + _session_state_block()
+
         async def _run():
             result = await self.secretary.run(
-                user_prompt, deps=deps, message_history=message_history
+                prompt_with_state, deps=deps, message_history=message_history
             )
 
             rounds = 0
@@ -458,7 +549,7 @@ async def _chat(registry: "ToolRegistry") -> None:
     """Interactive conversation with the secretary; one session, full history."""
     deps = SecretaryDeps(registry=registry)
     history = None
-    print("[chat] Secretary ready. Type 'exit' to quit. Type '/stream <brain|msf>' to watch logs (Ctrl+C to stop).")
+    print("[chat] Secretary ready. Type 'exit' to quit. Type '/clear' to reset conversation history.")
     while True:
         try:
             user_input = await asyncio.to_thread(input, "\nyou> ")
@@ -470,33 +561,10 @@ async def _chat(registry: "ToolRegistry") -> None:
         if not user_input.strip():
             continue
 
-        if user_input.strip().startswith("/stream"):
-            parts = user_input.strip().split()
-            if len(parts) < 2:
-                print("[chat] Usage: /stream <brain|msf>")
-                continue
-            log_type = parts[1]
-            from utils.log_reader import stream_logs
-            import threading
-            stop_event = threading.Event()
-            print(f"[chat] Streaming {log_type} logs... (Press Ctrl+C to stop)")
-
-            def run_stream():
-                for line in stream_logs(log_type, stop_event):
-                    print(f"[{log_type}] {line}", end="")
-
-            # Start streaming in a thread
-            stream_thread = threading.Thread(target=run_stream, daemon=True)
-            stream_thread.start()
-
-            try:
-                while stream_thread.is_alive():
-                    # We use a short sleep in a thread to keep the main loop
-                    # responsive to SIGINT (Ctrl+C)
-                    await asyncio.sleep(0.1)
-            except KeyboardInterrupt:
-                stop_event.set()
-                print(f"\n[chat] Stopped streaming {log_type} logs.")
+        if user_input.strip().lower() == "/clear":
+            history = None
+            deps = SecretaryDeps(registry=registry)
+            print("[chat] Conversation history cleared.")
             continue
 
         with capture_run_messages() as messages:

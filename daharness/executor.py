@@ -93,9 +93,12 @@ class ExecutorMixin:
         side effects.
         """
         socket_path = "/tmp/brain.sock"
-        # A tool that never returns (a listener, a wedged subprocess) used to
-        # hang this read forever and freeze the whole conversation. Bound it.
-        dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "180"))
+        # A tool that never returns (a listener, a wedged subprocess, a slow
+        # nmap -p- -sV, a sqlmap crawl) used to hang this read forever and freeze
+        # the whole conversation. Bound it. 600s matches the tool budget the
+        # e2e doc assumes (e.g. sqlmap's documented "600s tool timeout"); env
+        # overridable for faster lab targets.
+        dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
         try:
             # Prepare the payload: "CALL_TOOL|session_id|tool_id|args"
             # We use session 0 for framework-level calls

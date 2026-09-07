@@ -1,6 +1,6 @@
 """Manifest models used by the harness."""
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,13 @@ class ToolManifest(BaseModel):
     transport: TransportType = TransportType.LOCAL_FILE
     endpoint: Optional[str] = None
     tool_name: Optional[str] = None
+    # Typed session handle kinds this tool consumes (e.g. ("ssh",)).
+    # Empty tuple means the tool takes no session handle.  Populated from the
+    # @framework_tool(..., accepted_handle_kinds=...) decorator and persisted
+    # in the ChromaDB metadata so it survives re-indexing.  The secretary
+    # validates any ``handle`` argument's kind against this set before
+    # execution and rejects cross-namespace calls with a ModelRetry.
+    accepted_handle_kinds: Tuple[str, ...] = Field(default_factory=tuple)
     # Query-time annotation: cosine distance from the search query (lower =
     # more similar).  Not part of the tool definition — set by ``find_tools``
     # and surfaced in ``describe_manifest(lean=True)`` so the secretary model
