@@ -6,7 +6,7 @@ class TransportType(Enum):
     BRAIN_DISPATCH = "brain_dispatch"
 
 def framework_tool(
-    doc: str = None,
+    doc: str ,
     transport: TransportType = TransportType.BRAIN_DISPATCH,
     accepted_handle_kinds=None,
 ):

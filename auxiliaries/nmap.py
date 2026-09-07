@@ -15,7 +15,7 @@ class Nmap:
         command = ["nmap", *shlex.split(options), self.target]
         # Bounded so a wedged scan can't hang a dispatch worker forever; the
         # harness side has its own BRAIN_DISPATCH_TIMEOUT as a second net.
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
         return result.stdout or result.stderr
 
 

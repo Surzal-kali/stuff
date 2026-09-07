@@ -153,7 +153,7 @@ def smb_read_file(target, share, path, username="", password="", domain="", max_
         max_bytes: Cap on bytes read so a huge file can't drown the chat.
     """
     try:
-        conn = SMBConnection(target, target, remoteByName=False, timeout=10)
+        conn = SMBConnection(target, target, remoteName=False, timeout=10)
         if username:
             conn.login(username, password, domain)
         else:
