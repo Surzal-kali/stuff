@@ -64,18 +64,18 @@ def report_finding(
     if evidence_excerpt:
         evidence["excerpt"] = evidence_excerpt
 
-    repro_list: List[str] = [
-        s.strip() for s in repro.split("\n") if s.strip()
-    ] if repro else []
+    repro_list: List[str] = (
+        [s.strip() for s in repro.split("\n") if s.strip()] if repro else []
+    )
 
-    chain_list: List[str] = [
-        s.strip() for s in tool_chain.split(",") if s.strip()
-    ] if tool_chain else []
+    chain_list: List[str] = (
+        [s.strip() for s in tool_chain.split(",") if s.strip()] if tool_chain else []
+    )
 
     store = FindingStore()
     try:
         # Pre-generate a memory_id so we can store it as memory_ref.
-        memory_id = f"finding-{int(time.time())}"
+        memory_id = f"finding-{int(time.time())}-{uuid4().hex[:6]}"
         pointer = f"{severity} {title} on {asset}"
         if cwe:
             pointer += f" ({cwe})"
