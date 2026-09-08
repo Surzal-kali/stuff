@@ -456,7 +456,6 @@ def zap_sites() -> List[str]:
 
 
 @framework_tool("Get the full ZAP sites tree (optionally scoped to a subtree URL).")
-@framework_tool("Get the full ZAP sites tree (optionally scoped to a subtree URL).")
 def zap_sites_tree(target: Optional[str] = None) -> str:
     """JSON dump of the entire discovered URL hierarchy.
 

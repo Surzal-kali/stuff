@@ -31,12 +31,24 @@ def parse_param_docs(func: Callable) -> Dict[str, str]:
     )
     if google_match:
         block = google_match.group(1)
-        for line in block.strip().splitlines():
-            # Each line: "param_name: description" or "param_name (type): desc"
-            # Leading whitespace is optional since .strip() may have removed it.
+        # A parameter entry is a "name: desc" header line; any subsequent
+        # indented line that is NOT a new "name: desc" header is a continuation
+        # of the previous parameter's description (e.g. the multi-line
+        # '(e.g. "--batch --forms --risk=3")' example under `options`).
+        # Without this, continuation lines were silently dropped and the
+        # manifest lost critical usage hints -- which is why the secretary
+        # never learned to pass `--batch` to sqlmap and the scan blocked on
+        # an interactive prompt until the turn timeout fired.
+        current_name = None
+        for line in block.splitlines():
             m = re.match(r"\s*(\w+)\s*(?:\([^)]*\))?\s*:\s*(.+)", line)
             if m:
-                result[m.group(1)] = m.group(2).strip()
+                # New parameter header.
+                current_name = m.group(1)
+                result[current_name] = m.group(2).strip()
+            elif current_name and line.strip():
+                # Continuation of the previous parameter's description.
+                result[current_name] = (result[current_name] + " " + line.strip()).strip()
         if result:
             return result
 
