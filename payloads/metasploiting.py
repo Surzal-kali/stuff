@@ -3,6 +3,7 @@ import asyncio
 import os
 import json
 import time as _time
+from typing import Any, Dict, List, Literal, Optional
 from constants import TransportType
 import dotenv
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
 MSF_RPC_HOST = os.getenv("MSF_RPC_HOST", "127.0.0.1")
 
-# How long execute_module polls for new sessions after firing the module.
+# How long dispatch_metasploit polls for new sessions after firing the module.
 # ssh_login / similar auxiliaries take a few seconds to connect and create
 # a session; without polling, the tool returns before the session exists
 # and the caller never learns the session ID.
@@ -183,14 +184,20 @@ class MetasploitClient:
         "Search for Metasploit modules by type and name. Use this to find "
         "exploits, auxiliaries, payloads, and post-exploitation modules "
         "matching a known vulnerability or service (e.g. vsftpd backdoor, "
-        "ssh_login, samba usermap_script). Returns a JSON list of objects "
-        "with a 'module_path' field — copy that value VERBATIM (including "
-        "the type prefix, e.g. 'auxiliary/scanner/ssh/ssh_login') as the "
-        "module_path argument to execute_module. Do not abbreviate or "
-        "shorten the path.",
+        "ssh_login, samba usermap_script). Returns a JSON list of objects, "
+        "each with a 'module_path' field AND a 'category' field. The "
+        "'category' is one of 'exploit', 'auxiliary', or 'post' and tells "
+        "dispatch_metasploit which execution path to use. Copy BOTH fields "
+        "verbatim from a single result row when calling dispatch_metasploit. "
+        "Do not abbreviate or shorten the path.",
         transport=TransportType.BRAIN_DISPATCH,
     )
-    async def index_modules(self, module_type=None, module_name=None, limit=15):
+    async def index_modules(
+        self,
+        module_type: Optional[str] = None,
+        module_name: Optional[str] = None,
+        limit: int = 15,
+    ):
         """
         Search for a Metasploit module by type and name.
 
@@ -224,7 +231,7 @@ class MetasploitClient:
             # field. Returning JSON (instead of formatted text like
             # "path (type) — name") makes it much harder for the secretary
             # model to abbreviate or mangle the path when it passes it to
-            # execute_module. The model copies a labeled JSON value far more
+            # dispatch_metasploit. The model copies a labeled JSON value far more
             # reliably than it parses and re-types a formatted string.
             #
             # MSF RPC module.search returns results in variable formats
@@ -237,7 +244,7 @@ class MetasploitClient:
             # reliable source for the path. The 'name' key holds the
             # human-readable TITLE (e.g. 'VSFTPD 2.3.4 Backdoor Command
             # Execution') and must NOT be used as a module_path — it will
-            # cause execute_module to fail with "invalid module_path".
+            # cause dispatch_metasploit to fail with "invalid module_path".
             structured = []
 
             def _extract_module(mod, fallback_type="?"):
@@ -254,7 +261,7 @@ class MetasploitClient:
                     if path and '/' in path:
                         return {
                             "module_path": path,
-                            "type": path.split('/')[0],
+                            "category": path.split('/')[0],
                             "name": mod.get('name', mod.get('description', path)),
                         }
                     # module_name / refname may hold the short path (after type/).
@@ -265,7 +272,7 @@ class MetasploitClient:
                             full = f"{mod.get('type', fallback_type)}/{val}"
                             return {
                                 "module_path": full,
-                                "type": mod.get('type', fallback_type),
+                                "category": mod.get('type', fallback_type),
                                 "name": mod.get('name', mod.get('description', full)),
                             }
                     # Last resort: if 'name' looks like a path (contains /),
@@ -275,25 +282,25 @@ class MetasploitClient:
                         full = f"{mod.get('type', fallback_type)}/{raw_name}" if not raw_name.startswith(fallback_type) else raw_name
                         return {
                             "module_path": full,
-                            "type": mod.get('type', fallback_type),
+                            "category": mod.get('type', fallback_type),
                             "name": mod.get('description', full),
                         }
                     # Give up — return what we have and flag it for the caller.
                     return {
                         "module_path": f"{fallback_type}/{raw_name or 'unknown'}",
-                        "type": mod.get('type', fallback_type),
+                        "category": mod.get('type', fallback_type),
                         "name": mod.get('name', mod.get('description', 'unknown')),
                     }
                 elif hasattr(mod, 'name') and hasattr(mod, 'type'):
                     return {
                         "module_path": getattr(mod, 'fullname', None) or getattr(mod, 'name', '?'),
-                        "type": getattr(mod, 'type', '?'),
+                        "category": getattr(mod, 'type', '?'),
                         "name": getattr(mod, 'name', '?'),
                     }
                 else:
                     return {
                         "module_path": str(mod),
-                        "type": fallback_type,
+                        "category": fallback_type,
                         "name": str(mod),
                     }
 
@@ -331,7 +338,7 @@ class MetasploitClient:
                 "total_matches": total,
                 "returned": len(structured),
                 "modules": structured,
-                "note": "Use the 'module_path' value verbatim as the module_path argument to execute_module. Do not abbreviate.",
+                "note": "Use the 'module_path' value verbatim as the module_path argument to dispatch_metasploit, and copy the 'category' field alongside it. Do not abbreviate.",
             }
         except Exception as e:
             print(f"An error occurred while searching for the module: {e}")
@@ -339,51 +346,116 @@ class MetasploitClient:
 
     # This one is tagged to use the direct RPC path
     @framework_tool(
-        "Execute or fire a Metasploit exploit or auxiliary module against a "
-        "target host. Use this to exploit a vulnerability (e.g. vsftpd "
-        "backdoor, ssh_login, samba usermap_script) and obtain a shell or "
-        "meterpreter session on the compromised target. Accepts the full "
-        "module path (e.g. exploit/unix/ftp/vsftpd_234_backdoor) and a dict "
-        "of options (RHOSTS, USERNAME, PASSWORD, PAYLOAD, LHOST, LPORT). "
-        "The module_path MUST be the exact value returned by index_modules's "
-        "module_path field — do not abbreviate, shorten, or paraphrase it. "
-        "Polls for new sessions and reports their IDs. "
-        "start_handler: pass True for EXPLOIT modules that use a reverse or "
-        "bind PAYLOAD (e.g. cmd/unix/reverse, windows/meterpreter/reverse_tcp). "
-        "It starts a separate persistent exploit/multi/handler listener on "
-        "LHOST:LPORT first, because over msfrpcd the exploit's implicit handler "
-        "does NOT bind — without an explicit handler the target's callback "
-        "reaches nothing and no session is ever created. Pass start_handler=False "
-        "(the default) for auxiliaries and login scanners that need no inbound "
-        "listener.",
+        "Execute any Metasploit module — exploit, auxiliary, or post — "
+        "against a target. This is the single entry point for all MSF module "
+        "execution; pick the 'category' field returned by index_modules "
+        "(one of 'exploit', 'auxiliary', 'post') and pass it VERBATIM alongside "
+        "the module_path. Examples:\n"
+        "  - exploit (vsftpd_234_backdoor): category='exploit', "
+        "    options={RHOSTS: '...', PAYLOAD: 'cmd/unix/bind_perl', LPORT: '...'}\n"
+        "  - auxiliary (ssh_login): category='auxiliary', "
+        "    options={RHOSTS: '...', USERNAME: '...', PASSWORD: '...'}\n"
+        "  - post (gather enum_info): category='post', "
+        "    options={SESSION: <int>, ...}\n\n"
+        "For exploit modules using a reverse or bind payload, pass "
+        "start_handler=True to start a separate persistent exploit/multi/handler "
+        "listener first (required over msfrpcd because the exploit module's "
+        "implicit handler does not reliably bind). Pass start_handler=False "
+        "(the default) for auxiliaries, login scanners, post modules, and "
+        "exploits that handle their own connection (e.g. vsftpd_234_backdoor).\n\n"
+        "After execution, polls for new sessions and returns their 'msf:' "
+        "handles. The module_path MUST be the exact value returned by "
+        "index_modules's module_path field — do not abbreviate, shorten, or "
+        "paraphrase it. Meterpreter payloads are blocked: this pymetasploit3 "
+        "client cannot serialize their AutoLoadExtensions option and MSF "
+        "rejects the launch. Use cmd/unix/* or cmd/linux/* shell payloads "
+        "instead.",
         transport=TransportType.MCP_RPC,
     )
-    async def execute_module(self, module_path, options, start_handler=False):
+    async def dispatch_metasploit(
+        self,
+        module_path: str,
+        category: Literal["exploit", "auxiliary", "post"],
+        options: Dict[str, Any],
+        start_handler: bool = False,
+    ):
         """
-        Execute a Metasploit module with specified options.
-
-        After execution, polls for newly-created sessions (shell/meterpreter)
-        and returns their IDs so the caller can interact with them via
-        interact_session.  This fixes the "connection dropped on success"
-        issue: the module fires as a job, the session appears asynchronously,
-        and without polling the tool returned before the session existed.
+        Dispatch any Metasploit module to the right execution path based on
+        its category. Single entry point; the underlying execution logic
+        branches internally.
 
         Args:
-            module_path: Full MSF module path, e.g. 'auxiliary/scanner/ssh/ssh_login'.
-            options: Dict of option name -> value, e.g. {'RHOSTS': '10.0.0.5', 'USERNAME': 'root', 'PASSWORD': 'toor', 'PAYLOAD': 'cmd/unix/reverse', 'LHOST': '100.64.0.1', 'LPORT': '4444'}.
-            start_handler: If True, start a SEPARATE persistent
-                'exploit/multi/handler' job (same PAYLOAD/LHOST/LPORT from
-                options) BEFORE firing the module, so there is a live listener
-                for the payload's callback.  This is required for reverse/bind
-                payloads over msfrpcd: the exploit module's *implicit* payload
-                handler does NOT reliably bind a listener via the RPC
-                'module.execute' path, so the target's callback reaches
-                nothing and no session is ever created (the "connect then
-                close" symptom).  A standalone multi/handler DOES bind and
-                persist.  Pass True for exploit modules that use a reverse or
-                bind payload; pass False (the default) for auxiliaries, login
-                scanners, and any module that does not need an inbound listener.
+            module_path: Full MSF module path, e.g. 'exploit/unix/ftp/vsftpd_234_backdoor'.
+            category: One of 'exploit', 'auxiliary', 'post'. MUST match the
+                prefix of module_path (e.g. 'exploit' for 'exploit/.../foo').
+                Copy this verbatim from index_modules's category field.
+            options: Dict of option name -> value (RHOSTS, USERNAME, PAYLOAD,
+                LHOST, LPORT, SESSION, etc.). PAYLOAD is required for exploit
+                modules; SESSION is required for post modules.
+            start_handler: Only used when category='exploit'. If True, start a
+                SEPARATE persistent exploit/multi/handler job before firing
+                the module (required for reverse/bind payloads over msfrpcd).
         """
+        # Validate category matches the module_path prefix. Catches model
+        # confusion (passing an auxiliary module with category='exploit')
+        # BEFORE we waste 30s polling for sessions that will never appear.
+        # Return a structured error dict (not a string) so the executor
+        # surfaces this as status=Failed — the secretary then narrates it
+        # correctly instead of treating it as a successful execution.
+        if "/" in module_path:
+            inferred = module_path.split("/", 1)[0]
+            if inferred != category:
+                return {
+                    "stdout": "",
+                    "status": "Failed",
+                    "error": (
+                        f"Category mismatch: module_path '{module_path}' starts "
+                        f"with '{inferred}' but category='{category}' was passed. "
+                        f"These must agree (an exploit/... module requires "
+                        f"category='exploit', etc.). Copy the 'module_path' and "
+                        f"'category' fields together from the same index_modules "
+                        f"result row."
+                    ),
+                }
+
+        # Post modules need an existing session id. Validate up front so we
+        # don't waste a 30s poll on a guaranteed-empty session list.
+        if category == "post":
+            session_id = options.get("SESSION") if isinstance(options, dict) else None
+            if session_id is None or session_id == "":
+                return {
+                    "stdout": "",
+                    "status": "Failed",
+                    "error": (
+                        "category='post' requires a 'SESSION' option (the numeric "
+                        "id of an existing Metasploit session returned by a prior "
+                        "exploit or auxiliary dispatch). Call list_sessions to see "
+                        "active session ids; pass the integer as a string, e.g. "
+                        "options={'SESSION': '1'}."
+                    ),
+                }
+
+        # Delegate to the existing implementation. The category is used by
+        # the impl for category-specific guards (PAYLOAD validation for
+        # exploit, AutoCheck defaults, etc.); passing it through keeps the
+        # internal logic untouched.
+        return await self._execute_module_impl(
+            module_path=module_path,
+            options=options,
+            start_handler=start_handler,
+            category=category,
+        )
+
+    async def _execute_module_impl(
+        self,
+        module_path: str,
+        options: Dict[str, Any],
+        start_handler: bool,
+        category: str,
+    ):
+        """Internal implementation backing dispatch_metasploit. Not a
+        @framework_tool — call directly only when category is already known
+        and validated (dispatch_metasploit does that)."""
         if not await self._ensure_running():
             return None
 
@@ -399,6 +471,14 @@ class MetasploitClient:
             if len(parts) != 2:
                 return f"Invalid module_path '{module_path}'. Expected 'type/name', e.g. 'auxiliary/scanner/ssh/ssh_login'."
             mtype, mname = parts[0], parts[1]
+            # Belt-and-suspenders: the public entry already validated this,
+            # but if anything else calls us directly (tests, the API gateway)
+            # we still want the guard.
+            if mtype != category:
+                return (
+                    f"Internal category mismatch: module_path='{module_path}' "
+                    f"has type '{mtype}' but caller passed category='{category}'."
+                )
             module = self.client.modules.use(mtype, mname)
 
             # Type coercion: the secretary model passes all option values as
@@ -438,6 +518,22 @@ class MetasploitClient:
             # RPC call — this is the ONLY way those values reach MSF.
             opts = dict(options)  # copy so we don't mutate the caller's dict
             payload_name = opts.pop("PAYLOAD", None)
+
+            # The secretary model occasionally drops top-level arguments into
+            # the `options` dict because the schema is permissive (additionalProperties
+            # is implicit). Strip our own framework-level parameters that are
+            # NOT valid MSF datastore keys so they don't get forwarded to MSF
+            # and rejected as "Invalid option". Each stripped key is logged
+            # so the model can self-correct on retry.
+            for framework_only in ("start_handler",):
+                if framework_only in opts:
+                    val = opts.pop(framework_only)
+                    print(
+                        f"[i] Stripped framework-only key '{framework_only}' "
+                        f"from options dict (value={val!r}); it must be a "
+                        f"top-level argument to dispatch_metasploit, not nested "
+                        f"inside options."
+                    )
 
             # Validate the requested PAYLOAD against the module's compatible
             # payloads BEFORE attempting to launch.  The single most common
@@ -854,14 +950,14 @@ class MetasploitClient:
         "windows/meterpreter/reverse_tcp) with options like LHOST and LPORT. "
         "Use this to set up the payload before executing an exploit module."
     )
-    async def set_payload(self, payload_name, options):
+    async def set_payload(self, payload_name: str, options: Dict[str, Any]):
         """
         Configure a Metasploit payload with specified options.
 
         In the RPC model there is no global console 'set PAYLOAD' command;
         instead we load the payload module and apply options to it.  The
         configured payload can then be referenced by an exploit module via
-        its PAYLOAD option (see execute_module).
+        its PAYLOAD option (see dispatch_metasploit).
         """
         if not await self._ensure_running():
             return None
@@ -882,7 +978,7 @@ class MetasploitClient:
         "Metasploit module (e.g. RHOSTS, USERNAME, PAYLOAD, LHOST). Use this "
         "before executing a module to see what needs to be set."
     )
-    async def get_options(self, module_path):
+    async def get_options(self, module_path: str):
         """
         Retrieve the options for a given Metasploit module.
         """
@@ -904,13 +1000,13 @@ class MetasploitClient:
 
     @framework_tool(
         "Run a command on an active Metasploit session (shell or meterpreter). "
-        "Use this after execute_module creates a session to run commands like "
+        "Use this after dispatch_metasploit creates a session to run commands like "
         "'id', 'whoami', 'cat /etc/shadow' on the compromised target. Pass the "
-        "'msf:' handle returned by execute_module (e.g. 'msf:1'). The session "
+        "'msf:' handle returned by dispatch_metasploit (e.g. 'msf:1'). The session "
         "stays alive for follow-up commands.",
         accepted_handle_kinds=["msf"],
     )
-    async def interact_session(self, handle, command):
+    async def interact_session(self, handle: str, command: str):
         """
         Send a command to a specific active Metasploit session and read the
         response.  Works with both shell and meterpreter sessions.
@@ -925,7 +1021,7 @@ class MetasploitClient:
         includes an explicit success/failure indicator.
 
         Args:
-            handle: The 'msf:' handle returned by execute_module (e.g. 'msf:1').
+            handle: The 'msf:' handle returned by dispatch_metasploit (e.g. 'msf:1').
             command: The command to execute within the session.
         """
         if not await self._ensure_running():
@@ -1018,11 +1114,11 @@ class MetasploitClient:
 
     @framework_tool(
         "Close and kill a specific Metasploit session. Pass the 'msf:' handle "
-        "returned by execute_module. Use this to clean up after exploitation "
+        "returned by dispatch_metasploit. Use this to clean up after exploitation "
         "when the session is no longer needed.",
         accepted_handle_kinds=["msf"],
     )
-    async def close_msf_session(self, handle):
+    async def close_msf_session(self, handle: str):
         """
         Kill and remove a Metasploit session.
 

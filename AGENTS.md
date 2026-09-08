@@ -88,7 +88,7 @@ for embedding), and `_transport` (default `BRAIN_DISPATCH`).
 |---|---|---|
 | `LOCAL_FILE` | Subprocess: `python <script> --key value` | argparse modules discovered statically |
 | `BRAIN_DISPATCH` | Brain UDS socket -> function registry, or in-process fallback | `@framework_tool` functions/methods |
-| `MCP_RPC` | External RPC (Metasploit). Partially implemented. | `metasploiting.py` execute_module |
+| `MCP_RPC` | External RPC (Metasploit). Partially implemented. | `metasploiting.py` dispatch_metasploit |
 
 ### Brain Sidecar (`listeners/thebrain.py`)
 
@@ -175,13 +175,17 @@ it cannot see sessions the Brain was holding.
 `MetasploitClient` uses `pymetasploit3` RPC against a standalone `msfrpcd`
 (launched by `start_mcp()`; port `MSF_RPC_PORT`, default 55553). Singleton via
 `get_instance()` so bootstrap's `start_mcp()` and in-process tool launches
-share the same `MsfRpcClient`/daemon. Tools: `index_modules`, `execute_module`
+share the same `MsfRpcClient`/daemon. Tools: `index_modules`, `dispatch_metasploit`
 (polls for new sessions), `set_payload`, `get_options`, `list_sessions`,
 `interact_session`, `close_msf_session`.
 
-`execute_module(module_path, options, start_handler=False)` — the
-non-obvious parts, all driven by hard-won reproduction against the lab
-target:
+`dispatch_metasploit(module_path, category, options, start_handler=False)` —
+single entry point for all MSF module execution. The `category` argument
+('exploit', 'auxiliary', or 'post') is required and must match the prefix of
+`module_path`; the wrapper refuses mismatches and `category='post'` requires
+a `SESSION` option. Backed internally by `_execute_module_impl(module_path,
+options, start_handler, category)`. The non-obvious parts, all driven by
+hard-won reproduction against the lab target:
 
 - **Payload family matters most.** A binary FTP/TFTP-stager payload
   (`cmd/linux/ftp/<arch>/*`, `cmd/linux/tftp/<arch>/*`) cannot stage an ELF
@@ -189,12 +193,12 @@ target:
   and fails at the command-stager stage with **"Unsupported Binary
   Selected"**. Use a **pure-command** `cmd/unix/*` payload that runs a
   one-liner on the shell (e.g. `cmd/unix/bind_perl`, `cmd/unix/reverse_perl`,
-  `cmd/unix/bind_netcat_gaping`). `execute_module` validates `PAYLOAD`
+  `cmd/unix/bind_netcat_gaping`). `dispatch_metasploit` validates `PAYLOAD`
   against `module.compatible_payloads` and steers the caller at `cmd/unix/*`.
 - **Meterpreter payloads are unusable through this client** —
   pymetasploit3 serializes the meterpreter `AutoLoadExtensions` option as a
   non-scalar and MSF rejects the launch ("Invalid module option value for
-  AutoLoadExtensions: must be a scalar"). `execute_module` hard-blocks any
+  AutoLoadExtensions: must be a scalar"). `dispatch_metasploit` hard-blocks any
   payload containing `meterpreter` with that explanation.
 - **`AutoCheck=False` + `ForceExploit=True` are harness defaults** for
   exploit modules (caller can override either via `options`). The operator
@@ -206,7 +210,7 @@ target:
   payload handler does not reliably bind a reverse/bind listener, so the
   payload's callback reaches nothing and no session forms. Pass
   `start_handler=True` to start a separate persistent `exploit/multi/handler`
-  job (same `PAYLOAD`/`LHOST`/`LPORT`) first; `execute_module` then sets
+  job (same `PAYLOAD`/`LHOST`/`LPORT`) first; `dispatch_metasploit` then sets
   `DisablePayloadHandler=True` so the exploit doesn't double-bind the port.
   Pass `start_handler=False` (default) for auxiliaries/login scanners and for
   "manual" exploits that *require* their own handler and reject
@@ -226,7 +230,7 @@ target:
   by the 30s session-poll ("No new sessions detected"). Any `start_handler`
   listener started is stopped on launch failure so it isn't left orphaned.
 
-Confirmed end-to-end on `192.168.90.110`: `execute_module` with
+Confirmed end-to-end on `192.168.90.110`: `dispatch_metasploit` with
 `cmd/unix/bind_perl`, `RHOST=192.168.90.110`, `LPORT=<port>` yields a
 persistent `msf:` shell session that `interact_session` reads (`uid=0(root)`
 on `Linux metasploitable`).

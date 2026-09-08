@@ -50,7 +50,7 @@ class ToolManifest(BaseModel):
             # into a tool whose ``module_id`` *equals* the MSF module_path (e.g.
             # "auxiliary/scanner/ssh/ssh_login") creates a literal collision
             # between "a tool I call via execute_tool" and "a value I pass as
-            # the module_path argument to execute_module".  The secretary model
+            # the module_path argument to dispatch_metasploit".  The secretary model
             # then passes the slash-path as a tool_id, dispatch routes it to the
             # metasploit endpoint, and MSF logs "Error loading plugin <path>".
             #

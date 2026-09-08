@@ -67,7 +67,7 @@ SAFE_ARGS: Dict[str, Dict[str, Any]] = {
 # Tools that require a live service and should be skipped in --safe sweep
 REQUIRES_SERVICE = {
     "payloads.metasploiting.MetasploitClient.index_modules",
-    "payloads.metasploiting.MetasploitClient.execute_module",
+    "payloads.metasploiting.MetasploitClient.dispatch_metasploit",
     "payloads.metasploiting.MetasploitClient.get_options",
     "payloads.metasploiting.MetasploitClient.interact_session",
     "payloads.metasploiting.MetasploitClient.set_payload",

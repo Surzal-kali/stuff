@@ -139,6 +139,246 @@ def _parse_tool_args(args: Any) -> Dict[str, Any]:
     return {}
 
 
+# --- Pre-approval argument normalization and validation -----------------------
+#
+# pydantic-ai's `execute_tool` tool only declares `tool_id` and `arguments` (an
+# open object). It does NOT enforce the inner shape of `arguments` for the
+# specific tool being called — that's our job. Without this layer the model
+# can pass `{"options": "{\"RHOSTS\": ...}"}` (string-encoded JSON, because the
+# schema it was shown said `options: string`), or invent keys from prose
+# (`auto_check`), or stuff `start_handler` into `options`. We catch all of
+# these BEFORE the human confirmer sees them, with concrete error messages
+# the model can act on.
+
+_BOOL_TRUE = {"true", "yes", "1", "on"}
+_BOOL_FALSE = {"false", "no", "0", "off"}
+
+
+def _coerce_arg_value(name: str, value: Any, schema_type: str) -> Any:
+    """Coerce a single argument value to match its declared schema type.
+
+    Returns the value unchanged if it's already the right type, or if the
+    schema type is unrecognized (so we don't break unknown tools). Raises
+    ValueError with a concrete message on unrecoverable type mismatches —
+    the caller wraps that as a ModelRetry for the secretary to self-correct.
+    """
+    if value is None:
+        return value
+    if not schema_type or schema_type == "null":
+        return value
+
+    if schema_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in _BOOL_TRUE:
+                return True
+            if v in _BOOL_FALSE:
+                return False
+            raise ValueError(
+                f"argument '{name}' must be a boolean (true/false), got string {value!r}"
+            )
+        if isinstance(value, (int, float)):
+            return bool(value)
+        raise ValueError(
+            f"argument '{name}' must be a boolean, got {type(value).__name__}: {value!r}"
+        )
+
+    if schema_type == "integer":
+        if isinstance(value, bool):
+            # bool is a subclass of int in Python; reject so True/False don't
+            # silently become 1/0 for a numeric param.
+            raise ValueError(f"argument '{name}' must be an integer, got boolean {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                raise ValueError(
+                    f"argument '{name}' must be an integer, got string {value!r} that won't parse"
+                )
+        raise ValueError(
+            f"argument '{name}' must be an integer, got {type(value).__name__}: {value!r}"
+        )
+
+    if schema_type == "number":
+        if isinstance(value, bool):
+            raise ValueError(f"argument '{name}' must be a number, got boolean {value!r}")
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                raise ValueError(
+                    f"argument '{name}' must be a number, got string {value!r} that won't parse"
+                )
+        raise ValueError(f"argument '{name}' must be a number, got {type(value).__name__}")
+
+    if schema_type == "string":
+        if isinstance(value, str):
+            return value
+        # JSON-stringify dicts/lists the model sometimes emits for a "string"
+        # param that was supposed to be object/array (schema error upstream).
+        if isinstance(value, (dict, list, int, float, bool)):
+            return json.dumps(value, default=str)
+        return str(value)
+
+    if schema_type == "array":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            v = value.strip()
+            # Try JSON first, then comma-split as a fallback for models that
+            # emit "a,b,c" when they should emit ["a","b","c"].
+            if v.startswith("["):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            if "," in v:
+                return [item.strip() for item in v.split(",") if item.strip()]
+            return [v]
+        raise ValueError(f"argument '{name}' must be an array, got {type(value).__name__}")
+
+    if schema_type == "object":
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                raise ValueError(f"argument '{name}' must be an object, got empty string")
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"argument '{name}' must be an object/dict, got a string that "
+                    f"isn't valid JSON: {e}. Pass the dict directly, e.g. "
+                    f"\"{name}\": {{\"RHOSTS\": \"10.0.0.5\"}}, NOT as a JSON-encoded string."
+                )
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"argument '{name}' must be an object/dict, got JSON {type(parsed).__name__}: {parsed!r}"
+                )
+            return parsed
+        raise ValueError(f"argument '{name}' must be an object/dict, got {type(value).__name__}")
+
+    return value
+
+
+def _normalize_args_against_manifest(
+    manifest: "ToolManifest", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Coerce argument values to the manifest's declared types and report
+    structural problems as ModelRetry-able errors.
+
+    Returns a NEW dict (the caller's input is not mutated). Errors are raised
+    as ValueError; the caller wraps them in ModelRetry with the concrete
+    message intact so the secretary can self-correct.
+    """
+    params = (manifest.parameters or {}) if isinstance(manifest.parameters, dict) else {}
+    properties = params.get("properties") if isinstance(params, dict) else None
+    required = params.get("required") if isinstance(params, dict) else None
+    if not isinstance(properties, dict):
+        properties = {}
+    if not isinstance(required, list):
+        required = []
+
+    out = dict(args)  # shallow copy; values get replaced with coerced ones
+
+    # 1. Check for required fields the model forgot entirely. Empty containers
+    #    (dict/list/str) also count as missing because the wrapper will have
+    #    nothing to dispatch on.
+    def _is_missing(val: Any) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, str) and not val.strip():
+            return True
+        if isinstance(val, (dict, list)) and len(val) == 0:
+            return True
+        return False
+
+    missing = [r for r in required if r not in out or _is_missing(out[r])]
+    if missing:
+        raise ValueError(
+            f"missing required argument(s): {missing}. The tool "
+            f"'{manifest.module_id}' requires these fields; supply them all in 'arguments'."
+        )
+
+    # 2. Coerce every declared property to its declared type. Run this BEFORE
+    #    checking for extras so a coerced `options` dict is what's reported on.
+    for name, prop_def in properties.items():
+        if name not in out:
+            continue
+        schema_type = prop_def.get("type") if isinstance(prop_def, dict) else None
+        out[name] = _coerce_arg_value(name, out[name], schema_type or "")
+
+    # 2b. Enforce enum constraints (e.g. Literal["exploit","auxiliary","post"]
+    #     becomes {"type":"string","enum":[...]} in the manifest). Reject values
+    #     outside the allowed set before approval so the model self-corrects
+    #     instead of the wrapper silently accepting them.
+    for name, prop_def in properties.items():
+        if name not in out:
+            continue
+        if not isinstance(prop_def, dict):
+            continue
+        allowed = prop_def.get("enum")
+        if not allowed or not isinstance(allowed, list):
+            continue
+        val = out[name]
+        if val not in allowed:
+            raise ValueError(
+                f"argument '{name}' must be one of {allowed}, got {val!r}. "
+                f"Copy the value from index_modules's category field (or any "
+                f"other field whose schema is an enum) VERBATIM — do not "
+                f"paraphrase or substitute a synonym."
+            )
+
+    # 3. Reject extra keys the manifest doesn't declare. The model sometimes
+    #    invents parameters from prose in tool descriptions (e.g. "auto_check"
+    #    appears nowhere in the dispatch_metasploit signature) or relocates a
+    #    real parameter into the wrong place (start_handler into options).
+    #    Open schemas (additionalProperties: true) are rare in this codebase
+    #    but we honour them.
+    declared = set(properties.keys())
+    declared_lower = {d.lower() for d in declared}
+    extra = []
+    for key in out:
+        if key in declared or key.lower() in declared_lower:
+            continue
+        # Tolerate case differences and a handful of harmless meta-keys.
+        if key.startswith("_"):
+            continue
+        extra.append(key)
+
+    if extra:
+        # Try to be helpful: if a top-level key looks like a known MSF option
+        # name the model dropped into `arguments`, suggest moving it.
+        suggestions = []
+        for key in extra:
+            for prop_name in ("options",):
+                if prop_name in properties and isinstance(properties[prop_name].get("type"), str) \
+                        and properties[prop_name]["type"] == "object":
+                    suggestions.append(
+                        f"'{key}' looks like an MSF option — put it INSIDE the '{prop_name}' dict, "
+                        f"e.g. \"{prop_name}\": {{..., \"{key}\": <value>}}"
+                    )
+                    break
+        detail = ""
+        if suggestions:
+            detail = " Hint: " + " ".join(suggestions)
+        raise ValueError(
+            f"unknown argument(s): {extra}. The tool '{manifest.module_id}' "
+            f"only accepts these keys: {sorted(declared)}.{detail}"
+        )
+
+    return out
+
+
 def _cap_tool_stdout(result: Dict[str, Any], limit: Optional[int] = None) -> Dict[str, Any]:
     """Truncate the ``stdout`` field of a tool result before it enters the
     model's conversation history.
@@ -170,11 +410,12 @@ def _cap_tool_stdout(result: Dict[str, Any], limit: Optional[int] = None) -> Dic
 _CHAIN_NEXT = {
     "payloads.metasploiting.MetasploitClient.index_modules": (
         "Next: call execute_tool with tool_id "
-        "'payloads.metasploiting.MetasploitClient.execute_module', passing one of the "
-        "returned 'module_path' values VERBATIM as the 'module_path' argument (it is a "
-        "VALUE, not a tool id) and RHOSTS/PAYLOAD/etc. in 'options'."
+        "'payloads.metasploiting.MetasploitClient.dispatch_metasploit', passing one "
+        "of the returned 'module_path' values AND its 'category' field (e.g. "
+        "'exploit', 'auxiliary', 'post') VERBATIM as arguments (these are VALUES, "
+        "not tool ids). The other args go in 'options' (RHOSTS, PAYLOAD, etc.)."
     ),
-    "payloads.metasploiting.MetasploitClient.execute_module": (
+    "payloads.metasploiting.MetasploitClient.dispatch_metasploit": (
         "If a new session was reported: next call execute_tool with tool_id "
         "'payloads.metasploiting.MetasploitClient.interact_session', passing the 'msf:' "
         "handle VERBATIM as the 'handle' argument (a VALUE, not a tool id)."
@@ -265,10 +506,12 @@ async def secretary_execute_tool(
         raise ModelRetry(
             f"'{tool_id}' contains '/', so it looks like an MSF module_path (a value "
             f"you pass to a tool), not a tool id. Tool ids are dotted python paths "
-            f"such as 'payloads.metasploiting.MetasploitClient.execute_module'. "
+            f"such as 'payloads.metasploiting.MetasploitClient.dispatch_metasploit'. "
             f"To run the module '{tool_id}', call execute_tool with tool_id "
-            f"'payloads.metasploiting.MetasploitClient.execute_module' and pass '{tool_id}' "
-            f"as the 'module_path' argument."
+            f"'payloads.metasploiting.MetasploitClient.dispatch_metasploit' and pass '{tool_id}' "
+            f"as the 'module_path' argument. ALSO pass a 'category' argument "
+            f"matching the prefix (the first segment of module_path before '/'): "
+            f"'exploit', 'auxiliary', or 'post'."
         )
     args = _parse_tool_args(arguments)
     ctx.deps.execute_calls += 1
@@ -304,6 +547,22 @@ async def secretary_execute_tool(
     handle_reason = registry.validate_handle_argument(manifest, args)
     if handle_reason is not None:
         raise ModelRetry(handle_reason)
+
+    # Pre-approval shape check: coerce argument values to the manifest's
+    # declared types, reject missing required keys, and reject extra keys
+    # the model invented from prose. This runs BEFORE the human confirmer so
+    # the operator never sees a structurally-broken call. ValueError messages
+    # are concrete enough for the secretary to self-correct on the next retry.
+    try:
+        args = _normalize_args_against_manifest(manifest, args)
+    except ValueError as ve:
+        logger.info(
+            f"[TOOL_ARGS_REJECT] {tool_id}: {ve}"
+        )
+        raise ModelRetry(
+            f"{ve} The manifest for '{tool_id}' shows the expected shape "
+            f"in its 'parameters' field; pass arguments matching that shape."
+        )
 
     warnings = registry.validate_arguments(manifest, args)
     result = await registry.execute_tool(manifest, args)
@@ -354,7 +613,10 @@ async def _tail_framework_logs() -> Dict[str, str]:
     Imported lazily so utils/log_reader.py isn't pulled in at module load
     (it imports constants, which would create a circular import otherwise).
     Errors are swallowed: a missing/unreadable log is not a reason to fail
-    the whole tool call, just a visibility gap.
+    the whole tool call, just a visibility gap. Specifically, we do NOT
+    log ``Error: Log file /tmp/msfconsole_mcp.log does not exist`` on every
+    ZAP tool run -- that path is conditional on MSF being started, and
+    logging it at INFO level flooded the operator console.
     """
     try:
         from utils.log_reader import read_logs
@@ -371,8 +633,8 @@ async def _tail_framework_logs() -> Dict[str, str]:
             continue
         if isinstance(tail, str) and not tail.startswith("Error"):
             tails[log_type] = tail
-        elif isinstance(tail, str):
-            logger.info(f"[secretary] post-exec log ({log_type}): {tail}")
+        # Silently skip missing log files. Operator can read them via the
+        # log_reader tool directly when they actually want them.
     return tails
 
 
@@ -443,19 +705,24 @@ class SecretaryMixin:
 
             Tool IDs vs argument values (CRITICAL — this is the main failure mode):
             - A tool ID is a dotted python path with NO slashes, e.g.
-              'payloads.metasploiting.MetasploitClient.execute_module'. You pass it as
+              'payloads.metasploiting.MetasploitClient.dispatch_metasploit'. You pass it as
               the `tool_id` argument to execute_tool.
             - An MSF module_path like 'auxiliary/scanner/ssh/ssh_login' is an ARGUMENT
-              VALUE you pass to execute_module's `module_path` parameter. It is NEVER a
+              VALUE you pass to dispatch_metasploit's `module_path` parameter. It is NEVER a
               tool id and execute_tool will reject it if you pass it as one.
+            - The MSF 'category' ('exploit', 'auxiliary', or 'post') is an ARGUMENT
+              VALUE you pass to dispatch_metasploit's `category` parameter. Copy it
+              VERBATIM from index_modules's `category` field — the enum is enforced and
+              any other value (including synonyms or different casing) will be rejected.
             - A session handle like 'msf:1' or 'ssh:sess-0001' is an ARGUMENT VALUE you
               pass to a tool's `handle` parameter. It is NEVER a tool id.
             - Chaining: when a tool returns a value you need for the next step
-              (index_modules -> module_path -> execute_module; execute_module -> msf:
-              handle -> interact_session; ssh_connect -> ssh: handle -> ssh_exec), your
-              NEXT action is execute_tool with the matching wrapper tool, passing that
-              returned value as its argument. Do NOT search again, do NOT pass the value
-              as a tool_id, do NOT skip the next call.
+              (index_modules -> module_path+category -> dispatch_metasploit;
+              dispatch_metasploit -> msf: handle -> interact_session;
+              ssh_connect -> ssh: handle -> ssh_exec), your NEXT action is execute_tool
+              with the matching wrapper tool, passing that returned value as its
+              argument. Do NOT search again, do NOT pass the value as a tool_id, do
+              NOT skip the next call.
 
             Session handles (IMPORTANT — this is where mistakes happen):
             - Sessions are identified by TYPED handles of the form "<kind>:<id>":
@@ -479,7 +746,29 @@ class SecretaryMixin:
               you stop it with close_listener. You do NOT connect to a listener.
             - A BACKDOOR is already running on the target (e.g. vsftpd 2.3.4 on port 6200).
               You do NOT bind anything for it — you pop it with a Metasploit exploit module
-              (execute_module), which returns an msf: handle you use with interact_session.
+              (dispatch_metasploit with category='exploit'), which returns an msf: handle
+              you use with interact_session.
+
+            MSF dispatch_metasploit specifics:
+            - dispatch_metasploit is the ONLY tool that runs an MSF module. Pick the
+              category that matches what you're running and pass it verbatim from
+              index_modules's result. The wrapper refuses mismatches (an auxiliary
+              module path with category='exploit' is rejected before execution).
+            - For exploit category: pass PAYLOAD in `options`. cmd/unix/bind_* or
+              cmd/unix/reverse_* payloads work through this client; meterpreter payloads
+              are blocked (pymetasploit3 bug). For reverse/bind exploits, set
+              start_handler=True so a persistent multi/handler is started before the
+              module fires — without it, the callback reaches nothing over msfrpcd.
+            - For auxiliary category: no PAYLOAD, no handler. Just RHOSTS/USERNAME/PASSWORD
+              etc. in `options`.
+            - For post category: pass SESSION (the integer session id) in `options`.
+              Post modules run against an existing session, not a target host.
+            - If dispatch_metasploit returns "No new sessions detected" or any result
+              without an 'msf:' handle, do NOT stop and ask the user. Immediately:
+              (1) call list_sessions to verify, (2) if still empty, retry once with
+              start_handler=True if you haven't already, (3) if that fails, retry once
+              with a different cmd/unix/bind_* payload (the bind variant, not reverse).
+              Only ask the user after two consecutive empty-session results.
 
             SSH login on a target:
             - For a plain username/password SSH login, use ssh_connect (it handles old/legacy

@@ -109,7 +109,7 @@ Each row validates something specific about the framework, noted in the
 | # | Prompt to secretary | Tool that should surface | Expected pass signal | Validates |
 |---|---|---|---|---|
 | 6 | "Show me the options for that vsftpd module" | `get_options` | returns RHOSTS, etc. | MSF module option introspection |
-| 7 | "Exploit the vsftpd backdoor on 192.168.56.102" | `execute_module` (MCP_RPC) | reports 1 new session with session ID | MSF execute + session-poll loop; `before/after` diff catches the new session |
+| 7 | "Exploit the vsftpd backdoor on 192.168.56.102" | `dispatch_metasploit` (MCP_RPC) | reports 1 new session with session ID | MSF dispatch + session-poll loop; `before/after` diff catches the new session |
 | 8 | "Run 'id' on that new session" | `interact_session` | `uid=0(root)` | MSF session persistence across tool calls; write/read with retry |
 
 ### Phase D - Credential access & post-exploitation

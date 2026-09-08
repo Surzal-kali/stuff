@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from constants import TransportType
 
-from ._param_docs import parse_param_docs, annotation_to_schema_type
+from ._param_docs import parse_param_docs, annotation_to_schema_type, annotation_to_schema_extras
 from .models import ToolManifest
 from .executor import ExecutorMixin
 from .agent import (
@@ -493,7 +493,9 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
 
                         # Build parameter schema from the function signature,
                         # using type annotations for JSON Schema types and
-                        # docstring-derived descriptions.
+                        # docstring-derived descriptions. Annotation extras
+                        # (e.g. Literal -> enum) are merged in so the model
+                        # sees the full constraint set, not just the type.
                         sig = inspect.signature(func)
                         params = {"type": "object", "properties": {}}
                         required = []
@@ -501,12 +503,16 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                             if is_method and idx == 0 and p_name in ("self", "cls"):
                                 continue  # bound at launch time via a class instance
                             p_type = annotation_to_schema_type(p_param.annotation)
-                            params["properties"][p_name] = {
+                            prop_def: Dict[str, Any] = {
                                 "type": p_type,
                                 "description": param_docs.get(
                                     p_name, f"Parameter {p_name}"
                                 ),
                             }
+                            extras = annotation_to_schema_extras(p_param.annotation)
+                            if extras:
+                                prop_def.update(extras)
+                            params["properties"][p_name] = prop_def
                             if p_param.default is inspect.Parameter.empty:
                                 required.append(p_name)
                         params["required"] = required

@@ -26,6 +26,14 @@ MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
 MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
 
+# OWASP ZAP daemon (auxiliaries/zap.py uses these). The daemon is launched
+# loopback-only -- api.addrs.addr.name=127.0.0.1 below -- so even if
+# api.disablekey is set the API is unreachable off-host. ZAP_API_KEY is sent
+# on every call from auxiliaries/zap.py as the ``apikey`` query param.
+ZAP_HOST = os.getenv("ZAP_HOST", "127.0.0.1")
+ZAP_PORT = int(os.getenv("ZAP_PORT", "8090"))
+ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")
+
 # --- Async Background Runner ---
 class AsyncBackgroundRunner:
     """Runs an asyncio event loop in a separate background thread."""
@@ -227,9 +235,99 @@ class FrameworkLoader:
                 stderr=asyncio.subprocess.PIPE
             )
             self.active_tasks.append(process)
-        
+
         except Exception as e:
             logger.error("[!] SSL server exception: %s", e, exc_info=True)
+
+    async def start_zap_daemon(self, host=None, port=None):
+        """Start the OWASP ZAP daemon as a subprocess.
+
+        Same lifecycle shape as ``start_ssl_server``: asyncio subprocess,
+        appended to ``active_tasks`` so ``stop()`` reaps it via the
+        SIGTERM-then-SIGKILL filter on ``asyncio.subprocess.Process``.
+
+        The daemon is bound loopback-only (``api.addrs.addr.name=127.0.0.1``
+        + ``api.disablekey`` left at its default -- keys are still sent on
+        every API call from ``auxiliaries/zap.py`` so a defence-in-depth
+        posture holds if a future config flip exposes it).
+        """
+        import shutil
+        host = host or ZAP_HOST
+        port = port or ZAP_PORT
+
+        zap_bin = shutil.which("zap") or "/usr/share/zap/zap.sh"
+        if not Path(zap_bin).exists():
+            logger.error("[!] ZAP launcher not found at %s", zap_bin)
+            return
+
+        # Daemon JVM heap; 512m is enough for the framework's typical scans.
+        # -daemon forks the JVM (no GUI). Logs go to /tmp/zap.log so failures
+        # are inspectable after a crash.
+        log_path = "/tmp/zap.log"
+        cmd = [
+            zap_bin, "-daemon",
+            "-port", str(port),
+            "-host", host,
+            "-config", f"api.addrs.addr.name={host}",
+            "-config", "api.addrs.addr.regex=true",
+            # ZAP 2.17's `network` add-on binds a "main proxy" on
+            # localhost:8080 by default. Without an explicit address it
+            # tries to resolve ``localhost`` over IPv6 first and dies with
+            # ``UnresolvedAddressException`` -- which terminates the daemon
+            # before it ever opens the API socket. Pin it to 127.0.0.1 so
+            # it can bind deterministically on this loopback-only setup.
+            "-config", f"network.localServers.mainProxy.address={host}",
+            "-Xmx512m",
+        ]
+        # Pin the home dir somewhere stable so session DBs persist across
+        # restarts (handy when chaining spider -> active scan in two boots).
+        zap_home = self.framework_root / ".zap_home"
+        zap_home.mkdir(exist_ok=True)
+        env = {**os.environ, "ZAP_HOME": str(zap_home)}
+
+        try:
+            logger.info("[+] Starting ZAP daemon on %s:%s (log: %s)",
+                        host, port, log_path)
+            log_fd = open(log_path, "ab")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_fd,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            self.active_tasks.append(process)
+            # Track the log fd so ``stop()`` can close it when the daemon
+            # terminates -- otherwise the fd leaks for the lifetime of the
+            # parent process. Keyed by the Process object so we don't have
+            # to mutate it with a private attribute.
+            self._child_log_fds = getattr(self, "_child_log_fds", {})
+            self._child_log_fds[id(process)] = log_fd
+        except Exception as e:
+            logger.error("[!] ZAP daemon failed to start: %s", e, exc_info=True)
+
+    async def wait_for_zap(self, host=None, port=None, timeout=60):
+        """Block until the ZAP daemon's HTTP API responds.
+
+        Polls ``http://<host>:<port>/`` once a second up to ``timeout``
+        seconds. ZAP's first launch also has to extract/initialise its DB
+        (cold start ~10-20s on a fresh home dir), so the default budget is
+        generous. Call this from interactive / daemon startup right after
+        scheduling ``start_zap_daemon``.
+        """
+        import requests as _requests
+        host = host or ZAP_HOST
+        port = port or ZAP_PORT
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                _requests.get(f"http://{host}:{port}/", timeout=2)
+                logger.info("[+] ZAP daemon is up at %s:%s", host, port)
+                return True
+            except Exception:
+                await asyncio.sleep(1)
+        logger.warning("[!] ZAP daemon did not respond within %ss; "
+                       "zap_* tools will fail until it does", timeout)
+        return False
 
     async def reload_module(self, module):
         """Reloads a given module and updates the tool registry."""
@@ -323,6 +421,15 @@ class FrameworkLoader:
                 await asyncio.gather(*(t for t in tasks), return_exceptions=True)
             if procs:
                 await asyncio.gather(*(_reap_proc(p) for p in procs), return_exceptions=True)
+            # Close any child log fds (e.g. the ZAP daemon's /tmp/zap.log
+            # writer) once the matching Process has been reaped.
+            for proc in procs:
+                fd = self._child_log_fds.pop(id(proc), None)
+                if fd is not None:
+                    try:
+                        fd.close()
+                    except Exception:
+                        pass
 
         # Shield so a task cancellation (asyncio.run's KeyboardInterrupt path)
         # can't cut reaping short; children already got SIGTERM above, and the
@@ -358,11 +465,16 @@ class FrameworkLoader:
         # Start services
         self.active_tasks.append(asyncio.create_task(self.start_brain_server()))
         self.active_tasks.append(asyncio.create_task(self.start_ssl_server()))
+        self.active_tasks.append(asyncio.create_task(self.start_zap_daemon()))
         self.api_task = asyncio.create_task(self.start_api_server())
         self.active_tasks.append(self.api_task)
         self.active_tasks.append(asyncio.create_task(self.start_metasploit_mcp()))
-        
-        
+
+        # Wait for the ZAP API to answer before declaring launch complete;
+        # the spider/ascan tools will otherwise fail their first call with
+        # ConnectionError on a half-initialised daemon.
+        await self.wait_for_zap()
+
         logger.info("[+] API Control Panel started on port 6000")
         logger.info("[*] Background servers initialized.")
 

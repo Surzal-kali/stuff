@@ -52,7 +52,7 @@ class ExecutorMixin:
             return await self._execute_brain_tool(manifest.module_id, arguments)
 
         if manifest.transport == TransportType.MCP_RPC:
-            # MCP_RPC tools (e.g. MetasploitClient.execute_module) are async
+            # MCP_RPC tools (e.g. MetasploitClient.dispatch_metasploit) are async
             # methods on the same in-process class instances as the
             # BRAIN_DISPATCH tools. There is no separate MCP endpoint to call,
             # so route them through the identical Brain-first / in-process
@@ -298,7 +298,30 @@ class ExecutorMixin:
             }
         if isinstance(result, str):
             return {"stdout": result, "status": "Success"}
-        if isinstance(result, (dict, list, int, float, bool)):
+        if isinstance(result, dict):
+            # If the wrapper already produced a status dict, respect it.
+            # Pre-approval wrappers (dispatch_metasploit's category checks,
+            # for example) return {status: "Failed", error: "..."} to
+            # signal failure to the secretary, and we should not relabel
+            # it as Success just because it's a dict.
+            existing_status = result.get("status")
+            if existing_status in ("Success", "Failed"):
+                # Pass through with a stdout fallback so the agent layer
+                # can still surface the human-readable text.
+                wrapped = {
+                    "stdout": result.get("stdout") or json.dumps(result, default=str),
+                    "status": existing_status,
+                    "result": result,
+                }
+                if "error" in result:
+                    wrapped["error"] = result["error"]
+                return wrapped
+            return {
+                "stdout": json.dumps(result, default=str),
+                "result": result,
+                "status": "Success",
+            }
+        if isinstance(result, (list, int, float, bool)):
             return {
                 "stdout": json.dumps(result, default=str),
                 "result": result,
