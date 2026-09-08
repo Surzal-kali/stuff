@@ -7,7 +7,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
@@ -75,7 +77,15 @@ SSL* accept_new_connections(int server_fd, SSL_CTX *ctx) {
         perror("accept failed");
         return NULL;
     }
-    
+
+    /* Set a receive timeout so blocking SSL_accept / SSL_read can't pin
+     * a worker thread forever on a client that connects then idles. */
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    if (setsockopt(new_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO failed");
+        /* non-fatal: continue */
+    }
+
     // Create SSL structure for the new connection
     ssl = SSL_new(ctx);
     if (ssl == NULL) {
@@ -165,15 +175,20 @@ int main(int argc, char *argv[]) {
     // Create Socket
     int server_fd = start_listening_socket(ip, port);
 
+    signal(SIGPIPE, SIG_IGN);
+
     while(1) {
         SSL *session = accept_new_connections(server_fd, ctx);
         if (session) {
             pthread_t tid;
             connection_t *conn = malloc(sizeof(connection_t));
+            if (!conn) {
+                perror("malloc failed");
+                SSL_free(session);
+                close(SSL_get_fd(session));
+                continue;   /* keep serving; this one connection is dropped */
+            }
             conn->ssl = session;
-            // We need the raw fd for cleanup, but accept_new_connections 
-            // doesn't return it. We'll modify accept_new_connections or 
-            // just use SSL_get_fd.
             conn->fd = SSL_get_fd(session);
 
             if (pthread_create(&tid, NULL, connection_handler, conn) != 0) {
