@@ -32,29 +32,30 @@
       saved as an e2e artifact
 
 ## Phase 2 — Subdomain & content recon (bounty surface)
-- [ ] subfinder wrapper (subprocess + flag allowlist, pattern = nmap.py);
-      passive-first (`-passive` default)
-- [ ] `subdomain_enum(target)` composite -> {subdomains[], alive[], out_of_scope_hits[]}
-      — scope check enforced INSIDE the tool
-- [ ] amass as optional secondary wrapper (or defer; subfinder covers v1)
+- [x] amass wrapper (subprocess + flag allowlist, pattern = nmap.py);
+      passive-first (passive is default in amass v5; `-passive` flag deprecated)
+- [x] `subdomain_enum(target)` composite -> {subdomains[], alive[], out_of_scope[]}
+      — scope check enforced INSIDE the tool (.scope file in workspace root;
+      lab mode = no scope file = everything in scope)
+- [ ] subfinder as optional secondary wrapper (deferred; amass covers v1 + brute + alts)
 - [ ] Content discovery v1: wordlist-driven path fuzz reusing repeater ergonomics,
       pointed at a scope-gated real target (not the echo server)
-- [ ] Next hints: subdomain_enum -> "nmap -iL <alive>" -> "zap_open_url"
+- [x] Next hints: subdomain_enum -> "nmap -iL <alive>" -> "zap_open_url"
 - [ ] Acceptance: "map *.example.com, fuzz the blog, flag IDOR-looking params"
       runs with zero code changes
 
 ## Phase 3 — Collaborator analog (sslserver graduation)
-- [ ] Multi-protocol listener in listeners/plugins (evolve sslserver):
+- [x] Multi-protocol listener in listeners/collaborator.py (evolved from sslserver concept):
         - HTTP on 80
-        - HTTPS on 443 (reuse self-signed cert)
+        - HTTPS on 443 (reuse self-signed cert from utils/plugins/sslserver)
         - DNS on UDP 53: answer all queries with fixed IP, LOG FULL QNAME
           (payload ID rides in the subdomain — the qname IS the signal)
-- [ ] Register listener as typed handle in utils/handles.py (orchestrator owns it
-      like MSF/listener sessions)
-- [ ] `collab_generate()` -> {url, dns_name}
-- [ ] `collab_poll(since)` -> [{proto, src_ip, qname, path, ts, excerpt}]
-- [ ] Lab DNS: dnsmasq wildcard *.oob.lab -> listener (or PacketCraft
-      craft_dns_response); real-world OOB = one delegated NS record (config, not code)
+- [x] Register listener as typed handle in utils/handles.py — "collab" kind
+      added to VALID_KINDS; orchestrator owns it like MSF/listener sessions
+- [x] `collab_generate()` -> {id, url, dns_name}
+- [x] `collab_poll(since)` -> [{proto, src_ip, qname, path, host, user_agent, ts, excerpt}]
+- [x] Lab DNS: built-in DNS listener on port 53 IS the resolver for *.oob.lab
+      (no dnsmasq needed); real-world OOB = one delegated NS record (config, not code)
 - [ ] Acceptance: blind SSRF/XSS lab test — inject collab URL, trigger, poll
       shows the callback with matching qname ID
 

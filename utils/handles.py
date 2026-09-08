@@ -32,7 +32,7 @@ HANDLE_SEPARATOR = ":"
 # The closed set of namespaces.  Adding a new session type means: (1) extend
 # this set, (2) emit handles from the creating tool, (3) declare
 # accepted_handle_kinds on the consuming tools.
-VALID_KINDS = {"ssh", "msf", "listener"}
+VALID_KINDS = {"ssh", "msf", "listener", "collab"}
 
 
 def format_handle(kind: str, sid: str) -> str:
@@ -108,6 +108,7 @@ def validate_handle_for_tool(handle: str, accepted_kinds) -> Optional[str]:
             "ssh": "Use an ssh_* tool (ssh_exec / ssh_shell / ssh_close).",
             "msf": "Use interact_session / close_msf_session.",
             "listener": "Use close_listener to stop a bound listener.",
+            "collab": "Use collab_stop to stop the collaborator listener.",
         }.get(kind, "")
         return (
             f"Handle {handle!r} is kind '{kind}' but this tool accepts only "

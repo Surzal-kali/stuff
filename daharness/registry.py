@@ -468,8 +468,15 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     # Candidates: (tool_id, function, is_method)
                     candidates: List[tuple] = []
                     for name, obj in inspect.getmembers(mod):
-                        # Module-level @framework_tool functions
-                        if inspect.isfunction(obj) and getattr(obj, "_is_framework_tool", False):
+                        # Module-level @framework_tool functions — only those
+                        # DEFINED in this module, not imported from elsewhere.
+                        # The __module__ guard prevents re-minting an imported
+                        # @framework_tool under the wrong module_id (e.g.
+                        # remember_text imported into utils/findings.py being
+                        # registered as utils.findings.remember_text).
+                        if (inspect.isfunction(obj)
+                                and getattr(obj, "_is_framework_tool", False)
+                                and obj.__module__ == module_name):
                             candidates.append((f"{module_name}.{name}", obj, False))
                         # @framework_tool METHODS on classes defined in THIS module.
                         # The __module__ guard stops imported classes from being
