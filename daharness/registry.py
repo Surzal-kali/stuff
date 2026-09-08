@@ -236,12 +236,14 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 old_meta = (existing.get("metadatas") or [{}])[0] or {}
                 new_meta_json = json.dumps(m.parameters or {})
                 new_kinds_json = json.dumps(list(m.accepted_handle_kinds or []))
+                new_next_json = json.dumps(list(m.next or []))
                 unchanged = (
                     old_doc == m.internal_semantic_capability
                     and str(old_meta.get("implementation_path", "")) == m.implementation_path
                     and old_meta.get("transport") == m.transport.value
                     and old_meta.get("parameters_json") == new_meta_json
                     and old_meta.get("accepted_handle_kinds") == new_kinds_json
+                    and old_meta.get("next_hints") == new_next_json
                 )
                 if unchanged:
                     continue
@@ -269,6 +271,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         "accepted_handle_kinds": json.dumps(
                             list(m.accepted_handle_kinds or [])
                         ),
+                        "next_hints": json.dumps(list(m.next or [])),
                     }
                 ],
                 documents=[m.internal_semantic_capability],
@@ -534,6 +537,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         # before execution (prevents cross-namespace calls like
                         # passing an msf: handle to an ssh_exec tool).
                         handle_kinds = getattr(func, "_accepted_handle_kinds", ()) or ()
+                        next_hints = getattr(func, "_next_hints", ()) or ()
                         manifests.append(
                             ToolManifest(
                                 module_id=tool_id,
@@ -544,6 +548,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                                 internal_semantics=semantics,
                                 transport=tool_transport,
                                 accepted_handle_kinds=tuple(handle_kinds),
+                                next=list(next_hints),
                             )
                         )
                 except Exception as e:
@@ -596,6 +601,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             accepted_handle_kinds=self._safe_parse_kinds(
                 meta.get("accepted_handle_kinds")
             ),
+            next=list(self._safe_parse_kinds(meta.get("next_hints"))),
         )
 
     def _safe_parse_tool_args(self, raw: Any) -> dict:
@@ -683,6 +689,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     accepted_handle_kinds=self._safe_parse_kinds(
                         meta.get("accepted_handle_kinds")
                     ),
+                    next=list(self._safe_parse_kinds(meta.get("next_hints"))),
                     distance=round(float(dist), 4) if dist is not None else None,
                 )
             )
@@ -717,6 +724,8 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 # so it can self-check before calling (e.g. a tool that accepts
                 # only "ssh" must be given an ssh: handle, not an msf: one).
                 entry["accepted_handle_kinds"] = list(manifest.accepted_handle_kinds)
+            if manifest.next:
+                entry["next"] = list(manifest.next)
             return entry
         return {
             "tool_id": manifest.module_id,
@@ -726,6 +735,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             "transport": manifest.transport.value,
             "parameters": manifest.parameters,
             "internal_semantics": manifest.internal_semantics,
+            "next": list(manifest.next) if manifest.next else [],
         }
 
     def validate_arguments(

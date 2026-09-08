@@ -4,7 +4,10 @@ import subprocess
 from constants import framework_tool
 
 
-@framework_tool("Run sqlmap against a target URL to test for SQL injection vulnerabilities.")
+@framework_tool(
+    "Run sqlmap against a target URL to test for SQL injection vulnerabilities.",
+    next_hints=["report_finding"],
+)
 def run_sqlmap(target_url: str, options: str = ""):
     """Run sqlmap against the specified target URL with optional command-line options.
 

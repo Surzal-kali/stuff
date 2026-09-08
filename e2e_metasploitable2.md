@@ -29,7 +29,7 @@ human-in-the-loop interaction and the semantic-discovery behavior.
 
 - Same host-only subnet, e.g. `192.168.56.1`.
 - Ollama running with `nomic-embed-text` and the chat model from
-  `SECRETARY_MODEL` (default `gemma4:12b`).
+  `SECRETARY_MODEL` (default `qwen3:14b`).
 - ChromaDB server reachable at `CHROMA_HOST:CHROMA_PORT` (default
   `localhost:9000`).
 - Metasploit Framework installed, with `msfconsole` on `$PATH`.

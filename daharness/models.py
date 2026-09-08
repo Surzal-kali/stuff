@@ -30,6 +30,14 @@ class ToolManifest(BaseModel):
     # and surfaced in ``describe_manifest(lean=True)`` so the secretary model
     # can judge how well a result actually matches.
     distance: Optional[float] = None
+    # Next-action hints: human-curated suggestions for what tool to call
+    # after this one succeeds.  Populated from the ``@framework_tool(...,
+    # next_hints=[...])`` decorator and persisted in ChromaDB metadata so it
+    # survives re-indexing.  Surfaced in ``describe_manifest`` so the
+    # secretary model sees actionable next steps, not just a capability
+    # description.  Examples: secretsdump -> "psexec_exec with -hashes
+    # :<NTLM>", zap_alerts -> "report_finding".
+    next: List[str] = Field(default_factory=list)
 
     @classmethod
     def from_output(cls, payload: Any) -> Union["ToolManifest", List["ToolManifest"]]:
@@ -84,4 +92,30 @@ class ToolManifest(BaseModel):
         raise TypeError(f"Unsupported ToolManifest payload: {type(payload).__name__}")
 
 
-__all__ = ["ToolManifest"]
+class Finding(BaseModel):
+    """A structured security finding — the framework's output contract.
+
+    Every tool chain should end with ``report_finding`` to mint one of these.
+    The full object lives in the findings store (SQLite ``ids.db``) and is
+    never injected into the secretary's context.  Only a one-line pointer is
+    stored in vector memory via ``remember_text`` so the secretary can recall
+    that a finding *exists* without bloating its context with the full
+    evidence payload.
+    """
+
+    id: str = Field(..., description="Auto-assigned by store, e.g. F-001")
+    title: str
+    severity: str = Field(..., description="P1 (critical) .. P4 (info)")
+    cwe: Optional[str] = None
+    asset: str
+    evidence: Dict[str, str] = Field(
+        default_factory=dict,
+        description='Keys: "request", "response", "excerpt"',
+    )
+    repro: List[str] = Field(default_factory=list)
+    tool_chain: List[str] = Field(default_factory=list)
+    memory_ref: Optional[str] = None
+    ts: str = Field(..., description="ISO-8601 timestamp")
+
+
+__all__ = ["ToolManifest", "Finding"]

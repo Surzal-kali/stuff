@@ -399,7 +399,10 @@ def zap_active_scan_status(scan_id: str) -> Dict[str, Any]:
     return {"ascan_id": scan_id, "status": _zap().active_scan_status(scan_id)}
 
 
-@framework_tool("List ZAP alerts (optionally filtered by URL prefix and risk level).")
+@framework_tool(
+    "List ZAP alerts (optionally filtered by URL prefix and risk level).",
+    next_hints=["zap_alert_message", "report_finding"],
+)
 def zap_alerts(base_url: Optional[str] = None,
                risk_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """List all ZAP alerts raised during the session, with optional filtering.
@@ -414,7 +417,10 @@ def zap_alerts(base_url: Optional[str] = None,
     return _zap().alerts(base_url=base_url, risk_id=risk_id)
 
 
-@framework_tool("Get an alert's metadata plus the full HTTP request/response that triggered it.")
+@framework_tool(
+    "Get an alert's metadata plus the full HTTP request/response that triggered it.",
+    next_hints=["report_finding"],
+)
 def zap_alert_message(alert_id: str) -> Dict[str, Any]:
     """Returns the alert rule that fired (name, risk, CWE, evidence) AND the
     raw HTTP request + response that triggered it. Use to triage a finding:

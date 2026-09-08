@@ -12,8 +12,8 @@ working **on** the codebase.
 
 ### Tool Secretary (`daharness/`)
 
-The core agent loop lives in `daharness/core.py`. A local Ollama model
-(default `gemma4:12b`) is given two tools via a `FunctionToolset`:
+The core agent loop lives in `daharness/agent.py`. A local Ollama model
+(default `qwen3:14b`) is given two tools via a `FunctionToolset`:
 
 - **`search_tools`** — semantic search over the ChromaDB tool registry.
   Returns full manifests. Every result is recorded in
@@ -36,13 +36,13 @@ continue a conversation.
 appends the last 50 lines of Brain/MSF logs to the result for visibility.
 
 The `daharness/` package splits imports across focused modules:
-- `daharness.core` — everything (registry, secretary, chat loop, embedding)
-- `daharness.agent` — `create_secretary_agent()` factory
+- `daharness.core` — backwards-compat shim re-exporting legacy public names
+- `daharness.agent` — secretary agent loop, `run_secretary()`, `create_secretary_agent()`
 - `daharness.executor` — standalone execution helpers (no ChromaDB client)
-- `daharness.registry` — `ToolRegistry`, `OllamaEmbeddingFunction`
+- `daharness.registry` — `ToolRegistry`, `OllamaEmbeddingFunction`, discovery
 - `daharness.models` — `ToolManifest`
 
-### Tool Discovery (`daharness/core.py:discover_local_tools`)
+### Tool Discovery (`daharness/registry.py:discover_local_tools`)
 
 Two passes scan `ALLOWED_TOOL_ROOTS` (`auxiliaries/`, `payloads/`,
 `listeners/`, `utils/`, `encoders/`):
@@ -118,7 +118,7 @@ across calls.
 so the `finally` block unlinks the socket — but only if the inode still
 matches the one we bound (won't clobber a newer sidecar).
 
-### In-Process Fallback (`daharness/core.py:_execute_brain_tool`)
+### In-Process Fallback (`daharness/executor.py:_execute_brain_tool`)
 
 When the Brain socket is unavailable (`FileNotFoundError`, `ConnectionError`)
 or doesn't know the tool, execution falls back to `_launch_in_process()`:

@@ -188,7 +188,10 @@ def smb_read_file(target, share, path, username="", password="", domain="", max_
 
 # --- impacket example-script wrappers (Windows targets) ------------------
 
-@framework_tool("Dump SAM/LSA/NTDS secrets from a Windows target using impacket's secretsdump.")
+@framework_tool(
+    "Dump SAM/LSA/NTDS secrets from a Windows target using impacket's secretsdump.",
+    next_hints=["psexec_exec with -hashes :<NTLM>", "report_finding"],
+)
 def secretsdump(target, username="", password="", domain="", extra_options=""):
     """Run impacket secretsdump.py against a Windows target.
 

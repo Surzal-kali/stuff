@@ -9,6 +9,7 @@ def framework_tool(
     doc: str ,
     transport: TransportType = TransportType.BRAIN_DISPATCH,
     accepted_handle_kinds=None,
+    next_hints=None,
 ):
     """Decorator to mark a function as a framework tool callable by the Brain.
 
@@ -19,11 +20,17 @@ def framework_tool(
     model at the right tool instead of letting the call die inside the tool
     body.  See ``utils/handles.py`` for the kind taxonomy.  Tools that do not
     take a session handle simply omit it.
+
+    ``next_hints`` (optional iterable of strings) provides curated next-action
+    suggestions surfaced in the manifest so the secretary model knows what to
+    call after this tool succeeds.  Examples:
+    ``next_hints=["psexec_exec with -hashes :<NTLM>"]``.
     """
     def decorator(func):
         func._is_framework_tool = True
         func._tool_doc = doc or (func.__doc__ or "No description provided.")
         func._transport = transport
         func._accepted_handle_kinds = tuple(accepted_handle_kinds) if accepted_handle_kinds else ()
+        func._next_hints = tuple(next_hints) if next_hints else ()
         return func
     return decorator

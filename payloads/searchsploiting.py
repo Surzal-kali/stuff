@@ -3,7 +3,10 @@ import shlex
 import subprocess
 from constants import framework_tool
 #this module will be our primary searchsploit module, it will be used to search for exploits using the local searchsploit CLI.
-@framework_tool("Search for exploits using searchsploit")
+@framework_tool(
+    "Search for exploits using searchsploit",
+    next_hints=["index_modules (search metasploit for matching modules)"],
+)
 def search_exploit(query):
     # Use searchsploit command line tool to search for exploits.
     #

@@ -13,7 +13,7 @@ and low-level systems work (raw sockets, packet framing).
 
 ### Tool Secretary (`daharness/`)
 
-The core of the framework. A local LLM (Ollama, e.g. `gemma4:12b`) acts as a
+The core of the framework. A local LLM (Ollama, e.g. `qwen3:14b`) acts as a
 conversational agent with two tools:
 
 1. **`search_tools`** — semantic search over the tool registry (ChromaDB,
@@ -28,7 +28,7 @@ by `search_tools` in the current conversation. A tool_id that was never
 surfaced is rejected — the model cannot hallucinate a tool into existence.
 
 The `daharness/` package exposes focused import paths:
-- `daharness.core` — `ToolRegistry`, `SecretaryDeps`, secretary agent loop
+- `daharness.core` — backwards-compat shim re-exporting legacy public names
 - `daharness.agent` — secretary agent factory
 - `daharness.executor` — standalone execution helpers (no ChromaDB needed)
 - `daharness.registry` — discovery and semantic search API
@@ -137,7 +137,7 @@ tool execution and memory operations.
 
 - Python 3.13+
 - [Ollama](https://ollama.ai) running with `nomic-embed-text` and a chat
-  model (default: `gemma4:12b`)
+  model (default: `qwen3:14b`)
 - ChromaDB server (default: `localhost:9000`)
 - Metasploit Framework (optional, for MSF integration)
 - Root or `CAP_NET_RAW` (optional, for raw SYN scanning)
@@ -151,7 +151,7 @@ Environment variables (see `.env`):
 | `OLLAMA_BASE_URL` | `your-ip-address:11434/v1` | Ollama API endpoint |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
-| `SECRETARY_MODEL` | `gemma4:12b` | LLM model for the tool secretary |
+| `SECRETARY_MODEL` | `qwen3:14b` | LLM model for the tool secretary |
 | `MSGRPC_PASSWORD` | — | Metasploit RPC password |
 | `MSF_RPC_PORT` | `55552` | Metasploit RPC port |
 | `BRAIN_DISPATCH_TIMEOUT` | `180` | Brain socket dispatch timeout (seconds) |

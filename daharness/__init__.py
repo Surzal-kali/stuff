@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Not added to __all__ - httpx is an internal dependency, not a public API type.
 import httpx
 
-from .models import ToolManifest
+from .models import ToolManifest, Finding
+from .findings import FindingStore
 from .registry import OllamaEmbeddingFunction, ToolRegistry
 from .agent import (
     SecretaryDeps,
@@ -42,6 +43,8 @@ from .agent import (
 __all__ = [
     "OllamaEmbeddingFunction",
     "create_secretary_agent",
+    "Finding",
+    "FindingStore",
     "SecretaryDeps",
     "ToolManifest",
     "ToolRegistry",
