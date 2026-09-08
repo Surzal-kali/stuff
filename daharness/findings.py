@@ -28,8 +28,13 @@ class FindingStore:
 
     def __init__(self, db_path: str = _DEFAULT_DB):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, timeout=10.0)
         self.conn.row_factory = sqlite3.Row
+        # WAL: readers don't block the writer and vice versa across
+        # processes (gateway, secretary, MCP clients all share ids.db).
+        # busy_timeout makes writers WAIT instead of erroring out.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=10000")
         self._init_table()
 
     def _init_table(self) -> None:
@@ -65,45 +70,57 @@ class FindingStore:
         memory_ref: Optional[str] = None,
     ) -> Finding:
         """Append a finding, auto-assigning an incremental ID and timestamp."""
-        cur = self.conn.execute("SELECT COUNT(*) FROM findings")
-        count = cur.fetchone()[0]
-        finding_id = f"F-{count + 1:03d}"
         ts = datetime.now(timezone.utc).isoformat()
 
-        finding = Finding(
-            id=finding_id,
-            title=title,
-            severity=severity,
-            cwe=cwe,
-            asset=asset,
-            evidence=evidence or {},
-            repro=repro or [],
-            tool_chain=tool_chain or [],
-            memory_ref=memory_ref,
-            ts=ts,
-        )
-
-        self.conn.execute(
-            """
-            INSERT INTO findings
-                (id, title, severity, cwe, asset, evidence, repro, tool_chain, memory_ref, ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                finding.id,
-                finding.title,
-                finding.severity,
-                finding.cwe,
-                finding.asset,
-                json.dumps(finding.evidence),
-                json.dumps(finding.repro),
-                json.dumps(finding.tool_chain),
-                finding.memory_ref,
-                finding.ts,
-            ),
-        )
-        self.conn.commit()
-        return finding
+        # Concurrent adds (gateway + secretary + MCP clients all share
+        # ids.db) can compute the same F-id; the PRIMARY KEY turns that
+        # into a loud IntegrityError instead of a duplicate. Recount and
+        # retry so the caller just gets their finding, slightly later.
+        last_exc: Optional[BaseException] = None
+        for _attempt in range(3):
+            cur = self.conn.execute("SELECT COUNT(*) FROM findings")
+            finding_id = f"F-{cur.fetchone()[0] + 1:03d}"
+            finding = Finding(
+                id=finding_id,
+                title=title,
+                severity=severity,
+                cwe=cwe,
+                asset=asset,
+                evidence=evidence or {},
+                repro=repro or [],
+                tool_chain=tool_chain or [],
+                memory_ref=memory_ref,
+                ts=ts,
+            )
+            try:
+                with self.conn:  # atomic INSERT + commit
+                    self.conn.execute(
+                        """
+                        INSERT INTO findings
+                            (id, title, severity, cwe, asset, evidence, repro, tool_chain, memory_ref, ts)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            finding.id,
+                            finding.title,
+                            finding.severity,
+                            finding.cwe,
+                            finding.asset,
+                            json.dumps(finding.evidence),
+                            json.dumps(finding.repro),
+                            json.dumps(finding.tool_chain),
+                            finding.memory_ref,
+                            finding.ts,
+                        ),
+                    )
+                return finding
+            except sqlite3.IntegrityError:
+                last_exc = None  # lost the id race - recount and retry
+            except sqlite3.OperationalError as exc:
+                last_exc = exc  # e.g. 'database is locked' after busy_timeout
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("could not assign a unique finding ID after 3 attempts")
 
     # -- read ---------------------------------------------------------------
 

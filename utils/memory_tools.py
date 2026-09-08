@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import time
 from typing import List
+from uuid import uuid4
 
 import httpx
 
@@ -62,7 +63,7 @@ def _embed(text: str) -> List[float]:
 
 
 @framework_tool(
-    "Store a fact or finding in persistent vector memory for later use. "
+    "Store a fact or finding in persistent vector memory for later recall. "
     "Supply the text to remember (e.g. 'root password on the box is toor'). "
     "Optionally give a namespace (default 'engagement') and a memory_id; if "
     "memory_id is omitted a unique one is generated. Pass your agent_id so "
@@ -80,7 +81,7 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "",
     counts any attempt as a strike against the caller.
     """
     if not memory_id:
-              memory_id = f"mem-{int(time.time())}-{uuid4().hex[:6]}"
+        memory_id = f"mem-{int(time.time())}-{uuid4().hex[:6]}"
     embedding = _embed(text)
     _svc.remember(
         namespace=namespace,
@@ -110,3 +111,4 @@ def recall_text(query: str, namespace: str = "engagement", limit: int = 5, agent
         limit=limit,
         agent_id=(agent_id or None),
     )
+
