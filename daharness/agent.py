@@ -161,6 +161,52 @@ def _cap_tool_stdout(result: Dict[str, Any], limit: Optional[int] = None) -> Dic
     return result
 
 
+# --- Chaining nudge for tools that hand off to another tool ---
+
+# Maps a tool's module_id to the next-step instruction the model should follow
+# using the value(s) that tool returned.  Kept explicit (not auto-derived from
+# schemas) because the whole point is to remove the model's ambiguity about
+# "is this string a tool id or an argument value?".
+_CHAIN_NEXT = {
+    "payloads.metasploiting.MetasploitClient.index_modules": (
+        "Next: call execute_tool with tool_id "
+        "'payloads.metasploiting.MetasploitClient.execute_module', passing one of the "
+        "returned 'module_path' values VERBATIM as the 'module_path' argument (it is a "
+        "VALUE, not a tool id) and RHOSTS/PAYLOAD/etc. in 'options'."
+    ),
+    "payloads.metasploiting.MetasploitClient.execute_module": (
+        "If a new session was reported: next call execute_tool with tool_id "
+        "'payloads.metasploiting.MetasploitClient.interact_session', passing the 'msf:' "
+        "handle VERBATIM as the 'handle' argument (a VALUE, not a tool id)."
+    ),
+    "utils.paramiko_client.ssh_connect": (
+        "Next: call execute_tool with tool_id 'utils.paramiko_client.ssh_exec' "
+        "(or 'ssh_shell' for a PTY), passing the returned 'ssh:' handle VERBATIM as "
+        "the 'handle' argument (a VALUE, not a tool id)."
+    ),
+    "listeners.listening.TCPListener.open_listener": (
+        "Next: use the returned 'listener:' handle with the payload/connector that "
+        "calls back to it (a VALUE, not a tool id). Stop it later with "
+        "'listeners.listening.TCPListener.close_listener'."
+    ),
+}
+
+
+def _chaining_hint(tool_id: str, result: Dict[str, Any]) -> str:
+    """Return a one-line next-step hint for chaining tools, or ''.
+
+    Only emitted on a non-failed result so a hint never nudges the model to
+    build on a tool that just errored.
+    """
+    hint = _CHAIN_NEXT.get(tool_id)
+    if not hint:
+        return ""
+    status = str(result.get("status", "")).lower()
+    if status == "failed":
+        return ""
+    return hint
+
+
 # --- Secretary tool functions (called by the agent loop) ---
 
 
@@ -209,6 +255,21 @@ async def secretary_execute_tool(
     """
     registry = ctx.deps.registry
     tool_id = (tool_id or "").strip()
+    # Layer 0 (disambiguation): MSF module_path values look like
+    # "auxiliary/scanner/ssh/ssh_login" and real tool ids are slash-free
+    # dotted python paths.  Reject a slash-bearing tool_id *here* — before the
+    # surfaced-set lookup — so the model's confusion ("I'll just pass the
+    # module_path as a tool id") is turned into a self-correcting ModelRetry
+    # that names the right wrapper tool, instead of a generic "not found".
+    if "/" in tool_id:
+        raise ModelRetry(
+            f"'{tool_id}' contains '/', so it looks like an MSF module_path (a value "
+            f"you pass to a tool), not a tool id. Tool ids are dotted python paths "
+            f"such as 'payloads.metasploiting.MetasploitClient.execute_module'. "
+            f"To run the module '{tool_id}', call execute_tool with tool_id "
+            f"'payloads.metasploiting.MetasploitClient.execute_module' and pass '{tool_id}' "
+            f"as the 'module_path' argument."
+        )
     args = _parse_tool_args(arguments)
     ctx.deps.execute_calls += 1
     logger.info(
@@ -252,6 +313,17 @@ async def secretary_execute_tool(
     # Cap stdout so large tool outputs don't blow up the model's context window.
     if isinstance(result, dict):
         result = _cap_tool_stdout(result)
+
+    # Chaining nudge: tools that "interface with other tools" return values
+    # (module_path / typed handle) the model must carry into the NEXT tool call
+    # as an *argument*, not as a tool_id.  Small secretary models routinely
+    # drop the chain here (logs.txt turns 6-10: "executed no tool this turn").
+    # Appending a one-line "next step" hint to the result keeps the chain alive
+    # without re-running search_tools or guessing a tool id.
+    if isinstance(result, dict):
+        hint = _chaining_hint(manifest.module_id, result)
+        if hint:
+            result = {**result, "next_step_hint": hint}
 
     # Post-execution log dump: this function body only runs once pydantic-ai
     # has granted approval (execute_tool is declared requires_approval=True),
@@ -368,6 +440,22 @@ class SecretaryMixin:
             - When a tool returns structured JSON with labeled fields (e.g. "module_path"),
               copy the field value VERBATIM into your next tool call. Never abbreviate,
               shorten, or paraphrase values like module paths, session IDs, or tool IDs.
+
+            Tool IDs vs argument values (CRITICAL — this is the main failure mode):
+            - A tool ID is a dotted python path with NO slashes, e.g.
+              'payloads.metasploiting.MetasploitClient.execute_module'. You pass it as
+              the `tool_id` argument to execute_tool.
+            - An MSF module_path like 'auxiliary/scanner/ssh/ssh_login' is an ARGUMENT
+              VALUE you pass to execute_module's `module_path` parameter. It is NEVER a
+              tool id and execute_tool will reject it if you pass it as one.
+            - A session handle like 'msf:1' or 'ssh:sess-0001' is an ARGUMENT VALUE you
+              pass to a tool's `handle` parameter. It is NEVER a tool id.
+            - Chaining: when a tool returns a value you need for the next step
+              (index_modules -> module_path -> execute_module; execute_module -> msf:
+              handle -> interact_session; ssh_connect -> ssh: handle -> ssh_exec), your
+              NEXT action is execute_tool with the matching wrapper tool, passing that
+              returned value as its argument. Do NOT search again, do NOT pass the value
+              as a tool_id, do NOT skip the next call.
 
             Session handles (IMPORTANT — this is where mistakes happen):
             - Sessions are identified by TYPED handles of the form "<kind>:<id>":

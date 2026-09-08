@@ -172,11 +172,64 @@ it cannot see sessions the Brain was holding.
 
 ### Metasploit Client (`payloads/metasploiting.py`)
 
-`MetasploitClient` uses `pymetasploit3` RPC. Singleton via `get_instance()`
-so bootstrap's `start_mcp()` and in-process tool launches share the same
-`msfconsole` handle. Tools: `index_modules`, `execute_module` (polls for new
-sessions), `set_payload`, `get_options`, `list_sessions`,
+`MetasploitClient` uses `pymetasploit3` RPC against a standalone `msfrpcd`
+(launched by `start_mcp()`; port `MSF_RPC_PORT`, default 55553). Singleton via
+`get_instance()` so bootstrap's `start_mcp()` and in-process tool launches
+share the same `MsfRpcClient`/daemon. Tools: `index_modules`, `execute_module`
+(polls for new sessions), `set_payload`, `get_options`, `list_sessions`,
 `interact_session`, `close_msf_session`.
+
+`execute_module(module_path, options, start_handler=False)` — the
+non-obvious parts, all driven by hard-won reproduction against the lab
+target:
+
+- **Payload family matters most.** A binary FTP/TFTP-stager payload
+  (`cmd/linux/ftp/<arch>/*`, `cmd/linux/tftp/<arch>/*`) cannot stage an ELF
+  through a raw-shell backdoor channel (e.g. vsftpd_234_backdoor's port 6200)
+  and fails at the command-stager stage with **"Unsupported Binary
+  Selected"**. Use a **pure-command** `cmd/unix/*` payload that runs a
+  one-liner on the shell (e.g. `cmd/unix/bind_perl`, `cmd/unix/reverse_perl`,
+  `cmd/unix/bind_netcat_gaping`). `execute_module` validates `PAYLOAD`
+  against `module.compatible_payloads` and steers the caller at `cmd/unix/*`.
+- **Meterpreter payloads are unusable through this client** —
+  pymetasploit3 serializes the meterpreter `AutoLoadExtensions` option as a
+  non-scalar and MSF rejects the launch ("Invalid module option value for
+  AutoLoadExtensions: must be a scalar"). `execute_module` hard-blocks any
+  payload containing `meterpreter` with that explanation.
+- **`AutoCheck=False` + `ForceExploit=True` are harness defaults** for
+  exploit modules (caller can override either via `options`). The operator
+  already approved the run via the human-in-the-loop gate, and the check is
+  pure friction for backdoor-style exploits — once the backdoor port is open
+  from a prior run, `AutoCheck` aborts with "Cannot reliably check
+  exploitability … set ForceExploit true".
+- **`start_handler` (opt-in).** Over msfrpcd an exploit module's *implicit*
+  payload handler does not reliably bind a reverse/bind listener, so the
+  payload's callback reaches nothing and no session forms. Pass
+  `start_handler=True` to start a separate persistent `exploit/multi/handler`
+  job (same `PAYLOAD`/`LHOST`/`LPORT`) first; `execute_module` then sets
+  `DisablePayloadHandler=True` so the exploit doesn't double-bind the port.
+  Pass `start_handler=False` (default) for auxiliaries/login scanners and for
+  "manual" exploits that *require* their own handler and reject
+  `DisablePayloadHandler` (e.g. vsftpd_234_backdoor) — the error message
+  tells the model which case it hit.
+- **LHOST must be reachable *from the target*.** A reverse payload makes the
+  target call back to `LHOST:LPORT`; if the target can't route to it (e.g. a
+  VM behind a tailscale subnet router that can't reach your `100.x`), no
+  session forms even with a perfect handler. For such targets use a **bind**
+  pure-command payload (`cmd/unix/bind_*`) with `RHOST` set to the target —
+  the target opens a port and we connect to it.
+- **Launch-failure detection.** `module.execute()` returning
+  `{"job_id": null}` (refused to launch — missing/invalid PAYLOAD or a
+  required option, or `DisablePayloadHandler` on a module that needs its
+  own handler) or an `{"error": true, "error_message": ...}` envelope is
+  surfaced immediately as a clear, actionable error instead of being masked
+  by the 30s session-poll ("No new sessions detected"). Any `start_handler`
+  listener started is stopped on launch failure so it isn't left orphaned.
+
+Confirmed end-to-end on `192.168.90.110`: `execute_module` with
+`cmd/unix/bind_perl`, `RHOST=192.168.90.110`, `LPORT=<port>` yields a
+persistent `msf:` shell session that `interact_session` reads (`uid=0(root)`
+on `Linux metasploitable`).
 
 ### OpenWebUI Tool (`owui-tool.py`)
 

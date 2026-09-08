@@ -1,5 +1,6 @@
 """Manifest models used by the harness."""
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
@@ -45,9 +46,22 @@ class ToolManifest(BaseModel):
                     results.append(res)
             return results
         if isinstance(payload, dict):
-            # Handle Metasploit module dictionary mapping
-            # MSF modules usually have 'name' and 'description'
-            if "name" in payload or "description" in payload:
+            # MSF-module-as-tool ingestion: mapping each Metasploit module dict
+            # into a tool whose ``module_id`` *equals* the MSF module_path (e.g.
+            # "auxiliary/scanner/ssh/ssh_login") creates a literal collision
+            # between "a tool I call via execute_tool" and "a value I pass as
+            # the module_path argument to execute_module".  The secretary model
+            # then passes the slash-path as a tool_id, dispatch routes it to the
+            # metasploit endpoint, and MSF logs "Error loading plugin <path>".
+            #
+            # This branch is therefore OFF by default.  Only an explicit opt-in
+            # (``DAHARNESS_INGEST_MSF=1``) re-enables it, and even then every
+            # such "tool" carries a slash in its id so the slash-guard in
+            # ``secretary_execute_tool`` will reject it as a tool_id — keeping
+            # the two namespaces disjoint.
+            if os.getenv("DAHARNESS_INGEST_MSF", "").lower() in {"1", "true", "yes"} and (
+                "name" in payload or "description" in payload
+            ):
                 mapped_payload = {
                     "module_id": payload.get("name", "unknown_module"),
                     "internal_semantic_capability": payload.get(
