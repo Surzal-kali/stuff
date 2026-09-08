@@ -98,6 +98,15 @@ becomes the semantic capability description that the registry embeds.
 
 Compiled with `-fPIC -shared`; loaded via `ctypes.CDLL`.
 
+## External Dependencies
+
+### OWASP ZAP
+The framework integrates with ZAP for automated web scanning.
+1. Install ZAP on your system (e.g., `sudo apt install zap` or download from the official site).
+2. Ensure the `zap` binary is in your PATH or located at `/usr/share/zap/zap.sh`.
+3. The framework launches ZAP in `-daemon` mode and manages its configuration automatically.
+
+
 ## Supporting Services
 
 ### Memory Service (`memories.py`)
