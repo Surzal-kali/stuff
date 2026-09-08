@@ -82,6 +82,7 @@ becomes the semantic capability description that the registry embeds.
 | `auxiliaries/smb_scanner.py` | BRAIN_DISPATCH | SMB null session vulnerability scanning |
 | `payloads/metasploiting.py` | BRAIN_DISPATCH / MCP_RPC | Metasploit module search, execution, session polling, interaction |
 | `utils/paramiko_client.py` | BRAIN_DISPATCH | Persistent SSH (connect/exec/shell/close) + one-shot mode |
+| `utils/packetcraft.py` | BRAIN_DISPATCH | Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, sniff_packets, dissect_packet, modify_packet, save/load pcap |
 | `utils/log_reader.py` | BRAIN_DISPATCH | Read/stream Brain and MSF logs |
 | `listeners/listening.py` | BRAIN_DISPATCH | TCP listener with Brain event forwarding |
 | `listeners/raw_scan.py` | BRAIN_DISPATCH | Raw SYN port scanner (C++ plugin via ctypes) |
@@ -256,7 +257,7 @@ utils/
   session_manager.py   Singleton for live session objects
   sessions.py          SQLite database (targets/sessions/notes)
   log_reader.py        Brain/MSF log reading and streaming
-  packetcraft.py       Scapy packet crafting utilities
+  packetcraft.py       Scapy packet crafting (craft_*/send_packet/sniff_packets/dissect_packet/modify_packet)
   plugins/sslserver/   SSL server binary
 encoders/           Encoder plugins (C/C++)
 tests/              pytest suite for registry + secretary flows

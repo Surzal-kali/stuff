@@ -54,7 +54,7 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # A non-thinking chat model reliably drives the tool loop; reasoning/thinking
 # variants tend to hallucinate tools/executions instead of actually calling
 # them.  Override via the SECRETARY_MODEL env var to swap in another model.
-SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gemma4:cloud")
+SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gpt-oss:20b")
 SECRETARY_MAX_TOP_K = 10
 SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
 SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "600"))  # 10 min wall-clock

@@ -430,6 +430,78 @@ _CHAIN_NEXT = {
         "calls back to it (a VALUE, not a tool id). Stop it later with "
         "'listeners.listening.TCPListener.close_listener'."
     ),
+    # Packet craft -> send/dissect.  Craft tools return a text blob whose
+    # `hex:` line is the value to forward (no session handle — a packet is
+    # stateless).  One canonical hint covers every craft_* tool id.
+    "utils.packetcraft.craft_icmp_echo": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument "
+        "(a VALUE, not a tool id). Or use 'dissect_packet' to inspect it."
+    ),
+    "utils.packetcraft.craft_icmp_packet": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument. "
+        "Or use 'modify_packet' to set ICMP type/code first."
+    ),
+    "utils.packetcraft.craft_tcp_packet": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_udp_packet": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_arp_request": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_arp_packet": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument. "
+        "Or use 'modify_packet' to set the ARP op (request=1/reply=2)."
+    ),
+    "utils.packetcraft.craft_vlan_frame": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_dhcp_discover": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_dns_query": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_dns_response": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument. "
+        "Consider 'report_finding' to log the spoofing demo."
+    ),
+    "utils.packetcraft.craft_dns_response_multi": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument. "
+        "Consider 'report_finding' to log the spoofing demo."
+    ),
+    "utils.packetcraft.craft_mdns_query": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_http_request": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.craft_http_response": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
+        "passing the hex string from the result VERBATIM as the 'hex' argument."
+    ),
+    "utils.packetcraft.sniff_packets": (
+        "Next: use 'dissect_packet' with any captured hex string to inspect a "
+        "packet in full (a VALUE, not a tool id)."
+    ),
+    "utils.packetcraft.modify_packet": (
+        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet' "
+        "with the new hex, or 'dissect_packet' to verify the change."
+    ),
 }
 
 
