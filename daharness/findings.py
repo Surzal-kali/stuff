@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -30,12 +31,33 @@ class FindingStore:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, timeout=10.0)
         self.conn.row_factory = sqlite3.Row
+        # busy_timeout FIRST so every later statement (including the WAL
+        # pragma and table init) waits on locks instead of erroring out.
+        self.conn.execute("PRAGMA busy_timeout=10000")
         # WAL: readers don't block the writer and vice versa across
         # processes (gateway, secretary, MCP clients all share ids.db).
-        # busy_timeout makes writers WAIT instead of erroring out.
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=10000")
-        self._init_table()
+        # Switching INTO wal mode requires the global write lock, so under
+        # concurrent connects the pragma itself can raise 'database is
+        # locked'. It only needs to happen once per database file: skip it
+        # when the file is already WAL, and retry the connect loop below
+        # otherwise.
+        # Cold-start note: on a brand-new file every concurrent connect
+        # sees non-WAL mode and races on the journal_mode pragma, which
+        # needs an exclusive lock that busy_timeout does NOT cover. So the
+        # whole setup retries; only the first process ever flips the file
+        # into WAL, after which every later connect skips the pragma.
+        for _attempt in range(5):
+            try:
+                mode = self.conn.execute("PRAGMA journal_mode").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    self.conn.execute("PRAGMA journal_mode=WAL")
+                self._init_table()
+                break
+            except sqlite3.OperationalError:
+                if _attempt == 4:
+                    raise
+                self.conn.rollback()
+                time.sleep(0.05 * (_attempt + 1))
 
     def _init_table(self) -> None:
         self.conn.execute(
@@ -77,7 +99,7 @@ class FindingStore:
         # into a loud IntegrityError instead of a duplicate. Recount and
         # retry so the caller just gets their finding, slightly later.
         last_exc: Optional[BaseException] = None
-        for _attempt in range(3):
+        for _attempt in range(10):
             cur = self.conn.execute("SELECT COUNT(*) FROM findings")
             finding_id = f"F-{cur.fetchone()[0] + 1:03d}"
             finding = Finding(
