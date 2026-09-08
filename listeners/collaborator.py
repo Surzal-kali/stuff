@@ -177,8 +177,19 @@ class CollaboratorListener:
     ) -> None:
         addr = writer.get_extra_info("peername")
         try:
-            # Read request line + headers (up to 8 KB or connection close)
-            data = await asyncio.wait_for(reader.read(8192), timeout=10)
+            # Read until end of HTTP headers (\r\n\r\n) so a fragmented
+            # request still yields a complete request line + headers.
+            # readuntil raises IncompleteReadError (stream closed early,
+            # .partial has what arrived) or LimitOverrunError (headers
+            # exceeded the 64K StreamReader limit).
+            try:
+                data = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=10
+                )
+            except asyncio.IncompleteReadError as e:
+                data = e.partial
+            except asyncio.LimitOverrunError:
+                data = await reader.read(8192)
             text = data.decode("ascii", errors="replace")
             lines = text.split("\r\n")
             request_line = lines[0] if lines else ""
@@ -371,19 +382,31 @@ def collab_generate():
     "Poll the collaborator for received OOB callbacks since a timestamp. "
     "Returns a list of {proto, src_ip, qname/path, ts, excerpt}. proto is "
     "'dns', 'http', or 'https'. If since is omitted or 0, returns ALL "
-    "callbacks. Use the id from collab_generate to filter — the id appears "
-    "in the qname (for DNS) or the Host header (for HTTP/HTTPS).",
+    "callbacks. Pass the id from collab_generate to filter — only callbacks "
+    "whose qname (DNS), host, or path (HTTP) contains that id are returned, "
+    "giving per-payload correlation without eyeballing every qname.",
     next_hints=["report_finding"],
 )
-def collab_poll(since: float = 0.0):
+def collab_poll(since: float = 0.0, id: str = ""):
     """Poll for OOB callbacks received since the given Unix timestamp.
 
     Args:
         since: Unix timestamp (float). Only callbacks at or after this time
                are returned. 0 = all callbacks.
+        id: Optional payload ID from collab_generate. If given, only
+            callbacks whose qname, host, or path contains this ID are
+            returned — per-payload correlation.
     """
     c = _get_collab()
     callbacks = c.store.poll(since)
+    if id:
+        id_lower = id.lower()
+        callbacks = [
+            cb for cb in callbacks
+            if id_lower in (cb.get("qname") or "").lower()
+            or id_lower in (cb.get("host") or "").lower()
+            or id_lower in (cb.get("path") or "").lower()
+        ]
     return json.dumps(callbacks, indent=2)
 
 
@@ -396,12 +419,20 @@ async def collab_stop(handle: str = ""):
     """Stop the collaborator listener.
 
     Args:
-        handle: The 'collab:' handle from collab_start (optional — if omitted,
-                stops the current singleton).
+        handle: The 'collab:' handle from collab_start. If provided, must
+                match the current listener's handle — a stale handle from
+                an old session is refused rather than murdering the new
+                listener. If omitted, stops the current singleton.
     """
     global _collab
     if _collab is None:
         return "Collaborator not running."
+    if handle and _collab._handle and handle != _collab._handle:
+        return (
+            f"Refusing to stop: handle {handle!r} does not match the current "
+            f"listener's handle {_collab._handle!r}. This handle may be stale "
+            "from a previous session."
+        )
     msg = await _collab.stop()
     _collab = None
     return msg

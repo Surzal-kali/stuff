@@ -264,25 +264,25 @@ class FrameworkLoader:
         # -daemon forks the JVM (no GUI). Logs go to /tmp/zap.log so failures
         # are inspectable after a crash.
         log_path = "/tmp/zap.log"
+        
+        # Force 127.0.0.1 to avoid UnresolvedAddressException (IPv6/localhost issues)
+        host = host or "127.0.0.1"
+        
         cmd = [
             zap_bin, "-daemon",
             "-port", str(port),
             "-host", host,
             "-config", f"api.addrs.addr.name={host}",
             "-config", "api.addrs.addr.regex=true",
-            # ZAP 2.17's `network` add-on binds a "main proxy" on
-            # localhost:8080 by default. Without an explicit address it
-            # tries to resolve ``localhost`` over IPv6 first and dies with
-            # ``UnresolvedAddressException`` -- which terminates the daemon
-            # before it ever opens the API socket. Pin it to 127.0.0.1 so
-            # it can bind deterministically on this loopback-only setup.
+            "-config", "api.disablekey=true",
             "-config", f"network.localServers.mainProxy.address={host}",
             "-Xmx512m",
         ]
-        # Pin the home dir somewhere stable so session DBs persist across
-        # restarts (handy when chaining spider -> active scan in two boots).
+        # Pin the home dir using -dir argument; ZAP often ignores ZAP_HOME env var.
         zap_home = self.framework_root / ".zap_home"
         zap_home.mkdir(exist_ok=True)
+        cmd.extend(["-dir", str(zap_home)])
+        
         env = {**os.environ, "ZAP_HOME": str(zap_home)}
 
         try:

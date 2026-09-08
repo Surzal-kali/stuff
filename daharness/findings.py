@@ -108,9 +108,11 @@ class FindingStore:
     # -- read ---------------------------------------------------------------
 
     def all(self) -> List[Finding]:
-        """Return all findings, oldest first."""
+        """Return all findings, oldest first (numeric ID order)."""
+        # Sort by the integer portion of the ID (F-001 → 1, F-1000 → 1000)
+        # so F-1000 doesn't sort before F-999 as it would lexicographically.
         rows = self.conn.execute(
-            "SELECT * FROM findings ORDER BY id ASC"
+            "SELECT * FROM findings ORDER BY CAST(SUBSTR(id, 3) AS INTEGER) ASC"
         ).fetchall()
         return [self._row_to_finding(r) for r in rows]
 

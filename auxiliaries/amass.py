@@ -13,6 +13,7 @@ import os
 import shlex
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List
 
@@ -98,18 +99,29 @@ class Amass:
             "-nocolor",
             *validated,
         ]
-        # 10-minute hard cap; amass's own -timeout defaults to 30 min but the
-        # harness BRAIN_DISPATCH_TIMEOUT is a second net.  The model can pass
-        # -timeout N to shorten it.
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        # stdout = subdomain names (one per line); stderr = progress bar.
-        # Return stdout, falling back to stderr if empty (error messages).
-        return result.stdout or result.stderr
+        # Cap below the harness BRAIN_DISPATCH_TIMEOUT so the harness net
+        # doesn't kill the call before amass's own timeout fires and we get
+        # a chance to return partial results.  Default 590s leaves a 10s
+        # margin under the harness default of 600s.  The model can pass
+        # -timeout N (minutes) to shorten amass's own run further.
+        dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
+        amass_cap = min(600, dispatch_timeout - 10)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=amass_cap,
+            )
+            # stdout = subdomain names (one per line); stderr = progress bar.
+            # Return stdout, falling back to stderr if empty (error messages).
+            return result.stdout or result.stderr
+        except subprocess.TimeoutExpired as e:
+            # On timeout, e.stdout/e.stderr hold whatever was captured before
+            # the kill (populated because capture_output=True).  Return partial
+            # results so the composite doesn't die with an uncaught exception.
+            partial = (e.stdout or "") or (e.stderr or "")
+            return partial or "amass timed out with no output"
 
 
 @framework_tool(
@@ -123,7 +135,12 @@ class Amass:
     next_hints=["subdomain_enum (structured result with alive check + scope filter)"],
 )
 def run_amass(target, options=""):
-    """Run amass enum against a domain.
+    """Run amass enum against a domain, filtered against program scope.
+
+    If a ``.scope`` file exists in the workspace, results are split into
+    in-scope and out-of_scope and returned as JSON.  In lab mode (no scope
+    file) raw amass output is returned as-is.  For alive-checking and a
+    richer structured result, prefer ``subdomain_enum``.
 
     Args:
         target: Root domain to enumerate (e.g. example.com).
@@ -131,7 +148,28 @@ def run_amass(target, options=""):
                  Passive by default; add '-active', '-brute', '-alts' as needed.
     """
     amass = Amass(target)
-    return amass.enum(options)
+    raw = amass.enum(options)
+
+    # Parse subdomains from stdout (same logic as subdomain_enum)
+    subdomains = sorted({
+        line.strip().lower()
+        for line in raw.splitlines()
+        if line.strip() and "." in line.strip() and not line.strip().startswith("[")
+    })
+
+    patterns = _load_scope()
+    if patterns is None:
+        # Lab mode — no scope file, return raw output
+        return raw
+
+    in_scope = [s for s in subdomains if _in_scope(s, patterns)]
+    out_of_scope = [s for s in subdomains if s not in in_scope]
+    return json.dumps({
+        "subdomains": in_scope,
+        "out_of_scope": out_of_scope,
+        "total_discovered": len(subdomains),
+        "note": "prefer subdomain_enum for alive-checking + structured result",
+    }, indent=2)
 
 
 # --- subdomain_enum composite ------------------------------------------------
@@ -183,6 +221,24 @@ def _is_alive(hostname: str, timeout: float = 3.0) -> bool:
         return False
 
 
+def _resolve_alive(
+    hostnames: List[str], timeout: float = 3.0, workers: int = 20
+) -> List[str]:
+    """Concurrently DNS-resolve a list of hostnames.
+
+    Returns the subset that resolve, preserving input order.  Using a
+    ThreadPoolExecutor(20) turns 500 subs × 3s worst case from ~25 minutes
+    sequential into ~75 seconds.
+    """
+    alive_set: set[str] = set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_is_alive, h, timeout): h for h in hostnames}
+        for future in as_completed(futures):
+            if future.result():
+                alive_set.add(futures[future])
+    return [h for h in hostnames if h in alive_set]
+
+
 @framework_tool(
     "Enumerate subdomains for a domain using amass, then resolve each to "
     "check if it's alive, and filter against the program scope (if a .scope "
@@ -229,7 +285,7 @@ def subdomain_enum(target, options=""):
         out_of_scope = [s for s in subdomains if s not in in_scope]
 
     # Step 3: DNS resolution (alive check) — only on in-scope subs
-    alive = [s for s in in_scope if _is_alive(s)]
+    alive = _resolve_alive(in_scope)
 
     return json.dumps({
         "subdomains": in_scope,

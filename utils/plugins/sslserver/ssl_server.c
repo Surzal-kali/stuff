@@ -5,8 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/epoll.h>
 
 #define BUFFER_SIZE 4096
@@ -32,7 +35,7 @@ SSL_CTX* create_context() {
     return ctx;
 }
 
-int start_listening_socket() {
+int start_listening_socket(const char *ip, int port) {
     int server_fd;
     struct sockaddr_in address;
 
@@ -41,21 +44,25 @@ int start_listening_socket() {
         exit(EXIT_FAILURE);
     }
 
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+    }
+
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    address.sin_addr.s_addr = inet_addr(ip);
+    address.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
+        exit(EXIT_FAILURE);
     }
-    if (listen(server_fd, 3) < 0) {
+    if (listen(server_fd, 10) < 0) {
         perror("listen error");
         exit(EXIT_FAILURE);
     }
-    printf("Listening on port %d...\n", PORT);
+    printf("Listening on %s:%d...\n", ip, port);
     return server_fd;
-    
-
 }
 SSL* accept_new_connections(int server_fd, SSL_CTX *ctx) {
     int new_socket;
@@ -107,17 +114,20 @@ void configure_context(SSL_CTX *ctx) {
 }
 
 
-void encrypt_data(SSL *ssl) {
+typedef struct {
+    SSL *ssl;
+    int fd;
+} connection_t;
+
+void *connection_handler(void *arg) {
+    connection_t *conn = (connection_t *)arg;
+    SSL *ssl = conn->ssl;
     char buffer[BUFFER_SIZE];
-    int n; // Rewrite to accept multiple client connections without freezing
+    int n;
+
     while ((n = SSL_read(ssl, buffer, BUFFER_SIZE - 1)) > 0) {
         buffer[n] = '\0';
-        
-        // [INSPECTION ENGINE HOOK]
-        // This is where the inspection engine would analyze the decrypted buffer
-        // before it gets echoed back or forwarded.
         printf("[Inspection] Analyzing decrypted data: %s\n", buffer);
-
         printf("Received: %s\n", buffer);
         SSL_write(ssl, buffer, n);
     }
@@ -125,34 +135,55 @@ void encrypt_data(SSL *ssl) {
     if (n < 0) {
         ERR_print_errors_fp(stderr);
     }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(conn->fd);
+    free(conn);
+    return NULL;
 }
 
 
-int main() {
+int main(int argc, char *argv[]) {
+    char *ip = "0.0.0.0";
+    int port = 4433;
+
+    if (argc >= 3) {
+        ip = argv[1];
+        port = atoi(argv[2]);
+    }
+
     // Init SSL
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
-    // Init epoll
 
     // Create context
     SSL_CTX *ctx = create_context();
     // Configure context
     configure_context(ctx);
     // Create Socket
-    int server_fd = start_listening_socket();
+    int server_fd = start_listening_socket(ip, port);
 
     while(1) {
-        
         SSL *session = accept_new_connections(server_fd, ctx);
         if (session) {
-            // For now, we still call encrypt_data to keep it functional,
-            // but we now have the session object to pass to an inspection engine.
-            encrypt_data(session);
-            
-            // Cleanup after the session ends
-            SSL_shutdown(session);
-            SSL_free(session);
+            pthread_t tid;
+            connection_t *conn = malloc(sizeof(connection_t));
+            conn->ssl = session;
+            // We need the raw fd for cleanup, but accept_new_connections 
+            // doesn't return it. We'll modify accept_new_connections or 
+            // just use SSL_get_fd.
+            conn->fd = SSL_get_fd(session);
+
+            if (pthread_create(&tid, NULL, connection_handler, conn) != 0) {
+                perror("pthread_create failed");
+                SSL_free(session);
+                close(conn->fd);
+                free(conn);
+            } else {
+                pthread_detach(tid);
+            }
         }
     }
 

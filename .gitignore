@@ -27,3 +27,4 @@ chroma-data/
 payloads/__pycache__/
 listeners/__pycache__/
 daharness/__pycache__/
+.zap_home/
