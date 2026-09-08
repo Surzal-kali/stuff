@@ -95,6 +95,12 @@ class SecretaryDeps:
     # needs no approval) dozens of times within one run(), pegging the GPU
     # at 100% for minutes without ever calling execute_tool.
     max_search_calls: int = field(default_factory=lambda: int(os.getenv("SECRETARY_MAX_SEARCH_CALLS", "5")))
+    # Per-conversation Brain/session id. Each secretary conversation gets a
+    # unique id so that, when tools dispatch through the Brain, this agent's
+    # calls land on its OWN Brain session / stateful tool instances (e.g. its
+    # own msfconsole handle) instead of sharing session 0 with every other
+    # concurrently-running agent. Override to force a specific id.
+    session_id: str = field(default_factory=lambda: f"sec-{os.urandom(4).hex()}")
 
     def record_surfaced(self, manifests: List[ToolManifest]) -> None:
         for manifest in manifests:
@@ -637,7 +643,7 @@ async def secretary_execute_tool(
         )
 
     warnings = registry.validate_arguments(manifest, args)
-    result = await registry.execute_tool(manifest, args)
+    result = await registry.execute_tool(manifest, args, session_id=ctx.deps.session_id)
     if isinstance(result, dict) and warnings:
         result = {**result, "argument_warnings": warnings}
 

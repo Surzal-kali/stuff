@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -119,6 +120,15 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
         # One instance per class per registry, so stateful clients keep
         # their process/handles across calls.
         self._tool_instances: Dict[str, Any] = {}
+        # Brain session-id mapping. The Brain wire protocol carries session_id
+        # as a C int; non-numeric caller ids (agent_id / secretary session) are
+        # mapped to stable unique ints here so concurrent agents get isolated
+        # Brain sessions (and thus isolated stateful tool instances on the
+        # sidecar) instead of all sharing session 0. ``"0"`` is the default
+        # shared session.
+        self._brain_session_map: Dict[str, int] = {}
+        self._next_brain_session: int = 1
+        self._brain_session_lock = threading.Lock()
 
         # Removed automatic background bootstrap to avoid race conditions
         # and duplicate indexing when called explicitly from bootstrap.py

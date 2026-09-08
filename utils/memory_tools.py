@@ -65,14 +65,19 @@ def _embed(text: str) -> List[float]:
     "Store a fact or finding in persistent vector memory for later recall. "
     "Supply the text to remember (e.g. 'root password on the box is toor'). "
     "Optionally give a namespace (default 'engagement') and a memory_id; if "
-    "memory_id is omitted a unique one is generated. Returns a stored "
-    "confirmation naming the namespace and id."
+    "memory_id is omitted a unique one is generated. Pass your agent_id so "
+    "the memory is tagged to you; omit it to write to the shared pool. Set "
+    "important=true for critical findings you do not want anyone to be able "
+    "to delete. Returns a stored confirmation naming the namespace and id."
 )
-def remember_text(text: str, namespace: str = "engagement", memory_id: str = ""):
+def remember_text(text: str, namespace: str = "engagement", memory_id: str = "", agent_id: str = "", important: bool = False):
     """Remember a piece of text under a namespace.
 
     The embedding is computed automatically from ``text``; the caller never
-    supplies a vector.
+    supplies a vector. ``agent_id`` (when non-empty) tags the entry to the
+    running model so concurrent agents keep disjoint memory banks. ``important``
+    marks the entry as protected — ``forget`` will refuse to delete it and
+    counts any attempt as a strike against the caller.
     """
     if not memory_id:
         memory_id = f"mem-{int(time.time())}"
@@ -82,6 +87,8 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "")
         memory_id=memory_id,
         text=text,
         embedding=embedding,
+        agent_id=(agent_id or None),
+        important=bool(important),
     )
     return f"Memory stored in namespace '{namespace}': {memory_id} = {text}"
 
@@ -90,14 +97,16 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "")
     "Recall earlier findings from persistent vector memory using a "
     "natural-language query. Pass a query describing what you want back "
     "(e.g. 'port 21 ftp findings' or 'root password') and optionally the "
-    "namespace (default 'engagement'). Returns the closest stored matches "
-    "by vector similarity."
+    "namespace (default 'engagement'). Pass your agent_id to recall only "
+    "your own memories; omit it to search the shared pool across all agents. "
+    "Returns the closest stored matches by vector similarity."
 )
-def recall_text(query: str, namespace: str = "engagement", limit: int = 5):
+def recall_text(query: str, namespace: str = "engagement", limit: int = 5, agent_id: str = ""):
     """Recall stored memories by semantic similarity to the query text."""
     query_embedding = _embed(query)
     return _svc.recall(
         namespace=namespace,
         query_embedding=query_embedding,
         limit=limit,
+        agent_id=(agent_id or None),
     )

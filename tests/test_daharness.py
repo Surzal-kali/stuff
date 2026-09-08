@@ -147,7 +147,7 @@ def _secretary_registry(monkeypatch=None, executions=None):
 
     if executions is not None:
 
-        async def fake_execute(manifest, arguments):
+        async def fake_execute(manifest, arguments, session_id="0"):
             executions.append((manifest.module_id, arguments))
             return {"stdout": "", "stderr": "", "return_code": 0, "status": "Success"}
 
@@ -162,7 +162,11 @@ def _surface_manifest(registry, module_id="MOD-001"):
             module_id=module_id,
             internal_semantic_capability="scan smb for exposures",
             external_sanitized_description="Scan SMB services for exposures",
-            parameters={},
+            parameters={
+                "type": "object",
+                "properties": {"host": {"type": "string"}},
+                "required": ["host"],
+            },
             implementation_path="auxiliaries/smb_scanner.py",
             internal_semantics="smb enumeration scanner",
         )
@@ -345,7 +349,7 @@ def test_run_secretary_rejects_cross_namespace_handle_without_executing():
 
     executions = []
 
-    async def fake_execute(manifest, arguments):
+    async def fake_execute(manifest, arguments, session_id="0"):
         executions.append((manifest.module_id, arguments))
         return {"stdout": "", "status": "Success"}
 
@@ -394,7 +398,7 @@ def test_run_secretary_executes_correct_namespace_handle():
 
     executions = []
 
-    async def fake_execute(manifest, arguments):
+    async def fake_execute(manifest, arguments, session_id="0"):
         executions.append((manifest.module_id, arguments))
         return {"stdout": "uid=0", "status": "Success"}
 

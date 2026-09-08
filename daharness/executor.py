@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from typing import Any, Dict, Optional
 
 from pydantic import ValidationError
@@ -32,24 +33,25 @@ class ExecutorMixin:
     focused on discovery/embedding while all the "run a tool" paths live here.
     """
 
-    async def execute_tool(self, manifest: ToolManifest, arguments: dict):
+    async def execute_tool(self, manifest: ToolManifest, arguments: dict, *, session_id: str = "0"):
         manifest = self._ensure_valid_manifest(manifest)
 
         # LOGGING: Record actual execution start
         logger.info(
-            f"[TOOL_EXECUTE] Executing Tool ID: {manifest.module_id} | Path: {manifest.implementation_path} | Args: {arguments}"
+            f"[TOOL_EXECUTE] Executing Tool ID: {manifest.module_id} | Path: {manifest.implementation_path} | Args: {arguments} | Session: {session_id}"
         )
 
         if manifest.transport == TransportType.LOCAL_FILE:
             # Static-scan manifests (argparse modules) run as subprocesses of
             # the script itself; _execute_local_script also enforces the
-            # ALLOWED_TOOL_ROOTS path check.
+            # ALLOWED_TOOL_ROOTS path check.  Local scripts have no Brain
+            # session concept, so session_id is ignored here.
             return await self._execute_local_script(
                 manifest.implementation_path, arguments
             )
 
         if manifest.transport == TransportType.BRAIN_DISPATCH:
-            return await self._execute_brain_tool(manifest.module_id, arguments)
+            return await self._execute_brain_tool(manifest.module_id, arguments, session_id=session_id)
 
         if manifest.transport == TransportType.MCP_RPC:
             # MCP_RPC tools (e.g. MetasploitClient.dispatch_metasploit) are async
@@ -59,11 +61,32 @@ class ExecutorMixin:
             # fallback path. The previous stub returned "pending" without ever
             # invoking the method, which silently dropped every exploit
             # execution (the module never fired, no session was created).
-            return await self._execute_brain_tool(manifest.module_id, arguments)
+            return await self._execute_brain_tool(manifest.module_id, arguments, session_id=session_id)
 
         raise ValueError(f"Unsupported transport type: {manifest.transport}")
 
-    async def _execute_brain_tool(self, tool_id: str, arguments: dict):
+    def _resolve_brain_session(self, session_id: str) -> int:
+        """Map a caller session/agent id to the integer the Brain wire protocol
+        requires (``FrameworkEvent.session_id`` is a C ``int``).
+
+        ``"0"`` / empty -> ``0`` (the default *shared* session, backward
+        compatible with the old hardcoded ``CALL_TOOL|0|...``). Any other id —
+        numeric or not (e.g. an agent_id) — is mapped to a stable, unique int
+        slot so the same caller always lands on the same Brain session and a
+        concurrent agent gets its own. This is what lets multiple agents run
+        concurrently without sharing one stateful tool instance (e.g. one
+        msfconsole handle) on the Brain side.
+        """
+        sid = str(session_id if session_id is not None else "0").strip() or "0"
+        if sid == "0":
+            return 0
+        with self._brain_session_lock:
+            if sid not in self._brain_session_map:
+                self._next_brain_session += 1
+                self._brain_session_map[sid] = self._next_brain_session
+            return self._brain_session_map[sid]
+
+    async def _execute_brain_tool(self, tool_id: str, arguments: dict, *, session_id: str = "0"):
         """Dispatch a tool call, launching the decorated function directly.
 
         Order of preference:
@@ -73,7 +96,7 @@ class ExecutorMixin:
            unlinks the socket, and if the sidecar dies the socket goes with it,
            surfacing as FileNotFoundError: [Errno 2] No such file or directory).
         """
-        brain_result = await self._dispatch_via_brain(tool_id, arguments)
+        brain_result = await self._dispatch_via_brain(tool_id, arguments, session_id=session_id)
         if brain_result is not None:
             return brain_result
 
@@ -83,7 +106,7 @@ class ExecutorMixin:
         return await self._launch_in_process(tool_id, arguments)
 
     async def _dispatch_via_brain(
-        self, tool_id: str, arguments: dict
+        self, tool_id: str, arguments: dict, *, session_id: str = "0"
     ) -> Optional[Dict[str, Any]]:
         """Try the Brain socket. Returns None when the socket is unusable or the
         Brain does not know the tool, so the caller can fall back in-process.
@@ -99,11 +122,18 @@ class ExecutorMixin:
         # e2e doc assumes (e.g. sqlmap's documented "600s tool timeout"); env
         # overridable for faster lab targets.
         dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
+        # The Brain wire protocol carries session_id as a C int, so map the
+        # caller's (possibly non-numeric) session/agent id to a stable int.
+        # Distinct agents -> distinct Brain sessions -> isolated stateful tool
+        # instances on the sidecar (no more shared session 0 for everyone).
+        brain_session = self._resolve_brain_session(session_id)
         try:
             # Prepare the payload: "CALL_TOOL|session_id|tool_id|args"
-            # We use session 0 for framework-level calls
+            # session_id is now the caller's resolved Brain session, not a
+            # hardcoded 0 — so concurrent agents don't interleave on one
+            # shared Brain session/state.
             args_json = json.dumps(arguments)
-            message = f"CALL_TOOL|0|{tool_id}|{args_json}"
+            message = f"CALL_TOOL|{brain_session}|{tool_id}|{args_json}"
 
             # Use asyncio for non-blocking socket I/O
             reader, writer = await asyncio.wait_for(
@@ -378,9 +408,9 @@ def _new_registry():
     return registry
 
 
-async def execute_tool(manifest: ToolManifest, arguments: dict):
+async def execute_tool(manifest: ToolManifest, arguments: dict, *, session_id: str = "0"):
     """Execute a manifest without creating a ChromaDB client."""
-    return await _new_registry().execute_tool(manifest, arguments)
+    return await _new_registry().execute_tool(manifest, arguments, session_id=session_id)
 
 
 async def execute_local_script(script_path: str, arguments: dict):

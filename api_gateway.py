@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 class ToolRequest(BaseModel):
     intent: str
     arguments: Optional[dict] = None
+    agent_id: Optional[str] = None
 
 class ToolLookupRequest(BaseModel):
     tool_id: str
@@ -54,11 +56,13 @@ class ToolLookupRequest(BaseModel):
 class MemorySearchRequest(BaseModel):
     namespace: str
     query_text: Optional[str] = None
+    agent_id: Optional[str] = None
 
 class MemoryRecallRequest(BaseModel):
     namespace: str
     query_embedding: list
     limit: Optional[int] = 5
+    agent_id: Optional[str] = None
 
 
 # Input schemas advertised over MCP — kept in sync with the models above so a
@@ -68,6 +72,10 @@ _MCP_TOOL_EXECUTE_SCHEMA = {
     "properties": {
         "intent": {"type": "string"},
         "arguments": {"type": "object"},
+        "agent_id": {
+            "type": "string",
+            "description": "Identity of the running model/agent. Used as the Brain session id so concurrent agents get isolated tool state (e.g. separate msfconsole handles). Omit to use the shared default session.",
+        },
     },
     "required": ["intent"],
 }
@@ -76,6 +84,7 @@ _MCP_MEMORY_SEARCH_SCHEMA = {
     "properties": {
         "namespace": {"type": "string"},
         "query_text": {"type": "string"},
+        "agent_id": {"type": "string", "description": "Scope to one running model's memories; omit for the shared pool."},
     },
     "required": ["namespace", "query_text"],
 }
@@ -85,6 +94,7 @@ _MCP_MEMORY_RECALL_SCHEMA = {
         "namespace": {"type": "string"},
         "query_embedding": {"type": "array", "items": {"type": "number"}},
         "limit": {"type": "integer", "default": 5},
+        "agent_id": {"type": "string", "description": "Scope to one running model's memories; omit for the shared pool."},
     },
     "required": ["namespace", "query_embedding"],
 }
@@ -163,7 +173,12 @@ class APIGateway:
             if not manifest:
                 raise HTTPException(404, "No tool found for intent")
 
-            execution_result = await self.tool_registry.execute_tool(manifest, req.arguments or {})
+            # agent_id doubles as the Brain session id, so each identified
+            # agent gets its own isolated tool state on the sidecar; omitted
+            # falls back to the shared default session ("0").
+            execution_result = await self.tool_registry.execute_tool(
+                manifest, req.arguments or {}, session_id=req.agent_id or "0"
+            )
 
             # Return the result along with identifying information about the tool used
             logging.info(f"Executed tool {manifest.module_id} for intent '{req.intent}' with result: {execution_result}")
@@ -178,17 +193,24 @@ class APIGateway:
         async def search_memory(req: MemorySearchRequest):
             if not req.query_text:
                 raise HTTPException(400, "query_text is required for text-based search")
-            return self.memory_service.search(
+            # ChromaDB calls are synchronous and would block the event loop
+            # (and every concurrent MCP session / REST request) for the duration
+            # of the query; run them in a worker thread instead.
+            return await asyncio.to_thread(
+                self.memory_service.search,
                 namespace=req.namespace,
                 query_text=req.query_text,
+                agent_id=req.agent_id,
             )
 
         @self.app.post("/memory/recall")
         async def recall_memory(req: MemoryRecallRequest):
-            return self.memory_service.recall(
+            return await asyncio.to_thread(
+                self.memory_service.recall,
                 namespace=req.namespace,
                 query_embedding=req.query_embedding,
                 limit=req.limit,
+                agent_id=req.agent_id,
             )
 
         # --- MCP transport route --------------------------------------------
@@ -248,10 +270,14 @@ class APIGateway:
                     if not manifest:
                         return self._error(f"No tool found for intent: {intent}")
                     tool_args = arguments.get("arguments") or {}
-                    result = await self.tool_registry.execute_tool(manifest, tool_args)
+                    # agent_id -> Brain session id for per-agent isolation.
+                    session_id = arguments.get("agent_id") or "0"
+                    result = await self.tool_registry.execute_tool(
+                        manifest, tool_args, session_id=session_id
+                    )
                     logger.info(
-                        "MCP executed tool %s for intent '%s' with result: %s",
-                        manifest.module_id, intent, result,
+                        "MCP executed tool %s for intent '%s' (session=%s) with result: %s",
+                        manifest.module_id, intent, session_id, result,
                     )
                     payload = {
                         "tool_id": manifest.module_id,
@@ -267,8 +293,11 @@ class APIGateway:
                         return self._error(f"{MEMORY_SEARCH}: 'namespace' is required")
                     if not query_text:
                         return self._error(f"{MEMORY_SEARCH}: 'query_text' is required for text-based search")
-                    result = self.memory_service.search(
-                        namespace=namespace, query_text=query_text
+                    agent_id = arguments.get("agent_id")
+                    # Run the blocking ChromaDB query off the event loop.
+                    result = await asyncio.to_thread(
+                        self.memory_service.search,
+                        namespace=namespace, query_text=query_text, agent_id=agent_id,
                     )
                     return [mcp_types.TextContent(type="text", text=json.dumps(result, default=str))]
 
@@ -280,10 +309,13 @@ class APIGateway:
                     if not query_embedding:
                         return self._error(f"{MEMORY_RECALL}: 'query_embedding' is required")
                     limit = arguments.get("limit", 5)
-                    result = self.memory_service.recall(
+                    agent_id = arguments.get("agent_id")
+                    result = await asyncio.to_thread(
+                        self.memory_service.recall,
                         namespace=namespace,
                         query_embedding=query_embedding,
                         limit=limit,
+                        agent_id=agent_id,
                     )
                     return [mcp_types.TextContent(type="text", text=json.dumps(result, default=str))]
 

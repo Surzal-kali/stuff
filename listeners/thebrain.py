@@ -29,8 +29,17 @@ class FunctionRegistry:
     def __init__(self):
         self.tools: Dict[str, Callable] = {}
         self.metadata: Dict[str, Dict] = {}
-        # One instance per class, so stateful tool clients keep their handles.
-        self._instances: Dict[str, Any] = {}
+        # Per-session class instances, keyed by (session_id, class_key) so
+        # concurrent agents (distinct session ids) get ISOLATED stateful tool
+        # clients (e.g. separate MetasploitClient / RPC consoles) instead of
+        # sharing one. Session "0" is the default/shared pool used by callers
+        # that don't supply a session id (backward compatible with the old
+        # single-instance behaviour).
+        self._instances: Dict[tuple, Any] = {}
+        # tool_id -> (cls, method_name) for class-method tools, so dispatch can
+        # rebind to the per-session instance. Module-level function tools have
+        # no entry here and are called as-is (they're stateless).
+        self._class_tools: Dict[str, tuple] = {}
 
     def register(self, name: str, func: Callable, doc: str):
         self.tools[name] = func
@@ -42,11 +51,26 @@ class FunctionRegistry:
     def get_metadata(self, name: str) -> Optional[Dict]:
         return self.metadata.get(name)
 
-    def _instance_for(self, cls):
-        key = f"{cls.__module__}.{cls.__qualname__}"
+    @staticmethod
+    def _class_key(cls) -> str:
+        return f"{cls.__module__}.{cls.__qualname__}"
+
+    def instance_for_session(self, session_id, cls):
+        """Return the (lazily-created) class instance bound to a Brain session.
+
+        Distinct session ids -> distinct instances, so concurrent agents don't
+        share stateful clients. Session "0" is the shared default.
+        """
+        key = (str(session_id), self._class_key(cls))
         if key not in self._instances:
             self._instances[key] = cls()
         return self._instances[key]
+
+    def _instance_for(self, cls):
+        # Backward-compatible default-session binding used at scan time so the
+        # registered bound method (and its signature metadata) match the legacy
+        # single-instance behaviour for session "0" callers.
+        return self.instance_for_session("0", cls)
 
     def scan_module(self, module):
         for name, obj in inspect.getmembers(module):
@@ -63,6 +87,9 @@ class FunctionRegistry:
                             instance = self._instance_for(obj)
                             bound = getattr(instance, m_name)
                             self.register(tool_id, bound, getattr(m_obj, "_tool_doc", ""))
+                            # Remember the class + method so dispatch can rebind
+                            # to a per-session instance for caller isolation.
+                            self._class_tools[tool_id] = (obj, m_name)
                             print(f"[+] Registered framework tool: {tool_id}")
                         except TypeError as e:
                             print(f"[!] Skipping {tool_id}: class needs constructor args ({e})")
@@ -388,6 +415,18 @@ async def dispatch(event):
 
             tool = registry.get_tool(tool_id)
             if tool:
+                # Rebind class-method tools to a per-session instance so
+                # concurrent agents don't share stateful clients (e.g. one
+                # msfconsole handle between all agents). Module-level function
+                # tools are stateless and called as-is. Session "0" (the
+                # default, used by callers that don't supply a session id)
+                # rebinds to the same shared instance as before — backward
+                # compatible. ``event.session_id`` is the int the harness
+                # resolved from the caller's agent/session id.
+                if tool_id in registry._class_tools:
+                    cls, m_name = registry._class_tools[tool_id]
+                    instance = registry.instance_for_session(event.session_id, cls)
+                    tool = getattr(instance, m_name)
                 # Execute tool without blocking the event loop. Coroutine
                 # functions MUST be awaited directly — run_in_executor on them
                 # silently creates a coroutine that never runs.
