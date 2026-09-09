@@ -38,7 +38,7 @@ def _summarize(entries: List[Dict[str, Any]]) -> Dict[str, int]:
     "Discover and list available wordlist (.txt) files under the framework "
     "wordlist tree (default /usr/share/wordlists, e.g. SecLists). Returns a "
     "compact catalog grouped by category (Passwords, Discovery/Web-Content, "
-    "Usernames, etc.) with each entry's absolute path, size, and line count — "
+    "Usernames, etc.) with each entry's absolute path, and size,— "
     "use the returned path verbatim as the -w argument to run_ffuf or the "
     "-P/-L argument to run_hydra. Optional category filter narrows the walk. "
     "Call this BEFORE run_ffuf/run_hydra to avoid guessing a wordlist path.",

@@ -102,7 +102,6 @@ def test_discover_entries_have_metadata(fake_tree):
     entries = list(discover_wordlists(root=fake_tree))
     rock = [e for e in entries if e["path"].endswith("rockyou.txt")][0]
     assert rock["size"] > 0
-    assert rock["lines"] == 3
     assert rock["category"] == "Passwords"
     common = [e for e in entries if e["path"].endswith("common.txt")][0]
     assert common["category"] == "Discovery"

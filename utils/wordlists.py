@@ -101,14 +101,6 @@ def resolve_default_wordlist(kind: str, root: Optional[Path] = None) -> Optional
     return resolve_wordlist(rel, root=root)
 
 
-def _count_lines(path: Path) -> Optional[int]:
-    """Best-effort line count; ``None`` if the file can't be read (binary/perm)."""
-    try:
-        with path.open("rb") as fh:
-            return sum(1 for _ in fh)
-    except (OSError, ValueError):
-        return None
-
 
 def _category_from_path(path: Path, root: Path) -> str:
     """Derive a short category label from the path's first segment under root.
@@ -135,7 +127,7 @@ def discover_wordlists(
     """Walk ``root`` (default :data:`WORDLISTS_ROOT`) yielding matching files.
 
     Yields a dict per file with ``path`` (absolute, ``str``), ``size`` (bytes),
-    ``lines`` (best-effort, may be ``None``), and ``category`` (a short label).
+    and ``category`` (a short label).
 
     Skips ``.git`` and other VCS/junk directories so a cloned SecLists repo
     doesn't surface vendored metadata as wordlists.
@@ -156,7 +148,6 @@ def discover_wordlists(
         yield {
             "path": str(path),
             "size": path.stat().st_size,
-            "lines": _count_lines(path),
             "category": _category_from_path(path, base),
         }
 
