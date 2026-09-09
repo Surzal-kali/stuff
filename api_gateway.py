@@ -366,7 +366,7 @@ class APIGateway:
                 return list(props.keys())
         return []
 
-    def _check_unknown_args(manifest, arguments: dict) -> list:
+    def _check_unknown_args(self, manifest, arguments: dict) -> list:
         """Return a list of argument keys not declared in the manifest schema.
 
         Mirrors the extra-key rejection in
