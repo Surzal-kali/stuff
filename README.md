@@ -94,7 +94,7 @@ becomes the semantic capability description that the registry embeds.
   `SOCK_RAW` (requires root or `CAP_NET_RAW`)
 - `listeners/plugins/frameit.c` → `frameit.so` — C-side event bridge for the
   Brain
-- `utils/plugins/sslserver/` — standalone SSL server binary
+
 - `payloads/plugins/listen.cpp` — payload listener stub
 
 Compiled with `-fPIC -shared`; loaded via `ctypes.CDLL`.
@@ -258,7 +258,7 @@ utils/
   sessions.py          SQLite database (targets/sessions/notes)
   log_reader.py        Brain/MSF log reading and streaming
   packetcraft.py       Scapy packet crafting (craft_*/send_packet/sniff_packets/dissect_packet/modify_packet)
-  plugins/sslserver/   SSL server binary
+
 encoders/           Encoder plugins (C/C++)
 tests/              pytest suite for registry + secretary flows
 schema.md           SQLite database schema

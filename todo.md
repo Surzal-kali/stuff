@@ -44,10 +44,10 @@
 - [ ] Acceptance: "map *.example.com, fuzz the blog, flag IDOR-looking params"
       runs with zero code changes
 
-## Phase 3 — Collaborator analog (sslserver graduation)
-- [x] Multi-protocol listener in listeners/collaborator.py (evolved from sslserver concept):
+## Phase 3 — Collaborator analog
+- [x] Multi-protocol listener in listeners/collaborator.py:
         - HTTP on 80
-        - HTTPS on 443 (reuse self-signed cert from utils/plugins/sslserver)
+        - HTTPS on 443
         - DNS on UDP 53: answer all queries with fixed IP, LOG FULL QNAME
           (payload ID rides in the subdomain — the qname IS the signal)
 - [x] Register listener as typed handle in utils/handles.py — "collab" kind

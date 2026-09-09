@@ -138,7 +138,7 @@ and a second execution would cause duplicate side effects.
 
 Entry point and daemon. `FrameworkLoader.launch_all()` starts:
 - Brain sidecar (subprocess, logs to `/tmp/brain.log`)
-- SSL server (subprocess, compiled binary)
+
 - API gateway (async task, `api_gateway.py`, port 6000)
 - Metasploit MCP (launches `msfconsole` with `msgrpc`, waits for RPC port)
 

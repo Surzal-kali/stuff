@@ -220,25 +220,7 @@ class FrameworkLoader:
         except Exception as e:
             logger.error("[!] Brain sidecar failed to launch: %s", e, exc_info=True)
 
-    async def start_ssl_server(self, ip="0.0.0.0", port=4433):
-        """Starts the SSL server binary as a subprocess."""
-        ssl_server_path = self.framework_root / "utils" / "plugins" / "sslserver" / "ssl_server"
-        if not ssl_server_path.exists():
-            logger.error("[!] SSL server binary not found at %s", ssl_server_path)
-            return
-
-        try:
-            logger.info("[+] Starting SSL server on %s:%s...", ip, port)
-            process = await asyncio.create_subprocess_exec(
-                str(ssl_server_path), ip, str(port),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            self.active_tasks.append(process)
-
-        except Exception as e:
-            logger.error("[!] SSL server exception: %s", e, exc_info=True)
-
+    
     async def start_zap_daemon(self, host=None, port=None):
         """Start the OWASP ZAP daemon as a subprocess.
 
@@ -505,7 +487,6 @@ class FrameworkLoader:
 
         # Start services
         self.active_tasks.append(asyncio.create_task(self.start_brain_server()))
-        self.active_tasks.append(asyncio.create_task(self.start_ssl_server()))
         self.active_tasks.append(asyncio.create_task(self.start_zap_daemon()))
         self.api_task = asyncio.create_task(self.start_api_server())
         self.active_tasks.append(self.api_task)

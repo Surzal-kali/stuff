@@ -43,7 +43,7 @@ human-in-the-loop interaction and the semantic-discovery behavior.
 From the framework root (`/home/surzal/stuff`):
 
 ```bash
-# 1. Stand up sidecars: Brain socket, SSL server, API gateway, MSF RPC.
+# 1. Stand up sidecars: Brain socket, API gateway, MSF RPC.
 python bootstrap.py --daemon
 
 # 2. Wait for /tmp/brain.sock to appear and msfconsole to load msgrpc on 55552.
