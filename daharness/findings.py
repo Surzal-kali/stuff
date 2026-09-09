@@ -18,7 +18,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
-
+from uuid import uuid4
 from .models import Finding
 
 _DEFAULT_DB = str(Path(__file__).resolve().parent.parent / "ids.db")
@@ -137,7 +137,7 @@ class FindingStore:
                     )
                 return finding
             except sqlite3.IntegrityError:
-                last_exc = None  # lost the id race - recount and retry
+                finding.id = f"F-{uuid4()}"  # lost the id race - generate a new one and retry
             except sqlite3.OperationalError as exc:
                 last_exc = exc  # e.g. 'database is locked' after busy_timeout
         if last_exc:
