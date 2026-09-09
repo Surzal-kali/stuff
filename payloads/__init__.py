@@ -3,6 +3,8 @@ import sys
 import asyncio
 from pathlib import Path
 from .metasploiting import MetasploitClient
+from .hydra import run_hydra, hydra_status, hydra_cancel
+from .ffuf import run_ffuf, ffuf_status, ffuf_cancel
 
 listener = Path(__file__).parent / "plugins" / "listen.cpp"
 
@@ -30,4 +32,14 @@ def execute_tcp(ip="127.0.0.1", port=4444):
     except subprocess.CalledProcessError as e:
         print(f"[-] Execution failed: {e}")
 
-__all__ = ["MetasploitClient", "compile_tcp", "execute_tcp"]
+__all__ = [
+    "MetasploitClient",
+    "compile_tcp",
+    "execute_tcp",
+    "run_hydra",
+    "hydra_status",
+    "hydra_cancel",
+    "run_ffuf",
+    "ffuf_status",
+    "ffuf_cancel",
+]
