@@ -26,55 +26,134 @@ is ``/dev/null`` via the shared launcher as a second defense.
 from __future__ import annotations
 
 import json as _json
+import os
 import re
-from typing import Any, Dict, List
+import subprocess
+import uuid
+from typing import Any, Dict, List, Optional
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job, terminate_job
 
 
-# Standard ffuf result-row format, e.g.:
-#   [Status: 200, Size: 1234, Words: 56, Lines: 12, Duration: 0.001s]: /admin
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# Real ffuf table rows print the path BEFORE the bracket block:
+#   admin                   [Status: 301, Size: 0, Words: 1, Lines: 1]
+# (verified against ffuf 1.1.0 on Debian Trixie; the "[Status: ...]: /path"
+# format ffuf does not emit would silently never match).
 _FFUF_ROW_RE = re.compile(
-    r"\[Status:\s*(?P<status>\d+),\s*"
+    r"^(?P<path>\S+)\s+\[Status:\s*(?P<status>\d+),\s*"
     r"Size:\s*(?P<size>\d+),\s*"
-    r"Words:\s*(?P<words>\d+),\s*"
-    r"Lines:\s*(?P<lines>\d+)"
-    r"(?:,\s*Duration:\s*(?P<duration>[\d.]+s))?"
-    r"\]:\s*(?P<path>.+?)\s*$"
+    r"Words:\s*(?P<words>\d+),\s*Lines:\s*(?P<lines>\d+)"
+    r"(?:,\s*Duration:\s*(?P<duration>[\d.]+s))?\]"
 )
+
+# -noninteractive first appears in ffuf 2.0.0; Debian Trixie ships 1.1.0
+# where the flag is fatal ("flag provided but not defined", exit 2).
+_FFUF_NONINTERACTIVE_MIN = (2, 0)
+_noninteractive_supported: Optional[bool] = None
+
+
+def _ffuf_supports_noninteractive() -> bool:
+    """Check (once) whether the installed ffuf knows -noninteractive."""
+    global _noninteractive_supported
+    if _noninteractive_supported is None:
+        supported = False  # conservative default: don't inject
+        try:
+            out = subprocess.run(
+                ["ffuf", "-V"], capture_output=True, text=True, timeout=10
+            ).stdout
+            m = re.search(r"v?(\d+)\.(\d+)", out)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+                supported = ver >= _FFUF_NONINTERACTIVE_MIN
+        except Exception:
+            supported = False
+        _noninteractive_supported = supported
+    return _noninteractive_supported
 
 
 def _inject_noninteractive(extra: List[str]) -> List[str]:
-    """Append ``-noninteractive`` if the caller didn't already pass it."""
+    """Append ``-noninteractive`` when the installed ffuf supports it.
+
+    The detached launcher already sets stdin=/dev/null, which keeps ffuf
+    non-interactive on versions without the flag (e.g. Trixie's 1.1.0).
+    """
     if any(a in ("-noninteractive", "--noninteractive") for a in extra):
         return extra
-    return extra + ["-noninteractive"]
+    if _ffuf_supports_noninteractive():
+        return extra + ["-noninteractive"]
+    return extra
+
+
+def _path_from_record(rec: Dict[str, Any]) -> str:
+    """Extract the fuzzed value from a ffuf result record.
+
+    JSON records carry it in ``input`` — a dict like ``{"FUZZ": "admin"}``
+    in ffuf 1.x/2.x, or a list for multi-keyword runs; fall back to URL.
+    """
+    raw = rec.get("input")
+    if isinstance(raw, dict) and raw:
+        return str(next(iter(raw.values())))
+    if isinstance(raw, list) and raw:
+        return "/".join(str(p) for p in raw)
+    return str(rec.get("url", ""))
+
+
+def _parse_ffuf_output_file(out_path: str) -> Optional[Dict[str, Any]]:
+    """Parse ffuf's ``-of json -o <file>`` output (one JSON object per file).
+
+    Real file shape (ffuf 1.1.0, captured live): ``{"commandline": ...,
+    "time": ..., "results": [{"input": {...}, "status": ..., "length":
+    ..., ...}]}`` — results at a top-level ``"results"`` key.
+    """
+    try:
+        with open(out_path, "r") as fh:
+            data = _json.load(fh)
+    except (OSError, ValueError):
+        return None
+    results = data.get("results")
+    if not isinstance(results, list):
+        return None
+    findings = []
+    for rec in results:
+        if not isinstance(rec, dict):
+            continue
+        findings.append(
+            {
+                "path": _path_from_record(rec),
+                "status": rec.get("status"),
+                "size": rec.get("length"),
+                "words": rec.get("words"),
+                "lines": rec.get("lines"),
+                "redirect": rec.get("redirectlocation"),
+                "url": rec.get("url"),
+                "duration": rec.get("duration"),
+            }
+        )
+    return {
+        "findings": findings,
+        "findings_count": len(findings),
+        "meta": {"source": "json"},
+    }
 
 
 def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
-    """Best-effort summary from ffuf's output.
+    """Best-effort summary from ffuf's stdout (human table mode).
 
-    Returns a dict with:
-
-    - ``findings``: list of ``{"path", "status", "size", "words", "lines",
-      "duration"}`` dicts for every matched response ffuf reported.
-    - ``findings_count``: integer count of matched responses.
-    - ``meta``: the ``::`` header block (URL, method, threads, wordlist)
-      parsed into a dict when present.
-
-    Handles both ffuf's default human-readable table output (``[Status: ...,
-    Size: ..., Words: ..., Lines: ...]: /path``) and ``-json`` newline-
-    delimited JSON records (``{"url","status","length","words","lines",
-      "input", ...}``).
+    Strips the ANSI ``\x1b[2K`` prefixes ffuf writes into redirected
+    output, then parses path-first result rows.  Also accepts NDJSON
+    records on stdout (some ffuf builds/modes emit those).  The
+    ``-of json -o <file>`` output is parsed separately by
+    ``_parse_ffuf_output_file`` and preferred by ``run_ffuf``'s verdict.
     """
     findings: List[Dict[str, Any]] = []
     seen = set()
     meta: Dict[str, Any] = {}
 
-    for line in log_text.splitlines():
-        s = line.strip()
-        # ffuf's banner/header lines look like " :: URL : http://..."
+    for raw_line in log_text.splitlines():
+        s = _ANSI_RE.sub("", raw_line).strip()
         if s.startswith("::"):
             kv = s.lstrip(":").strip()
             if ":" in kv:
@@ -82,16 +161,13 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
                 meta[key.strip()] = val.strip()
             continue
 
-        # JSON record mode (-json).
         if s.startswith("{"):
             try:
                 rec = _json.loads(s)
             except _json.JSONDecodeError:
                 rec = None
             if isinstance(rec, dict) and ("status" in rec or "url" in rec):
-                path = rec.get("input") or rec.get("url") or ""
-                if isinstance(path, list):
-                    path = "/".join(str(p) for p in path)
+                path = _path_from_record(rec)
                 key = (rec.get("status"), str(path))
                 if key in seen:
                     continue
@@ -151,9 +227,10 @@ def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
 
     ``-u`` is set to ``url`` and ``-w`` to ``wordlist``; the URL must
     contain the ``FUZZ`` keyword where the wordlist entries are substituted
-    (e.g. ``http://10.0.0.1/FUZZ`` or ``http://10.0.0.1/?FUZZ=1``).
-    ``-noninteractive`` is forced (appended if not already in ``options``)
-    so ffuf never opens its interactive console on the detached subprocess.
+    (e.g. ``http://10.0.0.1/FUZZ``).  ``-of json -o <per-job file>`` is
+    injected AFTER any caller options (last ``-o`` wins) so machine-
+    readable results are always captured; ``ffuf_status`` prefers that
+    file's findings over the human-table parse when both exist.
 
     Args:
         url: The target URL containing the ``FUZZ`` keyword, e.g.
@@ -163,22 +240,39 @@ def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
         options: Additional ffuf command-line options as a single string
             (e.g. ``"-mc 200,301,401 -t 80 -recursion -recursion-depth 2"``).
             Quoted sub-phrases are preserved by shlex.  ``-noninteractive``
-            is injected automatically if absent.
+            is injected only if the installed ffuf supports it (>= 2.0).
     """
     import shlex
+
+    out_path = os.path.join(
+        os.getenv("BG_JOB_LOG_DIR", "/tmp"), f"ffuf_out_{uuid.uuid4().hex[:8]}.json"
+    )
 
     opt_list = shlex.split(options) if options else []
     opt_list = _inject_noninteractive(opt_list)
 
     # ``-u`` and ``-w`` are always explicit so the caller can't accidentally
     # omit the essentials; extra -w / -u in options are allowed by ffuf.
-    command = ["ffuf", "-u", url, "-w", wordlist, *opt_list]
+    # ``-of json -o`` goes LAST so it wins over any caller-provided -o.
+    command = [
+        "ffuf", "-u", url, "-w", wordlist,
+        *opt_list, "-of", "json", "-o", out_path,
+    ]
+
+    def _verdict(log_text: str) -> Dict[str, Any]:
+        verdict = _parse_ffuf_verdict(log_text)
+        file_verdict = _parse_ffuf_output_file(out_path)
+        if file_verdict and file_verdict.get("findings_count"):
+            verdict["findings"] = file_verdict["findings"]
+            verdict["findings_count"] = file_verdict["findings_count"]
+            verdict["meta"]["output_file"] = out_path
+        return verdict
 
     return launch_job(
         command,
         tool_name="ffuf",
-        timeout=float(__import__("os").getenv("FFUF_TIMEOUT", "1800")),
-        verdict_parser=_parse_ffuf_verdict,
+        timeout=float(os.getenv("FFUF_TIMEOUT", "1800")),
+        verdict_parser=_verdict,
     )
 
 
