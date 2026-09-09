@@ -14,6 +14,7 @@ can call it mid-session to review what has been found so far.
 from __future__ import annotations
 
 import time
+from uuid import uuid4
 from typing import Dict, List, Optional
 
 from constants import framework_tool
