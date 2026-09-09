@@ -477,6 +477,8 @@ class FrameworkLoader:
         """Launches all servers in the background."""
         self.tool_registry.update({
             "smb_scan": ("auxiliaries.smb_scanner", "run_smb_recon"),
+            "generate_certs": ("auxiliaries.cert_tools", "generate_certs"),
+            "clear_certs": ("auxiliaries.cert_tools", "clear_certs"),
             "mcp": ("metasploiting", "start_mcp")
         })
 
