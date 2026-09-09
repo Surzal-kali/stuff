@@ -4,7 +4,7 @@ Multi-protocol listener that catches blind SSRF, blind XSS, and other OOB
 callbacks.  Three protocols on one host:
 
   - HTTP  on TCP 80  — logs request path + source IP
-  - HTTPS on TCP 443 — same, using the self-signed cert from sslserver
+  - HTTPS on TCP 443 — same, using the self-signed cert from utils/plugins/certs
   - DNS   on UDP 53  — answers ALL queries with a fixed IP, logs full QNAME
 
 The payload ID rides in the subdomain: inject ``http://abc123.oob.lab/`` into
@@ -44,7 +44,7 @@ _sm = get_manager()
 # --- config ------------------------------------------------------------------
 
 _COLLAB_DOMAIN = os.getenv("COLLAB_DOMAIN", "oob.lab")
-_CERT_DIR = Path(os.getenv("WORKSPACE_ROOT", ".")) / "utils" / "plugins" / "sslserver"
+_CERT_DIR = Path(os.getenv("WORKSPACE_ROOT", ".")) / "utils" / "plugins" / "certs"
 _HTTP_PORT = int(os.getenv("COLLAB_HTTP_PORT", "80"))
 _HTTPS_PORT = int(os.getenv("COLLAB_HTTPS_PORT", "443"))
 _DNS_PORT = int(os.getenv("COLLAB_DNS_PORT", "53"))
@@ -245,7 +245,7 @@ class CollaboratorListener:
             self._handle_http, "0.0.0.0", _HTTP_PORT,
         )
 
-        # HTTPS (reuse sslserver certs)
+        # HTTPS (reuse certs from utils/plugins/certs)
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         cert = _CERT_DIR / "cert.pem"
         key = _CERT_DIR / "key.pem"

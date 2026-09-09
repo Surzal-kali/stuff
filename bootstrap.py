@@ -224,7 +224,7 @@ class FrameworkLoader:
     async def start_zap_daemon(self, host=None, port=None):
         """Start the OWASP ZAP daemon as a subprocess.
 
-        Same lifecycle shape as ``start_ssl_server``: asyncio subprocess,
+        Same lifecycle shape as ``start_brain_server``: asyncio subprocess,
         appended to ``active_tasks`` so ``stop()`` reaps it via the
         SIGTERM-then-SIGKILL filter on ``asyncio.subprocess.Process``.
 
