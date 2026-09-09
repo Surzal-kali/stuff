@@ -455,12 +455,53 @@ class FrameworkLoader:
                 except Exception:
                     pass
 
+    def _preflight_wordlists(self):
+        """Launch-time wordlist sanity check for ffuf/hydra.
+
+        Both brute-force tools consume wordlist file paths verbatim, so a
+        missing/empty wordlist tree is the dominant silent-failure mode:
+        ffuf exits with "could not read wordlist" and hydra errors on
+        ``-P``/``-L`` paths mid-run.  Running this check at launch turns a
+        runtime mystery into a startup warning the operator can fix before
+        any run is attempted.  Read-only and idempotent; failures here are
+        logged but never fatal — the framework still boots.
+        """
+        try:
+            from utils.wordlists import preflight_wordlists
+            report = preflight_wordlists()
+        except Exception as exc:  # defensive: never block boot on a preflight
+            logger.warning("[!] Wordlist preflight raised: %s", exc, exc_info=True)
+            return
+        if report["ok"]:
+            logger.info(
+                "[+] Wordlist preflight: %s .txt files under %s "
+                "(common present: %s; absent: %s)",
+                report["txt_count"], report["root"],
+                ", ".join(report["common_present"]) or "none",
+                ", ".join(report["common_absent"]) or "none",
+            )
+        else:
+            logger.warning(
+                "[!] Wordlist preflight FAILED for %s: %s",
+                report["root"],
+                "; ".join(report["warnings"]) or "unknown",
+            )
+            logger.warning(
+                "[!] ffuf/hydra wordlist-based runs will fail until the tree "
+                "is populated (install SecLists or set WORDLISTS_ROOT)."
+            )
+
     async def launch_all(self):
         """Launches all servers in the background."""
         self.tool_registry.update({
             "smb_scan": ("auxiliaries.smb_scanner", "run_smb_recon"),
             "mcp": ("metasploiting", "start_mcp")
         })
+
+        # Preflight the wordlist tree BEFORE any tool can be dispatched so a
+        # missing /usr/share/wordlists (or an undecompressed rockyou.txt) is
+        # surfaced as a launch warning, not a silent ffuf/hydra failure later.
+        self._preflight_wordlists()
 
         # Start services
         self.active_tasks.append(asyncio.create_task(self.start_brain_server()))
