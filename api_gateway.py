@@ -46,11 +46,20 @@ logger = logging.getLogger(__name__)
 # Request models shared by the REST endpoints and the MCP tool wrappers.
 # ---------------------------------------------------------------------------
 class ToolRequest(BaseModel):
-    intent: str
+    intent: Optional[str] = None
+    # When tool_id is supplied, skip semantic search and execute that exact
+    # tool (the model picked it from a tools_search menu).  When only intent
+    # is supplied, fall back to the legacy auto-resolve-and-execute path.
+    tool_id: Optional[str] = None
     arguments: Optional[dict] = None
     # agent_id doubles as the Brain session id and scopes memory reads/writes.
     # Must be a TOP-LEVEL request field, NOT a tool argument (concurrent MCP
     # clients each pass their own; tool schemas stay clean).
+    agent_id: Optional[str] = None
+
+class ToolSearchRequest(BaseModel):
+    intent: str
+    top_k: Optional[int] = 5
     agent_id: Optional[str] = None
 
 class ToolLookupRequest(BaseModel):
@@ -73,11 +82,53 @@ class MemoryRecallRequest(BaseModel):
 _MCP_TOOL_EXECUTE_SCHEMA = {
     "type": "object",
     "properties": {
-        "intent": {"type": "string"},
+        "intent": {
+            "type": "string",
+            "description": (
+                "Natural-language description of what the caller wants. "
+                "Used to auto-resolve the best matching tool when tool_id "
+                "is NOT supplied. Ignored when tool_id is supplied."
+            ),
+        },
+        "tool_id": {
+            "type": "string",
+            "description": (
+                "Exact tool id (dotted python path, e.g. "
+                "'auxiliaries.nmap.run_scan') from a tools_search result. "
+                "When supplied, this tool is executed directly — no semantic "
+                "search is performed. Call tools_search first to get the menu "
+                "of candidates, then pass the chosen tool_id here."
+            ),
+        },
         "arguments": {"type": "object"},
         "agent_id": {
             "type": "string",
             "description": "Identity of the running model/agent. Used as the Brain session id so concurrent agents get isolated tool state (e.g. separate msfconsole handles). Omit to use the shared default session.",
+        },
+    },
+    # At least one of intent or tool_id must be present; validated in the handler.
+}
+_MCP_TOOL_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {
+            "type": "string",
+            "description": (
+                "Natural-language description of what the caller wants. "
+                "Returns up to top_k candidate tools with their ids, "
+                "capabilities, parameter schemas, and semantic distances. "
+                "Call this BEFORE tools_execute so the model can pick the "
+                "right tool from the menu instead of relying on auto-resolve."
+            ),
+        },
+        "top_k": {
+            "type": "integer",
+            "default": 5,
+            "description": "Number of candidate tools to return (max 10).",
+        },
+        "agent_id": {
+            "type": "string",
+            "description": "Identity of the running model/agent (scopes tool state). Omit for the shared default session.",
         },
     },
     "required": ["intent"],
@@ -106,6 +157,7 @@ _MCP_MEMORY_RECALL_SCHEMA = {
 # entrypoints perform — the gateway is now an MCP wrapper around the same
 # simple ``tools/execute`` + memory operations, not a replacement for them.
 TOOL_EXECUTE = "tools_execute"
+TOOL_SEARCH = "tools_search"
 MEMORY_SEARCH = "memory_search"
 MEMORY_RECALL = "memory_recall"
 
@@ -172,9 +224,21 @@ class APIGateway:
 
         @self.app.post("/tools/execute")
         async def execute_tool(req: ToolRequest):
-            manifest = await self.tool_registry.find_best_tool(req.intent)
-            if not manifest:
-                raise HTTPException(404, "No tool found for intent")
+            # Two dispatch modes:
+            # 1. tool_id supplied → execute that exact tool (model picked it
+            #    from a /tools/search menu).  Skip semantic search entirely.
+            # 2. only intent supplied → legacy auto-resolve-and-execute:
+            #    find_best_tool picks the single best match and fires it.
+            if req.tool_id:
+                manifest = await self.tool_registry.find_tool_by_id(req.tool_id)
+                if not manifest:
+                    raise HTTPException(404, f"No tool found with id '{req.tool_id}'")
+            else:
+                if not req.intent:
+                    raise HTTPException(400, "Either 'intent' or 'tool_id' is required")
+                manifest = await self.tool_registry.find_best_tool(req.intent)
+                if not manifest:
+                    raise HTTPException(404, "No tool found for intent")
 
             # Reject kwargs not declared in the tool manifest schema before
             # dispatch.  The secretary path already does this via
@@ -206,6 +270,27 @@ class APIGateway:
                 "tool_id": manifest.module_id,
                 "tool_name": manifest.external_sanitized_description,
                 "result": execution_result
+            }
+
+        @self.app.post("/tools/search")
+        async def search_tools(req: ToolSearchRequest):
+            """Return a menu of up to top_k candidate tools for an intent.
+
+            Mirrors the secretary's search_tools: the model calls this first,
+            picks a tool_id from the results, then calls /tools/execute with
+            that tool_id.  This avoids the misfires that happen when
+            /tools/execute auto-resolves a vague intent to the wrong sibling.
+            """
+            from daharness.registry import SECRETARY_MAX_TOP_K
+            top_k = max(1, min(int(req.top_k or 5), SECRETARY_MAX_TOP_K))
+            manifests = await self.tool_registry.find_tools(req.intent, top_k=top_k)
+            if not manifests:
+                raise HTTPException(404, "No tools found for intent")
+            return {
+                "intent": req.intent,
+                "candidates": [
+                    self.tool_registry.describe_manifest(m, lean=True) for m in manifests
+                ],
             }
         logging.basicConfig(level=logging.INFO)
 
@@ -252,10 +337,27 @@ class APIGateway:
         async def list_tools() -> list[mcp_types.Tool]:
             return [
                 mcp_types.Tool(
+                    name=TOOL_SEARCH,
+                    description=(
+                        "Semantic search over the tool registry. Returns a menu "
+                        "of up to top_k candidate tools (id, capability, parameter "
+                        "schema, semantic distance) for a natural-language intent. "
+                        "ALWAYS call this BEFORE tools_execute so the model can "
+                        "pick the right tool from the menu instead of relying on "
+                        "auto-resolve, which misfires on ambiguous intents. "
+                        "Mirrors POST /tools/search."
+                    ),
+                    inputSchema=_MCP_TOOL_SEARCH_SCHEMA,
+                ),
+                mcp_types.Tool(
                     name=TOOL_EXECUTE,
                     description=(
-                        "Resolve a natural-language intent to the best matching "
-                        "tool and execute it. Mirrors POST /tools/execute."
+                        "Execute a tool. Two modes: (1) Pass tool_id (from a "
+                        "tools_search result) to execute that exact tool directly "
+                        "— preferred, no semantic search. (2) Pass only intent to "
+                        "auto-resolve and execute the best single match — legacy "
+                        "mode, prone to misfiring on ambiguous intents. Mirrors "
+                        "POST /tools/execute."
                     ),
                     inputSchema=_MCP_TOOL_EXECUTE_SCHEMA,
                 ),
@@ -282,13 +384,40 @@ class APIGateway:
             # Every branch dispatches to the same code the REST handlers call,
             # so REST and MCP stay behaviourally identical.
             try:
-                if name == TOOL_EXECUTE:
+                if name == TOOL_SEARCH:
                     intent = arguments.get("intent")
                     if not intent:
-                        return self._error(f"{TOOL_EXECUTE}: 'intent' is required")
-                    manifest = await self.tool_registry.find_best_tool(intent)
-                    if not manifest:
-                        return self._error(f"No tool found for intent: {intent}")
+                        return self._error(f"{TOOL_SEARCH}: 'intent' is required")
+                    from daharness.registry import SECRETARY_MAX_TOP_K
+                    top_k = max(1, min(int(arguments.get("top_k") or 5), SECRETARY_MAX_TOP_K))
+                    manifests = await self.tool_registry.find_tools(intent, top_k=top_k)
+                    if not manifests:
+                        return self._error(f"No tools found for intent: {intent}")
+                    candidates = [
+                        self.tool_registry.describe_manifest(m, lean=True) for m in manifests
+                    ]
+                    payload = {"intent": intent, "candidates": candidates}
+                    return [mcp_types.TextContent(type="text", text=json.dumps(payload, default=str))]
+
+                if name == TOOL_EXECUTE:
+                    tool_id = arguments.get("tool_id")
+                    intent = arguments.get("intent")
+
+                    # Mode 1: explicit tool_id → execute directly, no search.
+                    if tool_id:
+                        manifest = await self.tool_registry.find_tool_by_id(tool_id)
+                        if not manifest:
+                            return self._error(f"No tool found with id '{tool_id}'")
+                    # Mode 2: intent only → legacy auto-resolve-and-execute.
+                    elif intent:
+                        manifest = await self.tool_registry.find_best_tool(intent)
+                        if not manifest:
+                            return self._error(f"No tool found for intent: {intent}")
+                    else:
+                        return self._error(
+                            f"{TOOL_EXECUTE}: either 'tool_id' or 'intent' is required. "
+                            "Call tools_search first to get candidate tool_ids."
+                        )
                     tool_args = arguments.get("arguments") or {}
                     # Mirror the REST 422 gate: reject kwargs not in the tool
                     # manifest schema so wrong-sibling arg mismatches are
