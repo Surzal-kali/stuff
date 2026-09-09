@@ -236,6 +236,40 @@ class FindingStore:
 
         return "\n".join(lines)
 
+    def write_markdown(
+        self,
+        output_dir: Optional[Path] = None,
+        severity: Optional[str] = None,
+        asset: Optional[str] = None,
+    ) -> Path:
+        """Render findings to markdown AND persist the report to disk.
+
+        Writes a timestamped ``.md`` file under ``output_dir`` (defaults to
+        ``<workspace_root>/findings_md/``).  Each call produces a new file so
+        successive snapshots don't clobber each other.  Returns the path to
+        the written file.
+
+        The output dir is created if it doesn't exist.  Filters work the
+        same as :meth:`render_markdown`.
+        """
+        md = self.render_markdown(severity=severity, asset=asset)
+
+        if output_dir is None:
+            output_dir = Path(__file__).resolve().parent.parent / "findings_md"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        parts = [ts]
+        if severity:
+            parts.append(severity)
+        if asset:
+            parts.append(asset.replace("/", "_").replace(" ", "_"))
+        filename = "findings_" + "-".join(parts) + ".md"
+        out_path = output_dir / filename
+        out_path.write_text(md, encoding="utf-8")
+        return out_path
+
     # -- internals ----------------------------------------------------------
 
     @staticmethod

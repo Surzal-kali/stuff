@@ -109,7 +109,9 @@ def report_finding(
 @framework_tool(
     "Render all reported findings as a markdown report. Optionally filter by "
     "severity (P1/P2/P3/P4) or asset substring. Useful for reviewing progress "
-    "mid-session or generating a submission draft at the end of an engagement."
+    "mid-session or generating a submission draft at the end of an engagement. "
+    "The report is also written to a timestamped .md file under findings_md/ "
+    "so it persists outside the database."
 )
 def render_findings(severity: str = "", asset: str = "") -> str:
     """Render findings from the store as a markdown report.
@@ -120,9 +122,17 @@ def render_findings(severity: str = "", asset: str = "") -> str:
     """
     store = FindingStore()
     try:
-        return store.render_markdown(
+        md = store.render_markdown(
             severity=severity or None,
             asset=asset or None,
+        )
+        out_path = store.write_markdown(
+            severity=severity or None,
+            asset=asset or None,
+        )
+        return (
+            f"{md}\n\n"
+            f"_Report written to: {out_path}_"
         )
     finally:
         store.close()

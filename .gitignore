@@ -28,3 +28,4 @@ payloads/__pycache__/
 listeners/__pycache__/
 daharness/__pycache__/
 .zap_home/
+findings_md/
