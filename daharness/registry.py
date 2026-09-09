@@ -56,7 +56,7 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # A non-thinking chat model reliably drives the tool loop; reasoning/thinking
 # variants tend to hallucinate tools/executions instead of actually calling
 # them.  Override via the SECRETARY_MODEL env var to swap in another model.
-SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gpt-oss:20b")
+SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "glm-5.2:cloud")
 SECRETARY_MAX_TOP_K = 10
 # Router abstention: with no human in the loop, the API dispatch path
 # refuses to run anything whose semantic match is not this close.

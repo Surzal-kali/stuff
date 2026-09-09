@@ -1,26 +1,9 @@
-"""ffuf web fuzzer with background job + poll pattern.
+"""ffuf web fuzzer — background launch + poll pattern.
 
-ffuf directory / vhost / parameter fuzzing runs can take minutes to tens of
-minutes depending on the wordlist size, rate limiting, and recursion depth.
-A blocking ``subprocess.run`` holds the entire secretary turn open for the
-run's full runtime and fights the turn timeout.  Instead, this module uses
-the shared :mod:`utils.background_job` helper:
-
-- ``run_ffuf(url, wordlist, options)`` launches ffuf as a background
-  ``subprocess.Popen`` and returns immediately with a ``job_id`` plus a log
-  file path.  The secretary turn is NOT held open.
-- ``ffuf_status(job_id)`` polls the job: checks whether the process is
-  still alive, tails the log, and parses a summary of discovered paths /
-  responses so the model can decide whether to keep polling or proceed to
-  the next tool.
-
-This mirrors the proven nmap ``run_nmap`` / ``nmap_status`` shape and
-inherits the shared ``BackgroundJob`` machinery.
-
-Non-interactivity is enforced defensively: ``-noninteractive`` is
-auto-injected when the caller omits it (ffuf otherwise opens an interactive
-console on SIGINT/TTY that blocks the detached subprocess), and ``stdin``
-is ``/dev/null`` via the shared launcher as a second defense.
+Long fuzzing runs are launched detached via :mod:`utils.background_job` so
+the secretary turn is not held open.  ``run_ffuf`` returns a ``job_id``
+immediately; ``ffuf_status`` polls until ``status: "done"``.
+``-noninteractive`` and ``-ic`` are auto-injected as defensive defaults.
 """
 
 from __future__ import annotations
@@ -87,14 +70,34 @@ def _inject_noninteractive(extra: List[str]) -> List[str]:
     return extra
 
 
+def _inject_ignore_comments(extra: List[str]) -> List[str]:
+    """Append ``-ic`` unless the caller already set it.
+
+    141 of 6 042 SecLists wordlists contain ``#``-prefixed comment lines
+    (DirBuster headers, license text, etc.); without ``-ic`` ffuf fuzzes
+    them as literal paths, wasting requests and generating noise.  No
+    SecLists Web-Content wordlist uses ``#`` as a legitimate path prefix,
+    so this is safe for the URL/FUZZ use case.
+    """
+    if any(a in ("-ic", "--ic") for a in extra):
+        return extra
+    return extra + ["-ic"]
+
+
 def _path_from_record(rec: Dict[str, Any]) -> str:
     """Extract the fuzzed value from a ffuf result record.
 
-    JSON records carry it in ``input`` — a dict like ``{"FUZZ": "admin"}``
-    in ffuf 1.x/2.x, or a list for multi-keyword runs; fall back to URL.
+    JSON records carry it in ``input`` — a dict like ``{"FUZZ": "admin"}``.
+    ffuf 2.x adds an internal ``FFUFHASH`` key (e.g. ``"7b0bd1"``) that
+    sorts before ``FUZZ``, so we must prefer ``FUZZ`` over ``next(iter())``.
+    Falls back to URL when no keyword is found.
     """
     raw = rec.get("input")
     if isinstance(raw, dict) and raw:
+        # Prefer FUZZ keyword; exclude ffuf-internal keys like FFUFHASH.
+        for k in ("FUZZ", *raw):
+            if k != "FFUFHASH":
+                return str(raw[k])
         return str(next(iter(raw.values())))
     if isinstance(raw, list) and raw:
         return "/".join(str(p) for p in raw)
@@ -221,26 +224,19 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
 def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
     """Launch ffuf against ``url`` and return immediately.
 
-    ffuf runs as a detached background subprocess writing to a per-job log
-    file; this call does NOT block on the run.  Poll the result with
-    ``ffuf_status(job_id)`` until it reports ``status: "done"``.
-
-    ``-u`` is set to ``url`` and ``-w`` to ``wordlist``; the URL must
-    contain the ``FUZZ`` keyword where the wordlist entries are substituted
-    (e.g. ``http://10.0.0.1/FUZZ``).  ``-of json -o <per-job file>`` is
-    injected AFTER any caller options (last ``-o`` wins) so machine-
-    readable results are always captured; ``ffuf_status`` prefers that
-    file's findings over the human-table parse when both exist.
+    The URL must contain the ``FUZZ`` keyword where wordlist entries are
+    substituted (e.g. ``http://10.0.0.1/FUZZ``).  Machine-readable JSON
+    output is always captured to a per-job file; ``ffuf_status`` prefers
+    that file's findings over the human-table parse.
 
     Args:
-        url: The target URL containing the ``FUZZ`` keyword, e.g.
-            ``http://10.0.0.1/FUZZ``.  Passed as its own argv element and
-            never interpolated into a shell string.
+        url: Target URL containing the ``FUZZ`` keyword, e.g.
+            ``http://10.0.0.1/FUZZ``.
         wordlist: Path to the wordlist file (passed to ``-w``).
         options: Additional ffuf command-line options as a single string
             (e.g. ``"-mc 200,301,401 -t 80 -recursion -recursion-depth 2"``).
-            Quoted sub-phrases are preserved by shlex.  ``-noninteractive``
-            is injected only if the installed ffuf supports it (>= 2.0).
+            ``-noninteractive`` (if supported) and ``-ic`` are auto-injected
+            unless already present.
     """
     import shlex
 
@@ -250,6 +246,7 @@ def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
 
     opt_list = shlex.split(options) if options else []
     opt_list = _inject_noninteractive(opt_list)
+    opt_list = _inject_ignore_comments(opt_list)
 
     # ``-u`` and ``-w`` are always explicit so the caller can't accidentally
     # omit the essentials; extra -w / -u in options are allowed by ffuf.
