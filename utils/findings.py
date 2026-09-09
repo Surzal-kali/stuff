@@ -68,7 +68,7 @@ def report_finding(
     repro_list: List[str] = (
         [s.strip() for s in repro.split("\n") if s.strip()] if repro else []
     )
-
+    if isinstance(tool_chain, list):tool_chain = ",".join(str(s).strip() for s in tool_chain if str(s).strip())
     chain_list: List[str] = (
         [s.strip() for s in tool_chain.split(",") if s.strip()] if tool_chain else []
     )
