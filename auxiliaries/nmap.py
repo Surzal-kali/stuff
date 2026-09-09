@@ -59,9 +59,10 @@ def _parse_nmap_verdict(log_text: str) -> Dict[str, Any]:
 
 
 @framework_tool(
-    "Launch an Nmap port scan on a target in the background; returns a "
-    "job_id you poll with nmap_status. The scan runs detached and writes "
-    "to a log file — this call does NOT block.",
+    "Launch and start a new Nmap port scan on a target, subnet, or CIDR "
+    "range: discovers live hosts and enumerates open ports and services. "
+    "Non-blocking and detached — starts the scan in the background and "
+    "returns immediately with a scan ID for later retrieval.",
     next_hints=["nmap_status"],
 )
 def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
@@ -101,9 +102,10 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
 
 
 @framework_tool(
-    "Poll an Nmap scan job: returns running/done, a parsed list of open "
-    "ports with services, the host up/down verdict, and recent log lines. "
-    "Call until the scan reports done.",
+    "Poll, check, or monitor the progress and results of an existing, "
+    "already-launched Nmap scan job: returns running/done, a parsed list "
+    "of open ports with services, the host up/down verdict, and recent "
+    "log lines. Call until the scan reports done.",
     next_hints=["nmap_status", "report_finding"],
 )
 def nmap_status(job_id: str) -> Dict[str, Any]:
