@@ -30,6 +30,7 @@ anyway, so we don't pay the async tax.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -153,11 +154,21 @@ class ZAPClient:
         request. Returns the standard message envelope (requestHeader /
         responseHeader / responseBody / id).
         """
-        return self._get(
-            "httpSender/action/sendRequest",
-            request=raw_request,
-            followRedirects=str(follow_redirects).lower(),
-        )
+        try:
+            return self._get(
+                "httpSender/action/sendRequest",
+                request=raw_request,
+                followRedirects=str(follow_redirects).lower(),
+            )
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            body = resp.text[:2000] if resp is not None else ""
+            return {
+                "error": True,
+                "status": resp.status_code if resp is not None else None,
+                "zap_error_body": body,
+                "hint": "ZAP rejected sendRequest before it reached the target; zap_error_body holds the API's own reason. Adjust the request shape and retry.",
+            }
 
     def spider(self, url: str, max_depth: int = 5, recurse: bool = True) -> str:
         """Start the traditional crawler; returns the scan id (e.g. ``"0"``)."""
@@ -294,9 +305,20 @@ class ZAPClient:
 
     def sites_tree(self, url: Optional[str] = None) -> str:
         """Full tree as JSON string. Pass ``url`` to scope to a subtree."""
-        if url:
-            return self._get("core/view/sitesTree", url=url, expect_json=False)
-        return self._get("core/view/sitesTree", expect_json=False)
+        try:
+            if url:
+                return self._get("core/view/sitesTree", url=url, expect_json=False)
+            return self._get("core/view/sitesTree", expect_json=False)
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            body = resp.text[:2000] if resp is not None else ""
+            # The flat site list keeps target visibility alive even when the
+            # tree view is rejected by this ZAP build.
+            return json.dumps({
+                "error": True,
+                "zap_error_body": body,
+                "fallback_sites": self.sites(),
+            })
 
     def report(
         self,
