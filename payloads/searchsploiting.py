@@ -4,8 +4,10 @@ import subprocess
 from constants import framework_tool
 #this module will be our primary searchsploit module, it will be used to search for exploits using the local searchsploit CLI.
 @framework_tool(
-    "Search for exploits using searchsploit",
-    next_hints=["index_modules (search metasploit for matching modules)"],
+    "Look up known exploits for a vulnerability or service using the local "
+    "searchsploit CLI (ExploitDB). Pass keywords (e.g. 'apache 2.4' or "
+    "'vsftpd backdoor') and get matching ExploitDB entries back.",
+    next_hints=["index_modules (find matching Metasploit modules)"],
 )
 def search_exploit(query):
     # Use searchsploit command line tool to search for exploits.

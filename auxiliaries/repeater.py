@@ -164,7 +164,7 @@ def _rep() -> RepeaterClient:
 
 @framework_tool(
     "Replay a single raw HTTP/1.1 request through the framework's local TLS "
-    "echo server (Burp Repeater analog). Returns status, headers, and echoed body."
+    "echo server (Burp Repeater analog). Returns the HTTP response code, headers, and echoed body."
 )
 def ssl_replay(raw_request):
     """Pass a full request including the request line, headers, blank line,

@@ -241,7 +241,7 @@ def _resolve_alive(
 
 @framework_tool(
     "Enumerate subdomains for a domain using amass, then resolve each to "
-    "check if it's alive, and filter against the program scope (if a .scope "
+    "verify it's alive, and filter against the program scope (if a .scope "
     "file exists in the workspace). Returns a structured JSON object: "
     "{subdomains: [...], alive: [...], out_of_scope: [...]}. "
     "Use this instead of run_amass when you want a structured result ready "

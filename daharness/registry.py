@@ -740,6 +740,10 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 f"ROUTER_MAX_DISTANCE {ROUTER_MAX_DISTANCE} for intent '{user_intent}'"
             )
             return None
+        logger.info(
+            f"[TOOL_ACTIVATION] Accepted: distance {best.distance} for intent "
+            f"'{user_intent}' -> tool '{best.module_id}'"
+        )
         return best
 
     def describe_manifest(self, manifest: ToolManifest, lean: bool = False) -> Dict[str, Any]:

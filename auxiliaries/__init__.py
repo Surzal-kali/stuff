@@ -1,4 +1,4 @@
-from .nmap import Nmap
+from .nmap import run_nmap, nmap_status
 
 
-__all__ = ["Nmap",]
+__all__ = ["run_nmap", "nmap_status"]

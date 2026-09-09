@@ -97,7 +97,8 @@ def _parse_verdict(log_text: str) -> Dict[str, Any]:
 
 @framework_tool(
     "Launch a sqlmap scan against a target URL in the background; returns a "
-    "job_id you poll with sqlmap_status. Non-interactive (--batch is forced).",
+    "job_id you poll with sqlmap_status. Non-interactive (--batch is forced). "
+    "Use this for SQL injection testing.",
     next_hints=["sqlmap_status"],
 )
 def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
@@ -230,8 +231,8 @@ def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
 
 @framework_tool(
     "Poll a sqlmap scan job: returns running/done, a parsed injectable "
-    "verdict, the detected DBMS, and recent log lines. Call until "
-    "status == 'done'.",
+    "verdict, the detected DBMS, and recent log lines. Call until the "
+    "scan reports done.",
     next_hints=["sqlmap_status", "report_finding"],
 )
 def sqlmap_status(job_id: str) -> Dict[str, Any]:

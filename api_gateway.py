@@ -176,6 +176,23 @@ class APIGateway:
             if not manifest:
                 raise HTTPException(404, "No tool found for intent")
 
+            # Reject kwargs not declared in the tool manifest schema before
+            # dispatch.  The secretary path already does this via
+            # _normalize_args_against_manifest (which raises ModelRetry on
+            # unknown keys); the API path had no such gate, so a caller (or
+            # model) passing the wrong sibling's args silently got a
+            # TypeError deep inside the tool instead of a loud 422.  This
+            # is what stopped sqlmap from firing: the model passed args
+            # belonging to a different tool and the dispatch went through
+            # anyway because nothing checked the schema.
+            unknown = self._check_unknown_args(manifest, req.arguments or {})
+            if unknown:
+                raise HTTPException(
+                    422,
+                    f"Arguments not in tool '{manifest.module_id}' schema: {unknown}. "
+                    f"Accepted keys: {sorted(self._manifest_param_names(manifest))}",
+                )
+
             # agent_id doubles as the Brain session id, so each identified
             # agent gets its own isolated tool state on the sidecar; omitted
             # falls back to the shared default session ("0").
@@ -273,6 +290,16 @@ class APIGateway:
                     if not manifest:
                         return self._error(f"No tool found for intent: {intent}")
                     tool_args = arguments.get("arguments") or {}
+                    # Mirror the REST 422 gate: reject kwargs not in the tool
+                    # manifest schema so wrong-sibling arg mismatches are
+                    # LOUD, not silent TypeErrors deep in the tool body.
+                    unknown = self._check_unknown_args(manifest, tool_args)
+                    if unknown:
+                        return self._error(
+                            f"{TOOL_EXECUTE}: Arguments not in tool "
+                            f"'{manifest.module_id}' schema: {unknown}. "
+                            f"Accepted keys: {sorted(self._manifest_param_names(manifest))}"
+                        )
                     # agent_id -> Brain session id for per-agent isolation.
                     session_id = arguments.get("agent_id") or "0"
                     result = await self.tool_registry.execute_tool(
@@ -326,6 +353,40 @@ class APIGateway:
             except Exception as exc:  # noqa: BLE001 - surface to the MCP client
                 logger.error("[gateway] MCP call_tool '%s' failed: %s", name, exc, exc_info=True)
                 return self._error(f"{name}: {exc}")
+
+    # --- Arg validation helpers (mirror _normalize_args_against_manifest) -----
+
+    @staticmethod
+    def _manifest_param_names(manifest) -> list:
+        """Return the declared parameter names from the manifest schema."""
+        params = manifest.parameters or {}
+        if isinstance(params, dict):
+            props = params.get("properties")
+            if isinstance(props, dict):
+                return list(props.keys())
+        return []
+
+    def _check_unknown_args(manifest, arguments: dict) -> list:
+        """Return a list of argument keys not declared in the manifest schema.
+
+        Mirrors the extra-key rejection in
+        ``_normalize_args_against_manifest`` (agent.py) so the API path
+        gets the same loud failure the secretary path already has.
+        Tolerates case differences and meta-keys prefixed with ``_``
+        (e.g. ``_raw``) for parity with the secretary path.
+        """
+        if not isinstance(arguments, dict) or not arguments:
+            return []
+        declared = set(APIGateway._manifest_param_names(manifest))
+        declared_lower = {d.lower() for d in declared}
+        unknown = []
+        for key in arguments:
+            if key in declared or key.lower() in declared_lower:
+                continue
+            if key.startswith("_"):
+                continue
+            unknown.append(key)
+        return unknown
 
     @staticmethod
     def _error(message: str) -> mcp_types.CallToolResult:

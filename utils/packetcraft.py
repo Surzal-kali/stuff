@@ -424,7 +424,7 @@ def craft_dhcp_discover(src_mac: str):
 # --- DNS / mDNS -----------------------------------------------------------
 
 @framework_tool(
-    "Craft a DNS query packet (UDP/53). Returns the packet hex.",
+    "Craft a DNS request packet (UDP/53) for a domain name. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
 def craft_dns_query(src_ip: str, dst_ip: str, query_name: str):
@@ -477,7 +477,7 @@ def craft_dns_response_multi(src_ip: str, dst_ip: str, query_name: str, answer_i
 
 
 @framework_tool(
-    "Craft an mDNS query (UDP/5353). Returns the packet hex.",
+    "Craft an mDNS request packet (UDP/5353) for a domain name. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
 def craft_mdns_query(src_ip: str, dst_ip: str, query_name: str):

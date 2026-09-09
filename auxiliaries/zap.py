@@ -373,7 +373,7 @@ def zap_ajax_spider(target: str) -> Dict[str, str]:
     return {"ajax_spider_id": _zap().ajax_spider(target)}
 
 
-@framework_tool("Get AJAX spider status string (running / stopped / finished).")
+@framework_tool("Get AJAX spider progress (running / stopped / finished) for a given spider_id.")
 def zap_ajax_spider_status() -> Dict[str, str]:
     return {"status": _zap().ajax_spider_status()}
 

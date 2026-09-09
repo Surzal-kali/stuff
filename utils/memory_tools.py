@@ -96,10 +96,10 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "",
 
 @framework_tool(
     "Recall earlier findings from persistent vector memory using a "
-    "natural-language query. Pass a query describing what you want back "
+    "natural-language phrase. Pass a phrase describing what you want back "
     "(e.g. 'port 21 ftp findings' or 'root password') and optionally the "
     "namespace (default 'engagement'). Pass your agent_id to recall only "
-    "your own memories; omit it to search the shared pool across all agents. "
+    "your own memories; omit it to probe the shared pool across all agents. "
     "Returns the closest stored matches by vector similarity."
 )
 def recall_text(query: str, namespace: str = "engagement", limit: int = 5, agent_id: str = ""):

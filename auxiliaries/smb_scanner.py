@@ -25,7 +25,7 @@ class SMBScanner:
         except Exception as e:
             print(f"[!] Brain reporting failed: {e}")
 
-    @framework_tool("Check if a target is vulnerable to Null Sessions.")
+    @framework_tool("Test if a target is vulnerable to SMB Null Sessions.")
     def check_null_session(self, target, remoteName=False):
         """Attempts a Null Session connection to a target SMB share."""
         try:

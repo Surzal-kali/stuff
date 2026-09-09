@@ -181,7 +181,7 @@ class MetasploitClient:
 
     # This one goes through the Brain's logic
     @framework_tool(
-        "Search for Metasploit modules by type and name. Use this to find "
+        "Look up Metasploit modules by type and name. Use this to find "
         "exploits, auxiliaries, payloads, and post-exploitation modules "
         "matching a known vulnerability or service (e.g. vsftpd backdoor, "
         "ssh_login, samba usermap_script). Returns a JSON list of objects, "
