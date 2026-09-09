@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import threading
+
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -57,6 +58,11 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 # them.  Override via the SECRETARY_MODEL env var to swap in another model.
 SECRETARY_MODEL = os.getenv("SECRETARY_MODEL", "gpt-oss:20b")
 SECRETARY_MAX_TOP_K = 10
+# Router abstention: with no human in the loop, the API dispatch path
+# refuses to run anything whose semantic match is not this close.
+# Distance is chromadb L2 on nomic-embed-text normalized vectors
+# (0 = identical). 1.1 calibrated live: good matches ~0.3-0.9.
+ROUTER_MAX_DISTANCE = 1.1
 SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
 SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "600"))  # 10 min wall-clock
 ALLOWED_TOOL_ROOTS = [
@@ -713,9 +719,28 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
         return manifests
 
     async def find_best_tool(self, user_intent: str, top_k=1):
-        """Best single match for an intent (kept for the direct-dispatch API path)."""
+        """Best single match for an intent (kept for the direct-dispatch API path).
+
+        Abstention gate: on the API path there is no human confirmer, so the
+        router refuses to execute anything whose semantic match is not close.
+        Without this the router never abstains and a vague intent resolves to
+        whatever sibling happens to win the cosine tie (verified live:
+        'framework health status check' ran a ZAP spider-status read).
+        Returns None on no-match-or-too-far, which the gateway already
+        handles as a 404. The secretary path (find_tools) is untouched:
+        she sees fuzzy candidates plus a human confirmer, so she judges.
+        """
         manifests = await self.find_tools(user_intent, top_k=top_k)
-        return manifests[0] if manifests else None
+        if not manifests:
+            return None
+        best = manifests[0]
+        if best.distance is not None and best.distance > ROUTER_MAX_DISTANCE:
+            logger.info(
+                f"[TOOL_ACTIVATION] Abstaining: best distance {best.distance} > "
+                f"ROUTER_MAX_DISTANCE {ROUTER_MAX_DISTANCE} for intent '{user_intent}'"
+            )
+            return None
+        return best
 
     def describe_manifest(self, manifest: ToolManifest, lean: bool = False) -> Dict[str, Any]:
         """Full (non-sanitized) view of a manifest for the secretary and the confirmer.

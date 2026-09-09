@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 class ToolRequest(BaseModel):
     intent: str
     arguments: Optional[dict] = None
+    # agent_id doubles as the Brain session id and scopes memory reads/writes.
+    # Must be a TOP-LEVEL request field, NOT a tool argument (concurrent MCP
+    # clients each pass their own; tool schemas stay clean).
     agent_id: Optional[str] = None
 
 class ToolLookupRequest(BaseModel):
