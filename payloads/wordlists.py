@@ -20,6 +20,7 @@ from utils.wordlists import (
     WORDLISTS_ROOT,
     discover_wordlists,
     preflight_wordlists,
+    resolve_default_wordlist,
 )
 
 
@@ -89,4 +90,12 @@ def list_wordlists(
         "common_present": pf["common_present"],
         "common_absent": pf["common_absent"],
         "warnings": pf["warnings"],
+        # The "just in case" fallback wordlists run_ffuf/run_hydra use when
+        # no list is supplied.  A None value means the default file is absent
+        # under the root — ffuf/hydra will error in that case.
+        "defaults": {
+            "ffuf": resolve_default_wordlist("ffuf"),
+            "hydra_logins": resolve_default_wordlist("hydra_logins"),
+            "hydra_passwords": resolve_default_wordlist("hydra_passwords"),
+        },
     }

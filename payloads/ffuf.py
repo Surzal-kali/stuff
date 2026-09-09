@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job, terminate_job
+from utils.wordlists import resolve_default_wordlist
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -221,7 +222,7 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
     "with a job ID for later retrieval.",
     next_hints=["ffuf_status"],
 )
-def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
+def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
     """Launch ffuf against ``url`` and return immediately.
 
     The URL must contain the ``FUZZ`` keyword where wordlist entries are
@@ -229,16 +230,43 @@ def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
     output is always captured to a per-job file; ``ffuf_status`` prefers
     that file's findings over the human-table parse.
 
+    If ``wordlist`` is empty/unset, a short pre-existing SecLists default
+    (``SecLists/Discovery/Web-Content/common.txt`` — the canonical quick
+    ffuf list, overridable via ``DEFAULT_FFUF_WORDLIST``) is used as a
+    "just in case" fallback so a forgotten argument runs a quick sane pass
+    instead of failing with "could not read wordlist".  Call
+    ``list_wordlists`` first for a targeted run.
+
     Args:
         url: Target URL containing the ``FUZZ`` keyword, e.g.
             ``http://10.0.0.1/FUZZ``.
-        wordlist: Path to the wordlist file (passed to ``-w``).
+        wordlist: Path to the wordlist file (passed to ``-w``).  Empty
+            string falls back to the framework default wordlist.
         options: Additional ffuf command-line options as a single string
             (e.g. ``"-mc 200,301,401 -t 80 -recursion -recursion-depth 2"``).
             ``-noninteractive`` (if supported) and ``-ic`` are auto-injected
             unless already present.
     """
     import shlex
+
+    wordlist = (wordlist or "").strip()
+    default_used = False
+    if not wordlist:
+        default_wl = resolve_default_wordlist("ffuf")
+        if not default_wl:
+            return {
+                "job_id": None,
+                "tool": "ffuf",
+                "status": "error",
+                "error": (
+                    "No wordlist supplied and the framework default "
+                    "(DEFAULT_FFUF_WORDLIST) is not present under "
+                    "/usr/share/wordlists. Call list_wordlists to discover "
+                    "an available wordlist, or pass an explicit wordlist path."
+                ),
+            }
+        wordlist = default_wl
+        default_used = True
 
     out_path = os.path.join(
         os.getenv("BG_JOB_LOG_DIR", "/tmp"), f"ffuf_out_{uuid.uuid4().hex[:8]}.json"
@@ -265,12 +293,17 @@ def run_ffuf(url: str, wordlist: str, options: str = "") -> Dict[str, Any]:
             verdict["meta"]["output_file"] = out_path
         return verdict
 
-    return launch_job(
+    job = launch_job(
         command,
         tool_name="ffuf",
         timeout=float(os.getenv("FFUF_TIMEOUT", "1800")),
         verdict_parser=_verdict,
     )
+    # Surface which wordlist actually ran (and whether it was the fallback
+    # default) so the secretary model knows to swap in a targeted list.
+    job["wordlist"] = wordlist
+    job["default_wordlist_used"] = default_used
+    return job
 
 
 @framework_tool(

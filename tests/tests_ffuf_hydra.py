@@ -204,3 +204,118 @@ def test_hydra_parser_credentials_and_attempts():
         "host": "192.168.90.114", "login": "root", "password": "toor"}
     assert v["attempts"] == {"done": 12, "total": 100}
     assert v["status_line"] and "successfully completed" in v["status_line"]
+
+
+# --- default wordlist fallback (ffuf) ----------------------------------------
+
+def test_run_ffuf_uses_default_wordlist_when_empty(monkeypatch):
+    """Empty wordlist falls back to the framework default and flags it."""
+    import payloads.ffuf as ffuf_mod
+    from utils.wordlists import resolve_default_wordlist
+
+    default = resolve_default_wordlist("ffuf")
+    if not default:
+        pytest.skip("default ffuf wordlist not installed")
+
+    captured = {}
+
+    def fake_launch(cmd, *, tool_name, timeout, verdict_parser):
+        captured["cmd"] = cmd
+        return {"job_id": "j1", "status": "running", "tool": tool_name}
+
+    monkeypatch.setattr(ffuf_mod, "launch_job", fake_launch)
+
+    r = ffuf_mod.run_ffuf(url="http://127.0.0.1/FUZZ", wordlist="")
+    assert r["status"] == "running"
+    assert r["default_wordlist_used"] is True
+    assert r["wordlist"] == default
+    # the default must actually be on the command line via -w
+    assert "-w" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("-w") + 1] == default
+
+
+def test_run_ffuf_explicit_wordlist_not_flagged_default(monkeypatch):
+    import payloads.ffuf as ffuf_mod
+    captured = {}
+
+    def fake_launch(cmd, *, tool_name, timeout, verdict_parser):
+        captured["cmd"] = cmd
+        return {"job_id": "j2", "status": "running", "tool": tool_name}
+
+    monkeypatch.setattr(ffuf_mod, "launch_job", fake_launch)
+    r = ffuf_mod.run_ffuf(url="http://127.0.0.1/FUZZ", wordlist="/tmp/custom.txt")
+    assert r["default_wordlist_used"] is False
+    assert r["wordlist"] == "/tmp/custom.txt"
+    assert captured["cmd"][captured["cmd"].index("-w") + 1] == "/tmp/custom.txt"
+
+
+def test_run_ffuf_errors_when_no_default_available(monkeypatch, tmp_path):
+    import payloads.ffuf as ffuf_mod
+    monkeypatch.setattr(
+        "utils.wordlists.DEFAULT_FFUF_WORDLIST", "no/such/list.txt"
+    )
+    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", tmp_path)
+    r = ffuf_mod.run_ffuf(url="http://127.0.0.1/FUZZ", wordlist="")
+    assert r["status"] == "error"
+    assert "list_wordlists" in r["error"]
+
+
+# --- default credential fallback (hydra) --------------------------------------
+
+def test_hydra_injects_default_credentials_when_absent(monkeypatch):
+    import payloads.hydra as hydra_mod
+    from utils.wordlists import resolve_default_wordlist
+
+    if not (resolve_default_wordlist("hydra_logins") and
+            resolve_default_wordlist("hydra_passwords")):
+        pytest.skip("default hydra lists not installed")
+
+    captured = {}
+
+    def fake_launch(cmd, *, tool_name, timeout, verdict_parser):
+        captured["cmd"] = cmd
+        return {"job_id": "h1", "status": "running", "tool": tool_name}
+
+    monkeypatch.setattr(hydra_mod, "launch_job", fake_launch)
+    r = hydra_mod.run_hydra(target="ssh://127.0.0.1", options="-t 4 -f")
+    assert r["status"] == "running"
+    assert r["default_creds_used"] is True
+    # -L and -P with the default paths must be on the command line
+    assert "-L" in captured["cmd"] and "-P" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("-L") + 1] == r["default_login_list"]
+    assert captured["cmd"][captured["cmd"].index("-P") + 1] == r["default_password_list"]
+
+
+@pytest.mark.parametrize("opts", [
+    "-L /tmp/u.txt -P /tmp/p.txt",
+    "-C /tmp/creds.txt",
+    "-l admin -p secret",
+    "-x my:generator",
+])
+def test_hydra_does_not_inject_when_cred_source_present(monkeypatch, opts):
+    import payloads.hydra as hydra_mod
+    captured = {}
+
+    def fake_launch(cmd, *, tool_name, timeout, verdict_parser):
+        captured["cmd"] = cmd
+        return {"job_id": "h2", "status": "running", "tool": tool_name}
+
+    monkeypatch.setattr(hydra_mod, "launch_job", fake_launch)
+    r = hydra_mod.run_hydra(target="ssh://127.0.0.1", options=opts)
+    assert r["status"] == "running"
+    assert r["default_creds_used"] is False
+    # No second -L/-P injected beyond what the caller supplied.
+    l_count = captured["cmd"].count("-L")
+    p_count = captured["cmd"].count("-P")
+    assert l_count == (1 if "-L" in opts else 0)
+    assert p_count == (1 if "-P" in opts else 0)
+
+
+def test_hydra_errors_when_no_default_available(monkeypatch, tmp_path):
+    import payloads.hydra as hydra_mod
+    monkeypatch.setattr("utils.wordlists.DEFAULT_HYDRA_LOGIN_LIST", "no/such.txt")
+    monkeypatch.setattr("utils.wordlists.DEFAULT_HYDRA_PASSWORD_LIST", "no/such2.txt")
+    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", tmp_path)
+    r = hydra_mod.run_hydra(target="ssh://127.0.0.1", options="")
+    assert r["status"] == "error"
+    assert "list_wordlists" in r["error"]

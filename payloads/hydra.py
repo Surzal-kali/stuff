@@ -30,6 +30,7 @@ from typing import Any, Dict, List
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job, terminate_job
+from utils.wordlists import resolve_default_wordlist
 
 
 # hydra's success line looks like:
@@ -102,6 +103,58 @@ def _parse_hydra_verdict(log_text: str) -> Dict[str, Any]:
     }
 
 
+_HYDRA_CRED_FLAGS = {"-l", "-L", "-p", "-P", "-C", "-x"}
+
+
+def _has_credential_source(opt_list: List[str]) -> bool:
+    """True if ``options`` already names a hydra credential source.
+
+    hydra needs at least one of ``-l``/``-L`` (login), ``-p``/``-P``
+    (password), ``-C`` (colon file), or ``-x`` (module password generator).
+    Without any of these hydra exits with an error before touching the
+    target — the classic "forgot the wordlist" failure.
+    """
+    for tok in opt_list:
+        if tok in _HYDRA_CRED_FLAGS:
+            return True
+        # glued short form, e.g. -Cfile or -Llogins
+        if len(tok) > 2 and tok[:2] in _HYDRA_CRED_FLAGS:
+            return True
+    return False
+
+
+def _inject_default_credentials(opt_list: List[str]) -> tuple[List[str], Dict[str, Any]]:
+    """Inject default login + password lists when no cred source is set.
+
+    Returns the (possibly extended) argv list and a meta dict describing
+    what was injected, so ``run_hydra`` can surface it to the caller.  If
+    the default files are absent, returns the list unchanged with an
+    ``error`` key so ``run_hydra`` can fail loudly with a pointer to
+    ``list_wordlists`` instead of letting hydra produce a cryptic message.
+    """
+    meta: Dict[str, Any] = {"default_creds_used": False}
+    if _has_credential_source(opt_list):
+        return opt_list, meta
+
+    logins = resolve_default_wordlist("hydra_logins")
+    passwords = resolve_default_wordlist("hydra_passwords")
+    if not logins or not passwords:
+        meta["error"] = (
+            "No credential source (-l/-L/-p/-P/-C/-x) supplied and one or both "
+            "framework defaults (DEFAULT_HYDRA_LOGIN_LIST / "
+            "DEFAULT_HYDRA_PASSWORD_LIST) are missing under "
+            "/usr/share/wordlists. Call list_wordlists to discover available "
+            "lists, then pass -L <logins> -P <passwords>."
+        )
+        return opt_list, meta
+
+    injected = list(opt_list) + ["-L", logins, "-P", passwords]
+    meta["default_creds_used"] = True
+    meta["default_login_list"] = logins
+    meta["default_password_list"] = passwords
+    return injected, meta
+
+
 @framework_tool(
     "Launch and start a new Hydra credential brute-force / password-spray "
     "against a service target (e.g. ssh://10.0.0.1, ftp://host, "
@@ -131,20 +184,39 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
             shell string.
         options: Additional hydra command-line options as a single string
             (e.g. ``"-l admin -P /usr/share/wordlists/rockyou.txt -f -V"``).
-            Quoted sub-phrases are preserved by shlex.
+            Quoted sub-phrases are preserved by shlex.  If no credential
+            source (``-l``/``-L``/``-p``/``-P``/``-C``/``-x``) is present,
+            short pre-existing SecLists defaults
+            (``top-usernames-shortlist.txt`` + ``top-passwords-shortlist.txt``;
+            overridable via ``DEFAULT_HYDRA_LOGIN_LIST`` /
+            ``DEFAULT_HYDRA_PASSWORD_LIST``) are injected as a "just in case"
+            fallback so a forgotten cred source runs a quick sane pass instead
+            of erroring.  Call ``list_wordlists`` for a targeted run.
     """
     import shlex
 
     opt_list = shlex.split(options) if options else []
+    opt_list, creds_meta = _inject_default_credentials(opt_list)
+    if "error" in creds_meta:
+        return {
+            "job_id": None,
+            "tool": "hydra",
+            "status": "error",
+            "error": creds_meta["error"],
+        }
 
     command = ["hydra", *opt_list, target]
 
-    return launch_job(
+    job = launch_job(
         command,
         tool_name="hydra",
         timeout=float(__import__("os").getenv("HYDRA_TIMEOUT", "1800")),
         verdict_parser=_parse_hydra_verdict,
     )
+    # Surface whether default cred lists were injected so the secretary
+    # model knows to swap in targeted lists for a real run.
+    job.update(creds_meta)
+    return job
 
 
 @framework_tool(

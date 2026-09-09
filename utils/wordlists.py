@@ -44,6 +44,62 @@ COMMON_WORDLISTS: Dict[str, str] = {
     "names_top": "SecLists/Usernames/top-usernames-shortlist.txt",
 }
 
+# Short, pre-existing SecLists defaults used as "just in case" fallbacks when a
+# caller omits the wordlist argument.  These are deliberately small so a
+# forgotten argument runs a quick sane pass instead of failing (ffuf: "could
+# not read wordlist") or erroring (hydra: no cred source).  Override via env:
+#   DEFAULT_FFUF_WORDLIST / DEFAULT_HYDRA_LOGIN_LIST / DEFAULT_HYDRA_PASSWORD_LIST
+DEFAULT_FFUF_WORDLIST: str = os.getenv(
+    "DEFAULT_FFUF_WORDLIST",
+    "SecLists/Discovery/Web-Content/common.txt",  # 4 751 lines; canonical ffuf quick default
+)
+DEFAULT_HYDRA_LOGIN_LIST: str = os.getenv(
+    "DEFAULT_HYDRA_LOGIN_LIST",
+    "SecLists/Usernames/top-usernames-shortlist.txt",  # 17 lines: root, admin, ...
+)
+DEFAULT_HYDRA_PASSWORD_LIST: str = os.getenv(
+    "DEFAULT_HYDRA_PASSWORD_LIST",
+    "SecLists/Passwords/Common-Credentials/top-passwords-shortlist.txt",  # 25 lines
+)
+
+
+def resolve_wordlist(rel_path: str, root: Optional[Path] = None) -> Optional[str]:
+    """Resolve a wordlist path relative to :data:`WORDLISTS_ROOT`.
+
+    Accepts either a relative SecLists path (e.g.
+    ``SecLists/Discovery/Web-Content/common.txt``) or an absolute path that
+    already exists.  Returns the absolute ``str`` path if the file exists,
+    otherwise ``None`` — never raises, so callers can fall back to a clear
+    error message that points at ``list_wordlists``.
+    """
+    base = (root or WORDLISTS_ROOT)
+    # An existing absolute path is honoured as-is.
+    p = Path(rel_path)
+    if p.is_absolute() and p.is_file():
+        return str(p)
+    candidate = base / rel_path
+    if candidate.is_file():
+        return str(candidate)
+    return None
+
+
+def resolve_default_wordlist(kind: str, root: Optional[Path] = None) -> Optional[str]:
+    """Resolve the framework default wordlist for ``kind``.
+
+    ``kind`` is one of ``"ffuf"``, ``"hydra_logins"``, ``"hydra_passwords"``.
+    Returns the absolute path string if the default file exists under the
+    wordlist root, otherwise ``None``.
+    """
+    mapping = {
+        "ffuf": DEFAULT_FFUF_WORDLIST,
+        "hydra_logins": DEFAULT_HYDRA_LOGIN_LIST,
+        "hydra_passwords": DEFAULT_HYDRA_PASSWORD_LIST,
+    }
+    rel = mapping.get(kind)
+    if not rel:
+        return None
+    return resolve_wordlist(rel, root=root)
+
 
 def _count_lines(path: Path) -> Optional[int]:
     """Best-effort line count; ``None`` if the file can't be read (binary/perm)."""

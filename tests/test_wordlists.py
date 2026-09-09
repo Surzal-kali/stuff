@@ -167,3 +167,47 @@ def test_list_wordlists_next_hints_target_both_launchers():
 def test_list_wordlists_is_framework_tool():
     from payloads.wordlists import list_wordlists as _lw
     assert getattr(_lw, "_is_framework_tool", False) is True
+
+
+# --- default wordlist resolution --------------------------------------------
+
+def test_resolve_default_wordlists_present():
+    """The three framework defaults resolve to existing absolute paths."""
+    from utils.wordlists import resolve_default_wordlist
+    assert resolve_default_wordlist("ffuf") and Path(resolve_default_wordlist("ffuf")).is_file()
+    assert resolve_default_wordlist("hydra_logins") and Path(resolve_default_wordlist("hydra_logins")).is_file()
+    assert resolve_default_wordlist("hydra_passwords") and Path(resolve_default_wordlist("hydra_passwords")).is_file()
+
+
+def test_resolve_default_wordlist_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", tmp_path)
+    from utils.wordlists import resolve_default_wordlist
+    # Reload the module's resolve path picks up the monkeypatched root since it
+    # references the module-level WORDLISTS_ROOT at call time.
+    assert resolve_default_wordlist("ffuf", root=tmp_path) is None
+
+
+def test_resolve_wordlist_absolute_existing(tmp_path):
+    from utils.wordlists import resolve_wordlist
+    p = tmp_path / "x.txt"; p.write_text("a\n")
+    assert resolve_wordlist(str(p)) == str(p)
+
+
+def test_resolve_wordlist_missing_returns_none(tmp_path):
+    from utils.wordlists import resolve_wordlist
+    assert resolve_wordlist("nope/missing.txt", root=tmp_path) is None
+
+
+def test_list_wordlists_includes_defaults(fake_tree, monkeypatch):
+    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
+    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+    r = list_wordlists()
+    assert set(r["defaults"].keys()) == {"ffuf", "hydra_logins", "hydra_passwords"}
+    # fake_tree contains common.txt and top-usernames-shortlist.txt but NOT
+    # top-passwords-shortlist.txt, so the field must surface both presence
+    # and absence accurately.
+    assert r["defaults"]["ffuf"] is not None
+    assert r["defaults"]["ffuf"].endswith("common.txt")
+    assert r["defaults"]["hydra_logins"] is not None
+    assert r["defaults"]["hydra_logins"].endswith("top-usernames-shortlist.txt")
+    assert r["defaults"]["hydra_passwords"] is None
