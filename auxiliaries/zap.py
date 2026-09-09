@@ -35,6 +35,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import requests
+import requests.adapters
 
 from constants import framework_tool
 
@@ -141,6 +142,22 @@ class ZAPClient:
     def open_url(self, url: str) -> Dict[str, Any]:
         """Load a URL into the session; passive scanner observes it."""
         return self._get("core/action/accessUrl", url=url)
+
+    def send_raw(self, raw_request: str,
+                 follow_redirects: bool = False) -> Dict[str, Any]:
+        """Send a raw HTTP request byte-for-byte through ZAP's HTTP sender.
+
+        Uses the core ``httpSender/action/sendRequest`` endpoint (no add-on
+        required). The sent message is recorded in ZAP history and the
+        passive scanner observes the response, exactly like a proxied
+        request. Returns the standard message envelope (requestHeader /
+        responseHeader / responseBody / id).
+        """
+        return self._get(
+            "httpSender/action/sendRequest",
+            request=raw_request,
+            followRedirects=str(follow_redirects).lower(),
+        )
 
     def spider(self, url: str, max_depth: int = 5, recurse: bool = True) -> str:
         """Start the traditional crawler; returns the scan id (e.g. ``"0"``)."""
@@ -484,3 +501,43 @@ def zap_report(report_format: str = "html",
         report_file=report_file,
         report_title=report_title,
     )
+
+@framework_tool(
+    "Send a raw HTTP request with full control over method, path, headers "
+    "(Host, Cookie, User-Agent, Referer, any custom header) and body, "
+    "through ZAP's HTTP sender. Use this when a target requires a specific "
+    "Host header (vhost-gated apps), session cookies, CSRF tokens, or any "
+    "hand-crafted request that zap_open_url cannot express. The response is "
+    "recorded in ZAP history (grep it with zap_history_regex) and the "
+    "passive scanner observes it.",
+    next_hints=["zap_history_regex", "report_finding"],
+)
+def zap_send_raw(raw_request: str,
+                 follow_redirects: bool = False) -> Dict[str, Any]:
+    """Send a raw HTTP/1.1 request exactly as written.
+
+    First line must be ``METHOD /path HTTP/1.1``; separate headers from the
+    body with one blank line. ``\\n`` line endings are normalized to
+    ``\\r\\n`` before sending, so plain-text requests are wire-legal.
+
+    Args:
+        raw_request: The raw request, e.g. ``"GET / HTTP/1.1\\nHost: "
+            "earth.local\\n\\n"`` -- always include a Host header for
+            vhost-gated targets.
+        follow_redirects: If True, ZAP follows 3xx responses automatically.
+    """
+    lines = raw_request.lstrip().splitlines()
+    if not lines or " HTTP/1." not in lines[0]:
+        raise ValueError(
+            "raw_request must start with 'METHOD /path HTTP/1.1'"
+        )
+    # Model-written requests use \n; the wire needs \r\n. Normalize.
+    wire = raw_request.replace("\r\n", "\n").replace("\n", "\r\n")
+    env = _zap().send_raw(wire, follow_redirects=follow_redirects)
+    return {
+        "message_id": env.get("id", ""),
+        "status": _status_from_headers(env.get("responseHeader", "")),
+        "request_header": env.get("requestHeader", ""),
+        "response_header": env.get("responseHeader", ""),
+        "response_body": env.get("responseBody", ""),
+    }
