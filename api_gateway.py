@@ -1,14 +1,67 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import secrets
+import threading
+import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Any, Optional
 from starlette.routing import Route
+
+# ---------------------------------------------------------------------------
+# Per-request HTTP trace (gap-h root-cause hunt).  Append-only JSONL to
+# /tmp/gw_http_trace.log; one line per event.  Never raises into the request
+# path — instrumentation must not itself become a fault source.
+# ---------------------------------------------------------------------------
+_TRACE_PATH = "/tmp/gw_http_trace.log"
+_trace_lock = threading.Lock()
+_in_flight = 0                       # current accepted-but-not-completed requests
+_op_id_var: contextvars.ContextVar = contextvars.ContextVar("gw_op_id", default=None)
+_disp_result_len_var: contextvars.ContextVar = contextvars.ContextVar(
+    "gw_disp_result_len", default=0
+)
+
+
+def _trace(event: str, **fields) -> None:
+    """Append one structured JSON line to the trace log. Best-effort, never raises."""
+    try:
+        rec = {"event": event, "ts": time.time()}
+        rec.update(fields)
+        line = json.dumps(rec, default=str)
+        with _trace_lock:
+            with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except Exception:
+        logging.getLogger(__name__).debug("trace write failed", exc_info=True)
+
+
+def _get_nested(d, dotted: str):
+    """Best-effort nested key lookup 'a.b.c' on a dict; returns None on any miss."""
+    cur = d
+    for part in dotted.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def _mcp_text(payload) -> list:
+    """Serialize a payload to a single MCP TextContent list and record its
+    byte length for the DISPATCH_DONE trace. Centralizes the json.dumps so
+    every success return path reports response-composition size."""
+    text = json.dumps(payload, default=str)
+    try:
+        _disp_result_len_var.set(len(text.encode("utf-8", "replace")))
+    except Exception:
+        pass
+    return [mcp_types.TextContent(type="text", text=text)]
 
 # MCP transport (low-level server + streamable-HTTP session manager).  The
 # low-level ``Server`` is used on purpose: it advertises an explicit
@@ -35,7 +88,112 @@ class _MCPEndpoint:
         self._sm = session_manager
 
     async def __call__(self, scope, receive, send) -> None:
-        await self._sm.handle_request(scope, receive, send)
+        # Only HTTP requests carry the client-addr + reply-leg signals we want.
+        # Lifespan/non-http scopes pass through uninstrumented.
+        if scope.get("type") != "http":
+            await self._sm.handle_request(scope, receive, send)
+            return
+
+        global _in_flight
+        op_id = uuid.uuid4().hex[:12]
+        client = scope.get("client") or [None, None]
+        client_addr = f"{client[0]}:{client[1]}" if client and client[0] else "unknown"
+        in_flight_before = _in_flight
+        _in_flight += 1
+        t0 = time.monotonic()
+        _trace(
+            "REQUEST_START",
+            op_id=op_id,
+            client_addr=client_addr,
+            in_flight=in_flight_before,
+            http_method=scope.get("method"),
+            path=scope.get("path"),
+        )
+        token = _op_id_var.set(op_id)
+
+        resp_bytes = 0
+        resp_status = None
+        write_ok = True
+        exc_type = None
+
+        async def send_wrap(message):
+            nonlocal resp_bytes, resp_status, write_ok, exc_type
+            try:
+                if message.get("type") == "http.response.start":
+                    resp_status = message.get("status")
+                elif message.get("type") == "http.response.body":
+                    resp_bytes += len(message.get("body") or b"")
+                await send(message)
+            except Exception as e:
+                # Client that timed out and closed its socket surfaces HERE as
+                # ConnectionResetError / BrokenPipeError / similar. This is the
+                # reply-leg-loss signature we are hunting.
+                write_ok = False
+                exc_type = type(e).__name__
+                _trace(
+                    "WRITE_EXC",
+                    op_id=op_id,
+                    exc_type=exc_type,
+                    exc_msg=str(e),
+                    elapsed_ms=round((time.monotonic() - t0) * 1000, 2),
+                    resp_bytes_so_far=resp_bytes,
+                )
+                raise
+
+        async def receive_wrap():
+            msg = await receive()
+            # Parse the JSON-RPC body once on the first http.request chunk to
+            # extract the jsonrpc id, method, and (for tools/call) the tool name
+            # + tool_id. Best-effort: never break the request on a parse miss.
+            if msg.get("type") == "http.request":
+                body = msg.get("body") or b""
+                try:
+                    rpc = json.loads(body) if body else None
+                    cand = None
+                    batch_n = None
+                    if isinstance(rpc, dict):
+                        cand = rpc
+                    elif isinstance(rpc, list) and rpc and isinstance(rpc[0], dict):
+                        cand = rpc[0]
+                        batch_n = len(rpc)
+                    if cand is not None:
+                        _trace(
+                            "REQUEST_PARSED",
+                            op_id=op_id,
+                            batch=batch_n,
+                            jsonrpc_id=cand.get("id"),
+                            rpc_method=cand.get("method"),
+                            tool=_get_nested(cand, "params.name"),
+                            tool_id=_get_nested(cand, "params.arguments.tool_id"),
+                        )
+                except Exception:
+                    _trace("REQUEST_PARSE_FAIL", op_id=op_id, body_len=len(body))
+            return msg
+
+        try:
+            await self._sm.handle_request(scope, receive_wrap, send_wrap)
+        except Exception as e:
+            _trace(
+                "HANDLER_EXC",
+                op_id=op_id,
+                exc_type=type(e).__name__,
+                exc_msg=str(e),
+                elapsed_ms=round((time.monotonic() - t0) * 1000, 2),
+            )
+            raise
+        finally:
+            _in_flight -= 1
+            _op_id_var.reset(token)
+            _trace(
+                "RESPONSE_DONE",
+                op_id=op_id,
+                elapsed_ms=round((time.monotonic() - t0) * 1000, 2),
+                response_bytes=resp_bytes,
+                status=resp_status,
+                write_completed=write_ok,
+                exc_type=exc_type,
+                in_flight_after=_in_flight,
+            )
 
 from daharness import ToolRegistry, OllamaEmbeddingFunction
 
@@ -383,6 +541,17 @@ class APIGateway:
         async def call_tool(name: str, arguments: dict) -> Any:
             # Every branch dispatches to the same code the REST handlers call,
             # so REST and MCP stay behaviourally identical.
+            dispatch_id = uuid.uuid4().hex[:12]
+            linked_op = _op_id_var.get()
+            disp_t0 = time.monotonic()
+            _trace(
+                "DISPATCH_START",
+                dispatch_id=dispatch_id,
+                op_id=linked_op,
+                tool=name,
+                tool_id=arguments.get("tool_id"),
+            )
+            _disp_result_len_var.set(0)
             try:
                 if name == TOOL_SEARCH:
                     intent = arguments.get("intent")
@@ -397,7 +566,7 @@ class APIGateway:
                         self.tool_registry.describe_manifest(m, lean=True) for m in manifests
                     ]
                     payload = {"intent": intent, "candidates": candidates}
-                    return [mcp_types.TextContent(type="text", text=json.dumps(payload, default=str))]
+                    return _mcp_text(payload)
 
                 if name == TOOL_EXECUTE:
                     tool_id = arguments.get("tool_id")
@@ -443,7 +612,7 @@ class APIGateway:
                         "tool_name": manifest.external_sanitized_description,
                         "result": result,
                     }
-                    return [mcp_types.TextContent(type="text", text=json.dumps(payload, default=str))]
+                    return _mcp_text(payload)
 
                 if name == MEMORY_SEARCH:
                     namespace = arguments.get("namespace")
@@ -458,7 +627,7 @@ class APIGateway:
                         self.memory_service.search,
                         namespace=namespace, query_text=query_text, agent_id=agent_id,
                     )
-                    return [mcp_types.TextContent(type="text", text=json.dumps(result, default=str))]
+                    return _mcp_text(result)
 
                 if name == MEMORY_RECALL:
                     namespace = arguments.get("namespace")
@@ -476,12 +645,21 @@ class APIGateway:
                         limit=limit,
                         agent_id=agent_id,
                     )
-                    return [mcp_types.TextContent(type="text", text=json.dumps(result, default=str))]
+                    return _mcp_text(result)
 
                 return self._error(f"Unknown MCP tool: {name}")
             except Exception as exc:  # noqa: BLE001 - surface to the MCP client
                 logger.error("[gateway] MCP call_tool '%s' failed: %s", name, exc, exc_info=True)
                 return self._error(f"{name}: {exc}")
+            finally:
+                _trace(
+                    "DISPATCH_DONE",
+                    dispatch_id=dispatch_id,
+                    op_id=linked_op,
+                    tool=name,
+                    dispatch_ms=round((time.monotonic() - disp_t0) * 1000, 2),
+                    result_bytes=_disp_result_len_var.get(),
+                )
 
     # --- Arg validation helpers (mirror _normalize_args_against_manifest) -----
 
