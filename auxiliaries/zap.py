@@ -155,20 +155,23 @@ class ZAPClient:
         responseHeader / responseBody / id).
         """
         try:
-            return self._get(
+            resp = self._get(
                 "httpSender/action/sendRequest",
                 request=raw_request,
                 followRedirects=str(follow_redirects).lower(),
             )
+            # core/action/sendRequest wraps the message envelope under a
+            # "sendRequest" key; return the envelope itself.
+            if isinstance(resp, dict) and "sendRequest" in resp:
+                return resp["sendRequest"]
+            return resp
         except requests.HTTPError as e:
-            resp = getattr(e, "response", None)
-            body = resp.text[:2000] if resp is not None else ""
-            return {
-                "error": True,
-                "status": resp.status_code if resp is not None else None,
-                "zap_error_body": body,
-                "hint": "ZAP rejected sendRequest before it reached the target; zap_error_body holds the API's own reason. Adjust the request shape and retry.",
-            }
+            # 400 Bad Request is returned if the raw request is malformed.
+            if e.response is not None and e.response.status_code == 400:
+                raise ValueError(
+                    f"ZAP rejected the raw request: {e.response.text[:2000]}"
+                ) from e
+            raise 
 
     def spider(self, url: str, max_depth: int = 5, recurse: bool = True) -> str:
         """Start the traditional crawler; returns the scan id (e.g. ``"0"``)."""
@@ -598,6 +601,8 @@ def zap_send_raw(raw_request: str,
     # Model-written requests use \n; the wire needs \r\n. Normalize.
     wire = raw_request.replace("\r\n", "\n").replace("\n", "\r\n")
     env = _zap().send_raw(wire, follow_redirects=follow_redirects)
+    if env.get("error"):
+        return {"error": env["error"]}
     return {
         "message_id": env.get("id", ""),
         "status": _status_from_headers(env.get("responseHeader", "")),
