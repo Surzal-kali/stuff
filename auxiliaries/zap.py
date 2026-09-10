@@ -148,7 +148,7 @@ class ZAPClient:
                  follow_redirects: bool = False) -> Dict[str, Any]:
         """Send a raw HTTP request byte-for-byte through ZAP's HTTP sender.
 
-        Uses the core ``httpSender/action/sendRequest`` endpoint (no add-on
+        Uses the core ``core/action/sendRequest`` endpoint (no add-on
         required). The sent message is recorded in ZAP history and the
         passive scanner observes the response, exactly like a proxied
         request. Returns the standard message envelope (requestHeader /
@@ -156,7 +156,7 @@ class ZAPClient:
         """
         try:
             resp = self._get(
-                "httpSender/action/sendRequest",
+                "core/action/sendRequest",
                 request=raw_request,
                 followRedirects=str(follow_redirects).lower(),
             )
