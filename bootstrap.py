@@ -113,6 +113,15 @@ class FrameworkLoader:
             # Distinguish the two by whether the RPC client actually connected.
             if process is not None:
                 self.active_tasks.append(process)
+                # start_mcp redirects msfrpcd stdout/stderr to
+                # /tmp/msfconsole_mcp.log and stashes the writer fd on the
+                # client instance. Register it under the process id so stop()
+                # closes it once the process is reaped (same pattern as the
+                # ZAP daemon's /tmp/zap.log writer).
+                msf_log_fd = getattr(metasploit_client, "_msf_log_fd", None)
+                if msf_log_fd is not None:
+                    self._child_log_fds = getattr(self, "_child_log_fds", {})
+                    self._child_log_fds[id(process)] = msf_log_fd
             if not getattr(metasploit_client, 'client', None):
                 logger.warning("[!] MSF RPC client not connected; skipping tool discovery.")
                 return process

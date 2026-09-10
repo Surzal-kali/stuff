@@ -144,6 +144,13 @@ class MetasploitClient:
             launched_process = None
             if not stdout:
                 print("[i] msfrpcd is not running; launching it...")
+                # Stream msfrpcd's output to a log file so models can read back
+                # the console stdout/stderr via the read_logs('msf') tool. The
+                # old code piped to PIPE, which was never drained, so the tool
+                # always reported the log missing. Append-mode keeps history
+                # across framework restarts (matches the Brain/ZAP pattern in
+                # bootstrap.start_brain_server / start_zap_daemon).
+                msf_log = open("/tmp/msfconsole_mcp.log", "ab")
                 launched_process = await asyncio.create_subprocess_exec(
                     self.mcp_path,
                     "-U", user,
@@ -151,11 +158,16 @@ class MetasploitClient:
                     "-S",
                     "-a", host,
                     "-p", str(port),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=msf_log,
+                    stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                 )
+                # Track the log fd so bootstrap.stop() can close it when it
+                # reaps this process -- otherwise the fd leaks for the
+                # lifetime of the interpreter. bootstrap.register_child_log_fd
+                # picks this up via start_metasploit_mcp.
+                self._msf_log_fd = msf_log
             else:
                 print("[i] msfrpcd already running; connecting to it...")
 

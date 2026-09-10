@@ -212,15 +212,60 @@ class ZAPClient:
         self,
         base_url: Optional[str] = None,
         risk_id: Optional[int] = None,
+        summary: bool = True,
+        max_alerts: int = 50,
     ) -> List[Dict[str, Any]]:
         """List all alerts raised (optionally filtered by URL prefix and risk
-        level: 0 informational, 1 low, 2 medium, 3 high, 4 informational)."""
+        level: 0 informational, 1 low, 2 medium, 3 high, 4 informational).
+
+        ZAP alert objects are huge -- each carries multi-paragraph ``desc``,
+        ``solution``, a ``reference`` URL block, a full ``instance`` array of
+        every occurrence, plus ``attack``/``evidence``/``other`` payloads. A
+        modest scan of 40 alerts is 100KB+ of JSON, which dominates the model
+        context window. By default we project each alert down to the compact
+        triage fields the model needs to *prioritise* (id, name, risk,
+        confidence, cweid, count, first occurrence url/param/method/evidence).
+        Pass ``summary=False`` for the raw ZAP objects, or use
+        ``zap_alert_message`` to drill into a single alert's full metadata +
+        HTTP wire bytes.
+        """
         q: Dict[str, Any] = {}
         if base_url:
             q["baseurl"] = base_url
         if risk_id is not None:
             q["riskId"] = risk_id
-        return self._get("alert/view/alerts", **q).get("alerts", [])
+        raw = self._get("alert/view/alerts", **q).get("alerts", [])
+        if not summary:
+            return raw
+        projected: List[Dict[str, Any]] = []
+        for a in raw[:max_alerts]:
+            inst = a.get("instance") or []
+            first = inst[0] if inst else {}
+            projected.append({
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "riskcode": a.get("riskcode"),
+                "risk": a.get("risk"),
+                "confidence": a.get("confidence"),
+                "cweid": a.get("cweid"),
+                "count": a.get("count"),
+                "occurrences": len(inst),
+                "url": first.get("uri", ""),
+                "method": first.get("method", ""),
+                "param": first.get("param", ""),
+                # Cap evidence so a giant reflected payload can't blow up a
+                # single summary record; the full bytes live in zap_alert_message.
+                "evidence": (first.get("evidence", "") or "")[:120],
+            })
+        if len(raw) > max_alerts:
+            projected.append({
+                "_truncated": True,
+                "_total_alerts": len(raw),
+                "_returned": max_alerts,
+                "_hint": "call zap_alerts again with max_alerts raised, or "
+                         "filter by risk_id, to see more",
+            })
+        return projected
 
     def alert_message(self, alert_id: str) -> Dict[str, Any]:
         """Return the alert metadata AND the full HTTP message that triggered it.
@@ -493,17 +538,33 @@ def zap_active_scan_status(scan_id: str) -> Dict[str, Any]:
     next_hints=["zap_alert_message", "report_finding"],
 )
 def zap_alerts(base_url: Optional[str] = None,
-               risk_id: Optional[int] = None) -> List[Dict[str, Any]]:
+               risk_id: Optional[int] = None,
+               summary: bool = True,
+               max_alerts: int = 50) -> List[Dict[str, Any]]:
     """List all ZAP alerts raised during the session, with optional filtering.
 
     Risk levels: 0 informational, 1 low, 2 medium, 3 high, 4 informational
     (ZAP uses 0 and 4 for different informational buckets).
 
+    By default returns a COMPACT summary per alert (id, name, risk,
+    confidence, cweid, count, first occurrence url/param/method/evidence) so
+    a large scan doesn't fill the context window. Set ``summary=False`` for
+    the raw, verbose ZAP alert objects (multi-paragraph desc/solution/
+    references, full instance arrays) -- expensive, use sparingly. To drill
+    into one alert's full detail + the HTTP request/response that triggered
+    it, call ``zap_alert_message`` with the alert's ``id``.
+
     Args:
         base_url: Optional URL prefix to filter by (e.g. ``http://192.168.90.110``).
         risk_id: Optional minimum risk level (0-4). Returns ALL alerts when None.
+        summary: If True (default), return compact triage records. If False,
+            return the full raw ZAP alert objects.
+        max_alerts: Cap on the number of alerts returned (default 50). Only
+            applies in summary mode. A ``_truncated`` marker is appended when
+            more alerts exist; raise this or filter by ``risk_id`` to page.
     """
-    return _zap().alerts(base_url=base_url, risk_id=risk_id)
+    return _zap().alerts(base_url=base_url, risk_id=risk_id,
+                        summary=summary, max_alerts=max_alerts)
 
 
 @framework_tool(
