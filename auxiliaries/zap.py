@@ -33,10 +33,11 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import requests
 import requests.adapters
+from urllib3.util.retry import Retry
 
 from constants import framework_tool
 
@@ -104,7 +105,7 @@ class ZAPClient:
         self.session = requests.Session()
         # Tiny retry budget for the daemon's first few seconds after launch --
         # the API can return 503 briefly while ZAP is initialising its DB.
-        retry = requests.adapters.Retry(
+        retry = Retry(
             total=5, backoff_factor=0.5,
             status_forcelist=(502, 503, 504),
             allowed_methods=frozenset(["GET"]),
@@ -163,8 +164,12 @@ class ZAPClient:
             # core/action/sendRequest wraps the message envelope under a
             # "sendRequest" key; return the envelope itself.
             if isinstance(resp, dict) and "sendRequest" in resp:
-                return resp["sendRequest"]
-            return resp
+                inner = resp["sendRequest"]
+                # some ZAP builds return the envelope(s) as a list.
+                if isinstance(inner, list) and inner:
+                    return inner[0]
+                resp = inner
+            return cast(Dict[str, Any], resp)
         except requests.HTTPError as e:
             # 400 Bad Request is returned if the raw request is malformed.
             if e.response is not None and e.response.status_code == 400:
