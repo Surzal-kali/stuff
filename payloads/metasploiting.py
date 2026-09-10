@@ -653,7 +653,15 @@ class MetasploitClient:
             # this pymetasploit3 client (it serializes AutoLoadExtensions as a
             # non-scalar and MSF rejects it with "Invalid module option value
             # for AutoLoadExtensions: must be a scalar").
-            if mtype == "exploit" and payload_name:
+            # Interact-class exemption: module.payloads LIES for
+            # cmd_interact modules. vsftpd_234_backdoor declares PayloadType
+            # 'cmd_interact' and MSF's own docs set PAYLOAD cmd/unix/interact,
+            # yet msfrpc's compatible_payloads list omits it — so the generic
+            # compat check below false-negatives the ONE payload that works
+            # and makes the module unrunnable. The interact guard above has
+            # already sanitized/forced the correct payload for these modules,
+            # so skip the compat check entirely for them.
+            if mtype == "exploit" and payload_name and module_path not in INTERACT_FORCE_MODULES:
                 # Hard-block meterpreter payloads: pymetasploit3 serializes the
                 # meterpreter AutoLoadExtensions option as a non-scalar, and MSF
                 # rejects the whole launch with "Invalid module option value for
