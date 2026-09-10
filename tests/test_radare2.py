@@ -363,6 +363,77 @@ class TestEnvelope:
         assert r["status"] == "ok"
         assert r["command"] == "aaa; axf @ main"
 
+    def test_axf_empty_on_function_flag(self, crackme_bin):
+        """axf is broken on function-flag targets in r2 >=6.x: it returns
+        empty even when the function clearly makes calls.  This test
+        documents the known upstream bug so a future r2 fix is detected."""
+        r = run_r2(crackme_bin, "axf", addr="main")
+        assert r["status"] == "ok"
+        assert r["output"].strip() == ""
+
+    def test_pdf_shows_calls_from_main(self, crackme_bin):
+        """The rerouted hint path: pdf on main must show call instructions,
+        proving pdf-and-read-the-calls is the reliable alternative to axf."""
+        r = run_r2(crackme_bin, "pdf", addr="main")
+        assert r["status"] == "ok"
+        assert "call" in r["output"]
+
+    def test_pdg_hint_routes_to_pdf_not_axf(self, crackme_bin):
+        """After pdg, the model should be told to use pdf to see calls,
+        not axf (which is broken on function flags)."""
+        r = run_r2(crackme_bin, "pdf", addr="main")
+        # We can't always guarantee pdg works, so test the hint table
+        # directly instead.
+        from auxiliaries.radare2 import _hints_for
+        hints = _hints_for("pdg", "dummy output")
+        hint_text = " ".join(hints)
+        assert "pdf" in hint_text and "call" in hint_text
+        assert "axf @ <addr> to see what this function calls" not in hint_text
+
+    def test_delta_note_iz_counts_entities_not_lines(self, crackme_bin):
+        """_delta_note must subtract the header + separator for table commands.
+        E.g. iz with 3 strings + header + sep = 5 lines, delta should say 3."""
+        r = run_r2(crackme_bin, "iz")
+        assert r["status"] == "ok"
+        # Data rows in r2 tables start with a digit (the nth index).
+        data_rows = [ln for ln in r["output"].splitlines()
+                     if ln.strip() and ln[0].isdigit()]
+        import re
+        m = re.search(r"found (\d+) string\(s\)", r["delta"])
+        assert m, f"delta didn't match expected pattern: {r['delta']}"
+        assert int(m.group(1)) == len(data_rows), (
+            f"delta said {m.group(1)} strings but {len(data_rows)} data rows found"
+        )
+
+    def test_delta_note_iE_counts_entities_not_lines(self, crackme_bin):
+        """Same +2 fix for iE (exports)."""
+        r = run_r2(crackme_bin, "iE")
+        assert r["status"] == "ok"
+        data_rows = [ln for ln in r["output"].splitlines()
+                     if ln.strip() and ln[0].isdigit()]
+        import re
+        m = re.search(r"(\d+) export\(s\) listed", r["delta"])
+        assert m, f"delta didn't match expected pattern: {r['delta']}"
+        assert int(m.group(1)) == len(data_rows), (
+            f"delta said {m.group(1)} exports but {len(data_rows)} data rows found"
+        )
+
+    def test_delta_note_unit_table_subtracts_two(self):
+        """Unit test _delta_note directly: feed it simulated table output
+        with header + separator + N data rows and verify entity_count == N."""
+        import re
+        from auxiliaries.radare2 import _delta_note
+        for cmd in ("iz", "izz", "iE", "ii", "is", "iS"):
+            lines = ["nth paddr vaddr string", "\u2015" * 20, "0 0x100 hello"]
+            delta = _delta_note(cmd, lines, None)
+            # Extract the leading count from the delta string.
+            m = re.search(r"(\d+)", delta)
+            assert m, f"{cmd}: {delta} has no number"
+            assert int(m.group(1)) == 1, (
+                f"{cmd}: {delta} reported {m.group(1)} instead of 1 entity")
+            assert "3" not in delta, (
+                f"{cmd}: {delta} counted 3 lines instead of 1 entity")
+
     def test_af_command(self, crackme_bin):
         r = run_r2(crackme_bin, "af", addr="main")
         assert r["status"] == "ok"

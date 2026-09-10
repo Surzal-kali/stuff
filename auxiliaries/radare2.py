@@ -451,11 +451,14 @@ def _hints_for(command: str, output: str) -> List[str]:
         hints.append("axt @ <addr> to find callers of this function")
     elif command == "pdg":
         hints.append("pdf @ <same addr> for raw disassembly")
-        hints.append("axf @ <addr> to see what this function calls")
+        hints.append("pdf @ <addr> to see what this function calls (read the call instructions)")
     elif command == "axt":
         hints.append("pdf @ <caller addr> to inspect the calling function")
     elif command == "axf":
+        # axf is broken on function-flag targets in r2 >=6.x (returns empty
+        # even when calls exist); it still works on instruction addresses.
         hints.append("pdf @ <callee addr> to inspect the called function")
+        hints.append("note: axf may return empty on function flags - use pdf to read calls")
     elif command == "afi":
         hints.append("pdf @ <addr> to disassemble this function")
         hints.append("pdg @ <addr> to decompile it")
@@ -712,12 +715,25 @@ def _summarize(command: str, clean_lines: List[str], addr: Optional[str]) -> str
     return f"{command}{loc}: {n} lines — first: {first[:120]}"
 
 
+_TABLE_COMMANDS: frozenset = frozenset({"iz", "izz", "iE", "ii", "is", "iS"})
+
+
 def _delta_note(command: str, clean_lines: List[str], addr: Optional[str]) -> str:
-    """Short note on what this run surfaced (for the model's working memory)."""
+    """Short note on what this run surfaced (for the model's working memory).
+
+    Table-format commands (iz, izz, iE, ii, is, iS) emit a header row and a
+    separator row before the data rows.  We subtract 2 so the reported count
+    reflects actual entities, not raw line count.
+    """
+    # For table commands, drop the header + separator to count real rows.
+    entity_count = (
+        max(0, len(clean_lines) - 2) if command in _TABLE_COMMANDS
+        else len(clean_lines)
+    )
     if command == "afl":
-        return f"discovered {len(clean_lines)} function(s)"
+        return f"discovered {entity_count} function(s)"
     if command in ("izz", "iz"):
-        return f"found {len(clean_lines)} string(s)"
+        return f"found {entity_count} string(s)"
     if command == "iI":
         # grab the arch line if present
         for ln in clean_lines:
@@ -725,13 +741,13 @@ def _delta_note(command: str, clean_lines: List[str], addr: Optional[str]) -> st
                 return f"binary arch: {ln}"
         return "binary metadata returned"
     if command == "iE":
-        return f"{len(clean_lines)} export(s) listed"
+        return f"{entity_count} export(s) listed"
     if command == "ii":
-        return f"{len(clean_lines)} import(s) listed"
+        return f"{entity_count} import(s) listed"
     if command == "is":
-        return f"{len(clean_lines)} symbol(s) listed"
+        return f"{entity_count} symbol(s) listed"
     if command == "iS":
-        return f"{len(clean_lines)} section(s) listed"
+        return f"{entity_count} section(s) listed"
     if command == "axt":
         return f"{len(clean_lines)} xref(s) TO {addr}"
     if command == "axf":
