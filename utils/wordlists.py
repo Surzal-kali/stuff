@@ -39,7 +39,7 @@ WORDLISTS_ROOT: Path = Path(
 COMMON_WORDLISTS: Dict[str, str] = {
     "rockyou.txt": "SecLists/Passwords/Leaked-Databases/rockyou.txt",
     "dirb_common": "SecLists/Discovery/Web-Content/dirb/common.txt",
-    "directory_list_2.3_small": "SecLists/Discovery/Web-Content/directory-list-2.3-small.txt",
+    "directory_list_2.3_small": "SecLists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-small.txt",
     "raft_small_dirs": "SecLists/Discovery/Web-Content/raft-small-directories.txt",
     "names_top": "SecLists/Usernames/top-usernames-shortlist.txt",
 }
@@ -103,20 +103,28 @@ def resolve_default_wordlist(kind: str, root: Optional[Path] = None) -> Optional
 
 
 def _category_from_path(path: Path, root: Path) -> str:
-    """Derive a short category label from the path's first segment under root.
+    """Derive a category label from the path's directory segments under root.
 
-    e.g. ``SecLists/Passwords/Leaked-Databases/rockyou.txt`` -> ``Passwords``.
-    Returns ``"wordlists"`` as a fallback.
+    All directory segments below ``SecLists/`` (up to the parent directory)
+    are joined with ``/`` so deeply nested trees keep their distinguishing
+    segments, e.g. ``SecLists/Discovery/Web-Content/common.txt`` ->
+    ``Discovery/Web-Content`` and
+    ``SecLists/Passwords/Leaked-Databases/rockyou.txt`` ->
+    ``Passwords/Leaked-Databases``.  Non-SecLists paths use every directory
+    segment under root.  Returns ``"wordlists"`` as a fallback.
     """
     try:
         rel = path.relative_to(root)
     except ValueError:
         return "wordlists"
     parts = rel.parts
-    # SecLists/<Category>/... -> Category; otherwise the first dir or root.
+    # Drop the filename; what remains are the directory segments.
+    dirs = parts[:-1]
     if len(parts) >= 2 and parts[0] == "SecLists":
-        return parts[1]
-    return parts[0] if parts else "wordlists"
+        dirs = dirs[1:]  # strip the "SecLists" prefix
+    if not dirs:
+        return "wordlists"
+    return "/".join(dirs)
 
 
 def discover_wordlists(
@@ -145,9 +153,15 @@ def discover_wordlists(
             continue
         if any(part in skip_dirs for part in path.parts):
             continue
+        # 0-byte files (e.g. SecLists CMS/trickest-cms-wordlist/vanilla.txt
+        # and vanilla-all-levels.txt) contain no entries and must never feed
+        # ffuf/hydra — ffuf exits with "could not read wordlist" on them.
+        size = path.stat().st_size
+        if size == 0:
+            continue
         yield {
             "path": str(path),
-            "size": path.stat().st_size,
+            "size": size,
             "category": _category_from_path(path, base),
         }
 

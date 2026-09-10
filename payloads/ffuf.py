@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job, terminate_job
-from utils.wordlists import resolve_default_wordlist
+from utils.wordlists import resolve_default_wordlist, resolve_wordlist
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -267,6 +267,23 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
             }
         wordlist = default_wl
         default_used = True
+
+    # An explicit (non-empty) wordlist must resolve to an existing file —
+    # fail fast before the launch+poll cycle burns time on a path ffuf will
+    # reject with "could not read wordlist".
+    if not default_used:
+        resolved = resolve_wordlist(wordlist)
+        if not resolved:
+            return {
+                "job_id": None,
+                "tool": "ffuf",
+                "status": "error",
+                "error": (
+                    f"Wordlist path does not exist: {wordlist!r}. "
+                    "Call list_wordlists to discover an available wordlist."
+                ),
+            }
+        wordlist = resolved
 
     out_path = os.path.join(
         os.getenv("BG_JOB_LOG_DIR", "/tmp"), f"ffuf_out_{uuid.uuid4().hex[:8]}.json"

@@ -24,6 +24,19 @@ from utils.wordlists import (
 )
 
 
+def _category_matches(filter_str: str, category: str) -> bool:
+    """True if *filter_str* matches the full category or any of its segments.
+
+    Splits the multi-level category (e.g. ``Discovery/Web-Content``) on
+    ``/`` so a filter like ``"web-content"`` matches even though it is only
+    one segment of a deeper label.
+    """
+    cat_lower = category.lower()
+    if filter_str in cat_lower:
+        return True
+    return any(filter_str in seg for seg in cat_lower.split("/"))
+
+
 def _summarize(entries: List[Dict[str, Any]]) -> Dict[str, int]:
     """Per-category counts so the model sees the shape of the catalog."""
     counts: Dict[str, int] = {}
@@ -55,9 +68,10 @@ def list_wordlists(
     ``by_category`` summary is always complete regardless of ``limit``.
 
     Args:
-        category: Optional case-insensitive substring filter on the category
-            label (e.g. ``"Passwords"`` or ``"web-content"``).  ``None``
-            returns all categories.
+        category: Optional case-insensitive filter matched against the
+            category label and any of its ``/``-separated segments (e.g.
+            ``"Passwords"``, ``"web-content"``, or ``"Discovery"`` all match
+            ``Discovery/Web-Content``).  ``None`` returns all categories.
         limit: Maximum number of entries to return (default 200).  The
             category summary is unaffected by this cap.
     """
@@ -71,7 +85,7 @@ def list_wordlists(
 
     entries: List[Dict[str, Any]] = []
     for e in discover_wordlists():
-        if cat_filter and cat_filter not in e.get("category", "").lower():
+        if cat_filter and not _category_matches(cat_filter, e.get("category", "")):
             continue
         entries.append(e)
 
