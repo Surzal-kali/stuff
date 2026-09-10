@@ -335,9 +335,13 @@ class ExecutorMixin:
             # signal failure to the secretary, and we should not relabel
             # it as Success just because it's a dict.
             existing_status = result.get("status")
-            if existing_status in ("Success", "Failed"):
+            if existing_status in ("Success", "Failed", "unknown_delivery"):
                 # Pass through with a stdout fallback so the agent layer
-                # can still surface the human-readable text.
+                # can still surface the human-readable text.  "unknown_delivery"
+                # (send_to_listener) is a third, honest status: the write was
+                # interrupted and we don't know if bytes went out — it must NOT
+                # be relabeled Success or the secretary will narrate a maybe-
+                # failure as a success and skip the read_listener check.
                 wrapped = {
                     "stdout": result.get("stdout") or json.dumps(result, default=str),
                     "status": existing_status,

@@ -208,6 +208,23 @@ class ZAPClient:
         """0..100 progress."""
         return int(self._get("ascan/view/status", scanId=scan_id).get("status", 0))
 
+    def alerts_summary(self, base_url: Optional[str] = None) -> Dict[str, int]:
+        """Number of alerts grouped by risk level (the lightweight triage view).
+
+        Uses ``alert/view/alertsSummary`` so we get just counts — not the giant
+        per-alert objects — which is what ``zap_active_scan_status`` surfaces
+        when a scan reaches 100 so the secretary gets actionable triage in the
+        same poll instead of a bare progress integer with ~0% information.
+        """
+        q: Dict[str, Any] = {}
+        if base_url:
+            q["baseurl"] = base_url
+        raw = self._get("alert/view/alertsSummary", **q)
+        # ZAP wraps the result as {"alertsSummary": {"High": N, ...}} in some
+        # builds and returns the flat dict in others; normalise both.
+        summary = raw.get("alertsSummary", raw)
+        return {k: int(v) for k, v in summary.items() if isinstance(v, (int, str))}
+
     def alerts(
         self,
         base_url: Optional[str] = None,
@@ -525,12 +542,38 @@ def zap_active_scan(target: str, policy: Optional[str] = None) -> Dict[str, str]
     return {"ascan_id": _zap().active_scan(target, policy=policy)}
 
 
-@framework_tool("Get active-scan progress (0..100) for a given ascan_id.")
-def zap_active_scan_status(scan_id: str) -> Dict[str, Any]:
+@framework_tool(
+    "Get active-scan progress (0..100) for a given ascan_id. While the scan "
+    "is running you get just the progress integer (lightweight, safe to poll "
+    "repeatedly). When the scan reaches 100 (done) the response ALSO carries a "
+    "compact alert triage summary — total + counts by risk level (High/Medium/"
+    "Low/Informational) — so you can decide whether to pull details with "
+    "zap_alerts without a second round-trip. No full_output is ever returned "
+    "by this tool; use zap_alerts or zap_report for the detailed payload.",
+    next_hints=["zap_alerts", "zap_report"],
+)
+def zap_active_scan_status(scan_id: str, base_url: Optional[str] = None) -> Dict[str, Any]:
     """Args:
         scan_id: The ascan id returned by ``zap_active_scan``.
+        base_url: Optional URL prefix to scope the done-summary alert counts
+            (e.g. ``http://target``). Defaults to all alerts.
     """
-    return {"ascan_id": scan_id, "status": _zap().active_scan_status(scan_id)}
+    pct = _zap().active_scan_status(scan_id)
+    result: Dict[str, Any] = {
+        "ascan_id": scan_id,
+        "status": pct,
+        "done": pct >= 100,
+    }
+    # T5: only fetch the triage summary once the scan is complete, so a running
+    # poll stays tiny and a completed poll is information-dense. We never
+    # attach full_output here — that's what zap_alerts/zap_report are for.
+    if pct >= 100:
+        try:
+            result["alert_summary"] = _zap().alerts_summary(base_url=base_url)
+        except Exception as e:
+            # The summary is a nicety; never let it mask the status itself.
+            result["alert_summary_error"] = str(e)
+    return result
 
 
 @framework_tool(
