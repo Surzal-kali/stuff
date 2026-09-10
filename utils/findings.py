@@ -111,24 +111,40 @@ def report_finding(
     "severity (P1/P2/P3/P4) or asset substring. Useful for reviewing progress "
     "mid-session or generating a submission draft at the end of an engagement. "
     "The report is also written to a timestamped .md file under findings_md/ "
-    "so it persists outside the database."
+    "so it persists outside the database. Pass status='open' (or "
+    "include_closed=False) to render only the current state — open "
+    "findings with closed/duplicate/false-positive/superseded entries "
+    "hidden, which is the 'current state only' report."
 )
-def render_findings(severity: str = "", asset: str = "") -> str:
+def render_findings(
+    severity: str = "",
+    asset: str = "",
+    status: str = "",
+    include_closed: bool = True,
+) -> str:
     """Render findings from the store as a markdown report.
 
     Args:
         severity: Filter to a specific severity (P1/P2/P3/P4). Empty = all.
         asset: Filter to findings whose asset contains this substring. Empty = all.
+        status: Filter to a specific lifecycle status
+                (open|closed|superseded|false_positive|duplicate). Empty = all.
+        include_closed: When False, only 'open' findings are shown
+                        regardless of status — the 'current state' report.
     """
     store = FindingStore()
     try:
         md = store.render_markdown(
             severity=severity or None,
             asset=asset or None,
+            status=status or None,
+            include_closed=include_closed,
         )
         out_path = store.write_markdown(
             severity=severity or None,
             asset=asset or None,
+            status=status or None,
+            include_closed=include_closed,
         )
         return (
             f"{md}\n\n"
@@ -147,8 +163,10 @@ def render_findings(severity: str = "", asset: str = "") -> str:
     "when a finding turns out to be a false positive, a duplicate of another "
     "finding, or simply resolved/no longer relevant. Pass the finding ID "
     "(e.g. F-008) and one of: closed, false_positive, duplicate, open (to "
-    "reopen). Optionally provide a reason and your agent/role name so other "
-    "agents can see who closed it and why. Returns the updated finding.",
+    "reopen). For status='duplicate', pass duplicate_of with the ID of the "
+    "canonical finding it duplicates so the report can link them. Optionally "
+    "provide a reason and your agent/role name so other agents can see who "
+    "closed it and why. Returns the updated finding.",
     next_hints=["render_findings"],
 )
 def close_finding(
@@ -156,6 +174,7 @@ def close_finding(
     status: str,
     reason: str = "",
     closed_by: str = "",
+    duplicate_of: str = "",
 ) -> str:
     """Close or change the status of a finding.
 
@@ -164,14 +183,22 @@ def close_finding(
         status: New status — one of: closed, false_positive, duplicate, open.
         reason: Free-text explanation for the closure.
         closed_by: Agent name or role that closed it (for audit trail).
+        duplicate_of: When status is 'duplicate', the ID of the canonical
+                      finding this one duplicates (e.g. "F-003"). Stored as
+                      the superseded_by pointer so the report links them.
     """
     store = FindingStore()
     try:
+        if status == "duplicate":
+            supersede_target = duplicate_of or None
+        else:
+            supersede_target = None
         updated = store.update_status(
             finding_id=finding_id,
             status=status,
             closed_by=closed_by or None,
             closed_reason=reason or None,
+            superseded_by=supersede_target,
         )
         if updated is None:
             return f"Finding {finding_id} not found. Use render_findings to see all findings and their IDs."

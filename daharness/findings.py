@@ -217,15 +217,16 @@ class FindingStore:
         if finding is None:
             return None
 
-        # Validate supersede target
+        # Validate supersede / duplicate target
         if status == "superseded":
             if not superseded_by:
                 raise ValueError("superseded_by is required when status is 'superseded'")
+        if status in ("superseded", "duplicate") and superseded_by:
             replacement = self.get(superseded_by)
             if replacement is None:
-                raise ValueError(f"Supersede target {superseded_by} does not exist")
+                raise ValueError(f"Target finding {superseded_by} does not exist")
             if superseded_by == finding_id:
-                raise ValueError("A finding cannot supersede itself")
+                raise ValueError("A finding cannot reference itself")
 
         # Prevent circular supersede chains
         if superseded_by and superseded_by != finding_id:
@@ -238,15 +239,30 @@ class FindingStore:
 
         ts = datetime.now(timezone.utc).isoformat()
         with self.conn:
-            self.conn.execute(
-                """
-                UPDATE findings
-                SET status = ?, superseded_by = ?, closed_by = ?,
-                    closed_reason = ?, closed_ts = ?
-                WHERE id = ?
-                """,
-                (status, superseded_by, closed_by, closed_reason, ts, finding_id),
-            )
+            if status == "open":
+                # Reopening: clear the closure audit trail so we don't
+                # overwrite the original closed_ts with the reopen time
+                # and leave dangling closed_by / superseded_by pointers.
+                self.conn.execute(
+                    """
+                    UPDATE findings
+                    SET status = 'open', superseded_by = NULL,
+                        closed_by = NULL, closed_reason = NULL,
+                        closed_ts = NULL
+                    WHERE id = ?
+                    """,
+                    (finding_id,),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE findings
+                    SET status = ?, superseded_by = ?, closed_by = ?,
+                        closed_reason = ?, closed_ts = ?
+                    WHERE id = ?
+                    """,
+                    (status, superseded_by, closed_by, closed_reason, ts, finding_id),
+                )
         return self.get(finding_id)
 
     def supersede(

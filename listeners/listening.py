@@ -45,6 +45,11 @@ class ListenerDataStore:
                 "size": len(data),
                 "ts": time.time(),
             })
+            # FIFO cap: long-lived listeners never accumulate unbounded
+            # history (each chunk is stored twice — hex + text — so this
+            # bounds memory). Drop oldest, keep the most recent 500.
+            if len(self._entries) > 500:
+                del self._entries[: len(self._entries) - 500]
 
     def poll(
         self, handle: str = "", since: float = 0.0, limit: int = 0,
@@ -174,12 +179,12 @@ class TCPListener:
 
                     await self.send_to_brain("data_received", session_id, message)
 
-                    # Echo back so basic clients get a response. For reverse
-                    # shells you typically want to use send_to_listener to
-                    # drive the session instead of this auto-echo.
-                    response = f"Session {session_id} acknowledged: {message}\n"
-                    writer.write(response.encode())
-                    await writer.drain()
+                    # NOTE: no auto-echo. With read-back in place, echoing
+                    # received bytes back into the socket creates a feedback
+                    # loop when the peer is a shell (the echo is parsed as a
+                    # command, re-read, re-echoed...). Drive the session with
+                    # send_to_listener instead; read responses with
+                    # read_listener.
 
         except ConnectionResetError:
             print(f"[-] Session {addr} forcibly closed by remote host.")
@@ -304,13 +309,15 @@ class TCPListener:
         accepted_handle_kinds=["listener"],
         next_hints=["send_to_listener"],
     )
-    def read_listener(self, handle: str = "", since: float = 0.0, limit: int = 0):
+    def read_listener(self, handle: str = "", since: float = 0.0, limit: int = 50):
         """Retrieve data received by a listener (or all listeners).
 
         Args:
             handle: 'listener:' handle to filter, or empty for all listeners.
             since:  Only entries at or after this Unix timestamp (0 = all).
-            limit:  If > 0, return at most the last N matching entries.
+            limit:  If > 0, return at most the last N matching entries
+                   (default 50; pass 0 for unlimited — not recommended on
+                   long-lived listeners).
         """
         entries = _data_store.poll(handle=handle, since=since, limit=limit)
         clients = _data_store.list_clients(handle=handle) if handle else _data_store.list_clients()
