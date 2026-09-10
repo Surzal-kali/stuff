@@ -304,21 +304,63 @@ class ZAPClient:
         return self._get("core/view/sites").get("sites", [])
 
     def sites_tree(self, url: Optional[str] = None) -> str:
-        """Full tree as JSON string. Pass ``url`` to scope to a subtree."""
+        """Full discovered-URL hierarchy as a JSON string.
+
+        ZAP 2.17 removed ``core/view/sitesTree`` (it returns ``BAD_VIEW`` /
+        HTTP 400 on every call), so we reconstruct the tree client-side from
+        ``core/view/urls``, which returns every URL the session has seen.
+        Pass ``url`` to scope to a single subtree via ZAP's ``baseurl``
+        filter.
+
+        The returned shape is ``{"sites": {host: {path: {...}}}}`` -- a
+        nested dict keyed by ``scheme://host:port`` then by path segments,
+        with a ``"__urls__"`` leaf listing the full URLs that terminate each
+        node. This mirrors the old native tree well enough for triage.
+
+        ``url`` is lenient: a bare host (``"192.168.90.110"``) or a host with
+        a port but no scheme is normalised to ``http://...`` so it matches
+        the ``baseurl`` prefix filter ZAP applies server-side. A leading
+        scheme is preserved; trailing slashes are kept since ZAP's filter is
+        a plain prefix match.
+        """
+        from urllib.parse import urlsplit
+
+        q: Dict[str, Any] = {}
+        if url:
+            u = url.strip()
+            # Accept bare hosts ("192.168.90.110") and "host:port" forms that
+            # lack a scheme; urlsplit mis-parses those (host -> path), so we
+            # prepend a default scheme before handing to baseurl.
+            if "://" not in u:
+                u = "http://" + u
+            q["baseurl"] = u
         try:
-            if url:
-                return self._get("core/view/sitesTree", url=url, expect_json=False)
-            return self._get("core/view/sitesTree", expect_json=False)
+            urls = self._get("core/view/urls", **q).get("urls", [])
         except requests.HTTPError as e:
             resp = getattr(e, "response", None)
             body = resp.text[:2000] if resp is not None else ""
-            # The flat site list keeps target visibility alive even when the
-            # tree view is rejected by this ZAP build.
             return json.dumps({
                 "error": True,
                 "zap_error_body": body,
                 "fallback_sites": self.sites(),
             })
+
+        tree: Dict[str, Any] = {}
+        for raw in urls:
+            try:
+                parts = urlsplit(raw)
+            except ValueError:
+                continue
+            if not parts.scheme or not parts.netloc:
+                continue
+            root = f"{parts.scheme}://{parts.netloc}"
+            node = tree.setdefault(root, {})
+            segments = [s for s in parts.path.split("/") if s]
+            for seg in segments:
+                node = node.setdefault(seg, {})
+            node.setdefault("__urls__", []).append(raw)
+
+        return json.dumps({"sites": tree}, indent=2)
 
     def report(
         self,
