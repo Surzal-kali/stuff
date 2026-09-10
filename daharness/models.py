@@ -116,6 +116,16 @@ class Finding(BaseModel):
     tool_chain: List[str] = Field(default_factory=list)
     memory_ref: Optional[str] = None
     ts: str = Field(..., description="ISO-8601 timestamp")
+    # Lifecycle: lets other agents close, supersede, or de-duplicate findings
+    # they (or a peer) reported earlier.  ``status`` defaults to "open" on
+    # new findings; ``superseded_by`` holds the ID of the replacement finding
+    # when status is "superseded".  ``closed_reason`` is a free-text note set
+    # by whichever agent closed it.
+    status: str = Field(default="open", description="open|closed|superseded|false_positive|duplicate")
+    superseded_by: Optional[str] = Field(default=None, description="ID of the finding that replaces this one")
+    closed_by: Optional[str] = Field(default=None, description="Agent/role that closed this finding")
+    closed_reason: Optional[str] = Field(default=None, description="Free-text explanation for the closure")
+    closed_ts: Optional[str] = Field(default=None, description="ISO-8601 timestamp of closure")
 
 
 __all__ = ["ToolManifest", "Finding"]

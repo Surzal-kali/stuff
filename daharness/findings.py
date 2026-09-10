@@ -76,6 +76,26 @@ class FindingStore:
             )
             """
         )
+        # --- migrations: add lifecycle columns to pre-existing tables ---
+        # ALTER TABLE ... ADD COLUMN is idempotent-safe: we check the existing
+        # columns first and only add the ones that are missing.  This lets the
+        # store work on both fresh databases and ones with legacy schema.
+        existing_cols = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(findings)").fetchall()
+        }
+        migrations = [
+            ("status", "TEXT NOT NULL DEFAULT 'open'"),
+            ("superseded_by", "TEXT"),
+            ("closed_by", "TEXT"),
+            ("closed_reason", "TEXT"),
+            ("closed_ts", "TEXT"),
+        ]
+        for col_name, col_def in migrations:
+            if col_name not in existing_cols:
+                self.conn.execute(
+                    f"ALTER TABLE findings ADD COLUMN {col_name} {col_def}"
+                )
         self.conn.commit()
 
     # -- write --------------------------------------------------------------
@@ -119,8 +139,9 @@ class FindingStore:
                     self.conn.execute(
                         """
                         INSERT INTO findings
-                            (id, title, severity, cwe, asset, evidence, repro, tool_chain, memory_ref, ts)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (id, title, severity, cwe, asset, evidence, repro,
+                             tool_chain, memory_ref, ts, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                         """,
                         (
                             finding.id,
@@ -161,6 +182,123 @@ class FindingStore:
         ).fetchone()
         return self._row_to_finding(row) if row else None
 
+    # -- lifecycle (close / supersede / reopen) ----------------------------
+
+    _VALID_STATUSES = {"open", "closed", "superseded", "false_positive", "duplicate"}
+
+    def update_status(
+        self,
+        finding_id: str,
+        status: str,
+        closed_by: Optional[str] = None,
+        closed_reason: Optional[str] = None,
+        superseded_by: Optional[str] = None,
+    ) -> Optional[Finding]:
+        """Update the lifecycle status of a finding.
+
+        Args:
+            finding_id: The finding ID (e.g. ``F-008``).
+            status: One of open|closed|superseded|false_positive|duplicate.
+            closed_by: Who/what closed it (agent name, role, etc.).
+            closed_reason: Free-text explanation.
+            superseded_by: When status is "superseded", the ID of the
+                replacement finding.  The target finding must exist.
+
+        Returns the updated :class:`Finding`, or ``None`` if not found.
+        Raises ``ValueError`` for an invalid status or bad supersede target.
+        """
+        if status not in self._VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status {status!r}. Must be one of: "
+                f"{', '.join(sorted(self._VALID_STATUSES))}"
+            )
+
+        finding = self.get(finding_id)
+        if finding is None:
+            return None
+
+        # Validate supersede target
+        if status == "superseded":
+            if not superseded_by:
+                raise ValueError("superseded_by is required when status is 'superseded'")
+            replacement = self.get(superseded_by)
+            if replacement is None:
+                raise ValueError(f"Supersede target {superseded_by} does not exist")
+            if superseded_by == finding_id:
+                raise ValueError("A finding cannot supersede itself")
+
+        # Prevent circular supersede chains
+        if superseded_by and superseded_by != finding_id:
+            chain = self._supersede_chain(superseded_by)
+            if finding_id in chain:
+                raise ValueError(
+                    f"Circular supersede: {superseded_by} is itself superseded "
+                    f"(directly or transitively) by {finding_id}"
+                )
+
+        ts = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE findings
+                SET status = ?, superseded_by = ?, closed_by = ?,
+                    closed_reason = ?, closed_ts = ?
+                WHERE id = ?
+                """,
+                (status, superseded_by, closed_by, closed_reason, ts, finding_id),
+            )
+        return self.get(finding_id)
+
+    def supersede(
+        self,
+        old_id: str,
+        new_id: str,
+        closed_by: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> dict:
+        """Mark ``old_id`` as superseded by ``new_id``.
+
+        This is the common case: an agent reports a refined/corrected finding
+        and wants to close the older one with a pointer to the replacement.
+        Both findings must already exist in the store.
+
+        Returns ``{old: Finding, new: Finding}`` as dicts for convenience.
+        """
+        old = self.get(old_id)
+        if old is None:
+            raise ValueError(f"Finding {old_id} not found")
+        new = self.get(new_id)
+        if new is None:
+            raise ValueError(f"Finding {new_id} not found")
+        if old_id == new_id:
+            raise ValueError("A finding cannot supersede itself")
+
+        updated = self.update_status(
+            old_id,
+            status="superseded",
+            closed_by=closed_by,
+            closed_reason=reason or f"Superseded by {new_id}",
+            superseded_by=new_id,
+        )
+        return {"old": updated, "new": new}
+
+    def _supersede_chain(self, finding_id: str) -> set:
+        """Return the set of all IDs that ``finding_id`` is superseded by
+        (transitively), for circular-chain detection."""
+        seen = set()
+        current = finding_id
+        while current:
+            if current in seen:
+                break  # already detected a cycle in the existing chain
+            seen.add(current)
+            row = self.conn.execute(
+                "SELECT superseded_by FROM findings WHERE id = ?", (current,)
+            ).fetchone()
+            current = row["superseded_by"] if row else None
+        return seen
+
+    # -- read (with status awareness) ---------------------------------------
+
     def count(self) -> int:
         cur = self.conn.execute("SELECT COUNT(*) FROM findings")
         return cur.fetchone()[0]
@@ -168,11 +306,20 @@ class FindingStore:
     # -- render -------------------------------------------------------------
 
     def render_markdown(
-        self, severity: Optional[str] = None, asset: Optional[str] = None
+        self,
+        severity: Optional[str] = None,
+        asset: Optional[str] = None,
+        status: Optional[str] = None,
+        include_closed: bool = True,
     ) -> str:
         """Render findings as a markdown report.
 
-        Optionally filter by severity (e.g. ``"P1"``) or asset substring.
+        Optionally filter by severity (e.g. ``"P1"``), asset substring, or
+        status (e.g. ``"open"``).  When ``include_closed`` is ``False``,
+        only open findings are shown regardless of the ``status`` filter —
+        useful for a "current state" report that hides superseded / false
+        positive / duplicate entries.
+
         The output is suitable as a bug-bounty submission draft or lab
         documentation.
         """
@@ -181,29 +328,55 @@ class FindingStore:
             findings = [f for f in findings if f.severity == severity]
         if asset:
             findings = [f for f in findings if asset.lower() in f.asset.lower()]
+        if status:
+            findings = [f for f in findings if f.status == status]
+        if not include_closed:
+            findings = [f for f in findings if f.status == "open"]
 
         if not findings:
             return "_(no findings reported yet)_"
 
-        lines = [f"# Findings Report ({len(findings)} finding(s))", ""]
+        # Status breakdown for the header
+        open_count = sum(1 for f in findings if f.status == "open")
+        closed_count = len(findings) - open_count
+        header = f"# Findings Report ({len(findings)} finding(s)"
+        if closed_count:
+            header += f", {open_count} open / {closed_count} closed"
+        header += ")"
+
+        lines = [header, ""]
 
         # Summary table
-        lines.append("| ID | Title | Severity | CWE | Asset |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| ID | Title | Severity | CWE | Asset | Status |")
+        lines.append("|---|---|---|---|---|---|")
         for f in findings:
+            status_cell = f.status
+            if f.superseded_by:
+                status_cell += f" → {f.superseded_by}"
             lines.append(
-                f"| {f.id} | {f.title} | {f.severity} | {f.cwe or '—'} | {f.asset} |"
+                f"| {f.id} | {f.title} | {f.severity} | {f.cwe or '—'} | {f.asset} | {status_cell} |"
             )
         lines.append("")
 
         for f in findings:
-            lines.append(f"## {f.id}: {f.title} ({f.severity})")
+            status_tag = f" [{f.status}]" if f.status != "open" else ""
+            lines.append(f"## {f.id}: {f.title} ({f.severity}){status_tag}")
             lines.append("")
             lines.append(f"**Asset:** {f.asset}")
             lines.append(f"**CWE:** {f.cwe or '—'}")
             lines.append(f"**Timestamp:** {f.ts}")
             if f.memory_ref:
                 lines.append(f"**Memory ref:** {f.memory_ref}")
+            if f.status != "open":
+                lines.append(f"**Status:** {f.status}")
+                if f.superseded_by:
+                    lines.append(f"**Superseded by:** {f.superseded_by}")
+                if f.closed_by:
+                    lines.append(f"**Closed by:** {f.closed_by}")
+                if f.closed_reason:
+                    lines.append(f"**Closure reason:** {f.closed_reason}")
+                if f.closed_ts:
+                    lines.append(f"**Closed at:** {f.closed_ts}")
             lines.append("")
 
             if f.evidence:
@@ -241,6 +414,8 @@ class FindingStore:
         output_dir: Optional[Path] = None,
         severity: Optional[str] = None,
         asset: Optional[str] = None,
+        status: Optional[str] = None,
+        include_closed: bool = True,
     ) -> Path:
         """Render findings to markdown AND persist the report to disk.
 
@@ -252,7 +427,10 @@ class FindingStore:
         The output dir is created if it doesn't exist.  Filters work the
         same as :meth:`render_markdown`.
         """
-        md = self.render_markdown(severity=severity, asset=asset)
+        md = self.render_markdown(
+            severity=severity, asset=asset, status=status,
+            include_closed=include_closed,
+        )
 
         if output_dir is None:
             output_dir = Path(__file__).resolve().parent.parent / "findings_md"
@@ -285,6 +463,11 @@ class FindingStore:
             tool_chain=json.loads(row["tool_chain"] or "[]"),
             memory_ref=row["memory_ref"],
             ts=row["ts"],
+            status=row["status"] if "status" in row.keys() else "open",
+            superseded_by=row["superseded_by"] if "superseded_by" in row.keys() else None,
+            closed_by=row["closed_by"] if "closed_by" in row.keys() else None,
+            closed_reason=row["closed_reason"] if "closed_reason" in row.keys() else None,
+            closed_ts=row["closed_ts"] if "closed_ts" in row.keys() else None,
         )
 
     def close(self) -> None:

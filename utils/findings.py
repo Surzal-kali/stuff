@@ -136,3 +136,98 @@ def render_findings(severity: str = "", asset: str = "") -> str:
         )
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Finding lifecycle tools — close, supersede, reopen.
+# ---------------------------------------------------------------------------
+
+@framework_tool(
+    "Close or update the status of a previously reported finding. Use this "
+    "when a finding turns out to be a false positive, a duplicate of another "
+    "finding, or simply resolved/no longer relevant. Pass the finding ID "
+    "(e.g. F-008) and one of: closed, false_positive, duplicate, open (to "
+    "reopen). Optionally provide a reason and your agent/role name so other "
+    "agents can see who closed it and why. Returns the updated finding.",
+    next_hints=["render_findings"],
+)
+def close_finding(
+    finding_id: str,
+    status: str,
+    reason: str = "",
+    closed_by: str = "",
+) -> str:
+    """Close or change the status of a finding.
+
+    Args:
+        finding_id: The finding ID, e.g. "F-008".
+        status: New status — one of: closed, false_positive, duplicate, open.
+        reason: Free-text explanation for the closure.
+        closed_by: Agent name or role that closed it (for audit trail).
+    """
+    store = FindingStore()
+    try:
+        updated = store.update_status(
+            finding_id=finding_id,
+            status=status,
+            closed_by=closed_by or None,
+            closed_reason=reason or None,
+        )
+        if updated is None:
+            return f"Finding {finding_id} not found. Use render_findings to see all findings and their IDs."
+        return (
+            f"Finding {finding_id} status updated to '{updated.status}'. "
+            + (f"Reason: {updated.closed_reason}. " if updated.closed_reason else "")
+            + (f"Closed by: {updated.closed_by}. " if updated.closed_by else "")
+            + "Use render_findings to see the updated report."
+        )
+    except ValueError as e:
+        return f"Error: {e}"
+    finally:
+        store.close()
+
+
+@framework_tool(
+    "Mark an older finding as superseded by a newer, more accurate one. This "
+    "is the standard workflow when an agent reports a refined or corrected "
+    "finding — call supersede_finding to close the old one and point to the "
+    "replacement. Both findings must already exist (report_finding for the "
+    "new one first, then supersede_finding). Pass old_id (the finding to "
+    "close), new_id (the replacement), and optionally a reason and your "
+    "agent name. Returns both findings with their updated statuses.",
+    next_hints=["render_findings"],
+)
+def supersede_finding(
+    old_id: str,
+    new_id: str,
+    reason: str = "",
+    closed_by: str = "",
+) -> str:
+    """Mark old_id as superseded by new_id.
+
+    Args:
+        old_id: The finding to close (e.g. "F-008").
+        new_id: The replacement finding (e.g. "F-015").
+        reason: Why the old finding is being superseded.
+        closed_by: Agent name or role performing the supersede.
+    """
+    store = FindingStore()
+    try:
+        result = store.supersede(
+            old_id=old_id,
+            new_id=new_id,
+            closed_by=closed_by or None,
+            reason=reason or None,
+        )
+        old = result["old"]
+        new = result["new"]
+        return (
+            f"Finding {old_id} superseded by {new_id}. "
+            f"Old: '{old.title}' → status={old.status}. "
+            f"New: '{new.title}' → status={new.status}. "
+            "Use render_findings to see the updated report."
+        )
+    except ValueError as e:
+        return f"Error: {e}"
+    finally:
+        store.close()
