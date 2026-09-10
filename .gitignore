@@ -29,3 +29,6 @@ listeners/__pycache__/
 daharness/__pycache__/
 .zap_home/
 findings_md/
+/binaries/*
+!/binaries/.gitkeep
+!/binaries/README.md
