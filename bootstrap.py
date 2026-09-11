@@ -54,6 +54,33 @@ class AsyncBackgroundRunner:
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join()
 
+def _open_child_log(name: str):
+    """Open an append-mode log for a child process, **never raising**.
+
+    A child-process log exists only to capture diagnostics. Letting its
+    ``open()`` kill the launch is strictly worse than losing the trace:
+    the ZAP/Brain daemon never starts AND there's no log to say why -- the
+    exact "permission denied touching zap.log, no trace" failure. So we
+    fail *open*: try the classic shared path, then a uid-scoped path (so
+    root and non-root runs never collide on ownership / an immutable bit
+    left on the shared file by a prior run), then give up to DEVNULL.
+
+    Returns ``(file_or_devnull, path_or_None)``.
+    """
+    candidates = [f"/tmp/{name}.log", f"/tmp/{name}-{os.geteuid()}.log"]
+    for path in candidates:
+        try:
+            return open(path, "ab"), path
+        except OSError as exc:
+            logger.warning("[!] Can't open child log %s (%s); trying next", path, exc)
+            continue
+    logger.warning(
+        "[!] All /tmp/%s*.log candidates unwritable; child stdout -> DEVNULL "
+        "(check /tmp perms / immutable bits / MAC).", name,
+    )
+    return asyncio.subprocess.DEVNULL, None
+
+
 # --- FrameworkLoader ---
 class FrameworkLoader:
     def __init__(self, framework_root: Path):
@@ -196,7 +223,9 @@ class FrameworkLoader:
             # pipe buffer fills, the sidecar blocks on write and effectively
             # dies -- taking /tmp/brain.sock down with it (it unlinks the socket
             # on startup, so a crashed sidecar leaves NO socket behind).
-            brain_log = open("/tmp/brain.log", "ab")
+            # Opened via _open_child_log so a poisoned/immutable /tmp/brain.log
+            # can never kill the sidecar launch the way it killed ZAP.
+            brain_log, brain_log_path = _open_child_log("brain")
             process = await asyncio.create_subprocess_exec(
                 sys.executable, str(brain_script),
                 stdout=brain_log,
@@ -216,8 +245,8 @@ class FrameworkLoader:
                     return process
                 if process.returncode is not None:
                     logger.error(
-                        "[!] Brain sidecar exited early (code %s); see /tmp/brain.log",
-                        process.returncode,
+                        "[!] Brain sidecar exited early (code %s); see %s",
+                        process.returncode, brain_log_path or "<devnull>",
                     )
                     return process
                 await asyncio.sleep(0.1)
@@ -242,7 +271,9 @@ class FrameworkLoader:
         every API call from ``auxiliaries/zap.py`` so a defence-in-depth
         posture holds if a future config flip exposes it).
         """
+        import pwd
         import shutil
+        import subprocess
         host = host or ZAP_HOST
         port = port or ZAP_PORT
 
@@ -252,9 +283,10 @@ class FrameworkLoader:
             return
 
         # Daemon JVM heap; 512m is enough for the framework's typical scans.
-        # -daemon forks the JVM (no GUI). Logs go to /tmp/zap.log so failures
-        # are inspectable after a crash.
-        log_path = "/tmp/zap.log"
+        # -daemon forks the JVM (no GUI). Logs go to a /tmp log so failures
+        # are inspectable after a crash. Opened via _open_child_log so a
+        # poisoned/immutable /tmp/zap.log can never kill the launch.
+        log_fd, log_path = _open_child_log("zap")
         
         # Force 127.0.0.1 to avoid UnresolvedAddressException (IPv6/localhost issues)
         host = host or "127.0.0.1"
@@ -273,13 +305,83 @@ class FrameworkLoader:
         zap_home = self.framework_root / ".zap_home"
         zap_home.mkdir(exist_ok=True)
         cmd.extend(["-dir", str(zap_home)])
-        
+
+        # --- Root guard: never run the ZAP daemon as root. -----------------
+        # ZAP checks write access to its home at startup
+        # (OptionsParamCheckForUpdates -> "No write access to directory
+        # .../plugin") and aborts the daemon if it can't write. When the
+        # framework is launched as root but ``.zap_home`` is owned by a
+        # normal user (the common case -- the project lives under the
+        # operator's $HOME), a root ZAP run *can* write (root bypasses DAC)
+        # so the root launch itself starts, but it silently chowns the home
+        # tree (config.xml, db/permanent.*, plugin/, ...) to root:root.
+        # Every subsequent *non-root* launch then fails ZAP's write-access
+        # check and the daemon refuses to come up -- i.e. "starting as root"
+        # is what poisons later runs.
+        #
+        # Fix: when we're root, drop the ZAP subprocess to the user who owns
+        # ``.zap_home`` (ZAP needs no root) and chown the home tree + log
+        # file back to them so any corruption from a prior root run is
+        # repaired in the same launch. Ownership then stays consistent across
+        # root / non-root framework launches.
+        launch_user = None  # pwent of the user to run ZAP as, or None
+        if os.geteuid() == 0:
+            home_st = zap_home.stat()
+            if home_st.st_uid != 0:
+                launch_user = pwd.getpwuid(home_st.st_uid)
+                # Repair ownership corrupted by an earlier root run (no-op if
+                # already correct). Scoped to .zap_home only -- the ZAP log is
+                # opened uid-safely by _open_child_log, so it needs no chown.
+                chown_spec = f"{launch_user.pw_uid}:{home_st.st_gid}"
+                subprocess.run(
+                    ["chown", "-R", chown_spec, str(zap_home)],
+                    check=False, capture_output=True,
+                )
+                logger.info(
+                    "[+] Framework started as root; dropping ZAP daemon "
+                    "privileges to '%s' and (re)chowning %s to match.",
+                    launch_user.pw_name, zap_home,
+                )
+            # If .zap_home is already root-owned there's no mismatch to fix;
+            # leave ZAP running as root.
+
+        if launch_user is not None:
+            # runuser(1) (util-linux) execs the command as the target user
+            # without a login shell, so our env + -dir arg pass straight
+            # through. No --login: that would scrub ZAP_HOME/HOME. It lives
+            # in /usr/sbin (not always on a non-root PATH), so check the
+            # canonical locations too. su(1) is the universal fallback when
+            # invoked by root (passwordless); we feed it a shlex-quoted -c
+            # string so the arg array survives the shell round-trip intact.
+            import shlex
+            runuser = (
+                shutil.which("runuser")
+                or next((p for p in ("/usr/sbin/runuser", "/sbin/runuser")
+                         if os.path.exists(p)), None)
+            )
+            if runuser:
+                cmd = [runuser, "-u", launch_user.pw_name, "--", *cmd]
+            else:
+                su = shutil.which("su") or "/usr/bin/su"
+                cmd = [su, launch_user.pw_name, "-s", "/bin/sh", "-c",
+                       " ".join(shlex.quote(a) for a in cmd)]
+                logger.info(
+                    "[+] (runuser unavailable; using su to drop ZAP to '%s')",
+                    launch_user.pw_name,
+                )
+
         env = {**os.environ, "ZAP_HOME": str(zap_home)}
+        if launch_user is not None:
+            # Point HOME at the real user so ZAP/JVM scratch paths resolve
+            # correctly even though we didn't use a login shell.
+            env["HOME"] = launch_user.pw_dir
 
         try:
             logger.info("[+] Starting ZAP daemon on %s:%s (log: %s)",
-                        host, port, log_path)
-            log_fd = open(log_path, "ab")
+                        host, port, log_path or "<devnull>")
+            # log_fd was opened non-fatally by _open_child_log above; never
+            # re-open here (the open is the thing that used to kill the
+            # launch with PermissionError on a poisoned /tmp/zap.log).
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=log_fd,
@@ -290,9 +392,11 @@ class FrameworkLoader:
             # Track the log fd so ``stop()`` can close it when the daemon
             # terminates -- otherwise the fd leaks for the lifetime of the
             # parent process. Keyed by the Process object so we don't have
-            # to mutate it with a private attribute.
-            self._child_log_fds = getattr(self, "_child_log_fds", {})
-            self._child_log_fds[id(process)] = log_fd
+            # to mutate it with a private attribute. Only track real file
+            # objects (DEVNULL is an int and has no .close()).
+            if hasattr(log_fd, "close"):
+                self._child_log_fds = getattr(self, "_child_log_fds", {})
+                self._child_log_fds[id(process)] = log_fd
         except Exception as e:
             logger.error("[!] ZAP daemon failed to start: %s", e, exc_info=True)
 

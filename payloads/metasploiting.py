@@ -150,7 +150,20 @@ class MetasploitClient:
                 # always reported the log missing. Append-mode keeps history
                 # across framework restarts (matches the Brain/ZAP pattern in
                 # bootstrap.start_brain_server / start_zap_daemon).
-                msf_log = open("/tmp/msfconsole_mcp.log", "ab")
+                # Non-fatal: a poisoned/immutable /tmp/msfconsole_mcp.log must
+                # not kill the msfrpcd launch -- fall back to a uid-scoped path
+                # then DEVNULL (same pattern as bootstrap._open_child_log).
+                msf_log = None
+                for _msf_path in (f"/tmp/msfconsole_mcp.log",
+                                  f"/tmp/msfconsole_mcp-{os.geteuid()}.log"):
+                    try:
+                        msf_log = open(_msf_path, "ab")
+                        break
+                    except OSError:
+                        continue
+                if msf_log is None:
+                    msf_log = asyncio.subprocess.DEVNULL
+                    print("[!] /tmp/msfconsole_mcp*.log unwritable; msfrpcd stdout -> DEVNULL")
                 launched_process = await asyncio.create_subprocess_exec(
                     self.mcp_path,
                     "-U", user,
@@ -166,8 +179,9 @@ class MetasploitClient:
                 # Track the log fd so bootstrap.stop() can close it when it
                 # reaps this process -- otherwise the fd leaks for the
                 # lifetime of the interpreter. bootstrap.register_child_log_fd
-                # picks this up via start_metasploit_mcp.
-                self._msf_log_fd = msf_log
+                # picks this up via start_metasploit_mcp. Only track real file
+                # objects (DEVNULL is an int with no .close()).
+                self._msf_log_fd = msf_log if hasattr(msf_log, "close") else None
             else:
                 print("[i] msfrpcd already running; connecting to it...")
 

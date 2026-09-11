@@ -275,7 +275,13 @@ async def start_brain():
     # never contend on it. lock_fh is deliberately kept referenced for the
     # lifetime of serve_forever(); closing it (implicit on exit) releases the
     # lock.
-    lock_fh = open("/tmp/brain.lock", "w")
+    try:
+        lock_fh = open("/tmp/brain.lock", "w")
+    except OSError:
+        # Shared lockfile unwritable (poisoned ownership / immutable bit /
+        # MAC). Fall back to a uid-scoped lockfile so a bad /tmp/brain.lock
+        # can't kill the sidecar; the singleton guard then applies per-uid.
+        lock_fh = open(f"/tmp/brain.lock-{os.geteuid()}", "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError) as e:
