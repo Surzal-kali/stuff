@@ -47,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip(
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.0.0.245:11434/v1").rstrip(
     "/"
 )
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
