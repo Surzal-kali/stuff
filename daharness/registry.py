@@ -716,6 +716,15 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     distance=round(float(dist), 4) if dist is not None else None,
                 )
             )
+        # T-002: Explicitly sort by distance ascending so array position ==
+        # relevance order. ChromaDB's HNSW query usually returns ascending
+        # order, but this is not contractually guaranteed across versions /
+        # configurations; an unsorted (or worst-first) array causes agents
+        # that read array position instead of the distance field to
+        # mis-select the worst match.
+        manifests.sort(
+            key=lambda m: m.distance if m.distance is not None else float("inf")
+        )
         return manifests
 
     async def find_best_tool(self, user_intent: str, top_k=1):

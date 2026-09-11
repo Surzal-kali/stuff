@@ -102,9 +102,9 @@ def test_discover_entries_have_metadata(fake_tree):
     entries = list(discover_wordlists(root=fake_tree))
     rock = [e for e in entries if e["path"].endswith("rockyou.txt")][0]
     assert rock["size"] > 0
-    assert rock["category"] == "Passwords"
+    assert rock["category"] == "Passwords/Leaked-Databases"
     common = [e for e in entries if e["path"].endswith("common.txt")][0]
-    assert common["category"] == "Discovery"
+    assert common["category"] == "Discovery/Web-Content"
 
 
 def test_discover_missing_root_yields_nothing(tmp_path):
@@ -120,8 +120,8 @@ def test_list_wordlists_catalog(fake_tree, monkeypatch):
     assert r["ok"] is True
     assert r["total"] == 3
     assert r["returned"] == 3
-    assert "Passwords" in r["by_category"]
-    assert "Discovery" in r["by_category"]
+    assert "Passwords/Leaked-Databases" in r["by_category"]
+    assert "Discovery/Web-Content" in r["by_category"]
     assert "Usernames" in r["by_category"]
     assert "rockyou.txt" in r["common_present"]
 

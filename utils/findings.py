@@ -30,7 +30,7 @@ from utils.memory_tools import remember_text
     "steps, and the list of tools used in this chain. The finding is stored "
     "persistently and a short pointer is saved to memory so it can be "
     "recalled later. Returns a brief confirmation with the finding ID.",
-    next_hints=["render_findings"],
+    next_hints=["test recovered creds against other services once (SSH, web auth, DB, SMB, FTP) — credential-reuse sweep is a standing runbook step", "render_findings"],
 )
 def report_finding(
     title: str,

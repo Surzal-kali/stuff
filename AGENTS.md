@@ -298,6 +298,27 @@ block — `serve_forever()` would hang the dispatcher. Bind the socket, hand
 serving off to a background `asyncio.create_task()`, and return immediately.
 See `listeners/listening.py:listen()` for the pattern.
 
+### Credential-Reuse Sweep (standing runbook step)
+
+Every recovered credential — dumped (secretsdump), cracked (hashcat/john),
+decoded (GPP cpassword, Base64 config blobs) — gets **ONE validation attempt
+against each other reachable service** before deeper work continues. This is a
+standing step, not an afterthought:
+
+1. After recovering a credential, enumerate the other services on the target
+   (and pivots) that accept authentication: SSH, web login forms, HTTP Basic,
+   MySQL, PostgreSQL, SMB, FTP, etc.
+2. Try the credential exactly once per service. A single failure means "not
+   reused here" — do not brute-force.
+3. Log each validation (hit or miss) via `report_finding` so the chain is
+   auditable. Reuse hits are findings in their own right (P2/P3).
+4. Only after the sweep is complete, continue to deeper exploitation.
+
+Reactive-only reuse checking misses pivots: a cred that works on SSH but was
+recovered from a MySQL dump is the classic lab pivot. The `report_finding` tool
+carries a `next_hints` entry that nudges the secretary to do this sweep
+automatically after reporting any credential-bearing finding.
+
 ## Pitfalls
 
 - **Stale Brain socket:** the kernel doesn't unlink a socket when its owner

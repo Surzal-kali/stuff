@@ -403,7 +403,22 @@ def _cap_tool_stdout(result: Dict[str, Any], limit: Optional[int] = None) -> Dic
     stdout = result.get("stdout")
     if isinstance(stdout, str) and len(stdout) > limit:
         elided = len(stdout) - limit
-        result = {**result, "stdout": stdout[:limit] + f"\n... [truncated {elided} chars]"}
+        # T-001: Preserve both head AND tail when truncating.  A head-only
+        # cap drops tokens near the end of the output — critically, the
+        # ``(user[:group])`` runas spec from ``sudo -l`` can appear late in
+        # a long sudoers listing, and losing it forces fallback
+        # interpretation of the sudoers entry and misdirects privesc
+        # attempts. Keeping a tail slice ensures runas specs survive.
+        tail_len = min(2000, limit // 4)
+        head_len = limit - tail_len
+        result = {
+            **result,
+            "stdout": (
+                stdout[:head_len]
+                + f"\n... [truncated {elided} chars] ...\n"
+                + stdout[-tail_len:]
+            ),
+        }
     return result
 
 

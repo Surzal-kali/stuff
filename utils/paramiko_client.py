@@ -114,8 +114,13 @@ def ssh_exec(handle: str, command: str):
         stdin, stdout, stderr = session.client.exec_command(command)
         output = stdout.read().decode("utf-8", errors="replace")
         error = stderr.read().decode("utf-8", errors="replace")
+        # T-001: Return stdout UNPREFIXED so tokens like the ``(root : root)``
+        # runas spec from ``sudo -l`` are not buried behind an "Output:"
+        # label that some consumers strip or mis-parse.  stderr is appended
+        # with a clear ``[stderr]`` marker only when non-empty, preserving
+        # the full stdout surface for parsing.
         if error:
-            return f"Output: {output}\nError: {error}"
+            return f"{output}\n[stderr] {error}"
         return output
     except paramiko.SSHException as e:
         # The connection may have died remotely; surface it clearly.

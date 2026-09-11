@@ -242,6 +242,10 @@ def test_run_ffuf_explicit_wordlist_not_flagged_default(monkeypatch):
         captured["cmd"] = cmd
         return {"job_id": "j2", "status": "running", "tool": tool_name}
 
+    # resolve_wordlist does a real file-existence check; the test wordlist
+    # doesn't exist on disk, so mock it to return the path as-is so we
+    # reach the launch_job call (which is what this test exercises).
+    monkeypatch.setattr(ffuf_mod, "resolve_wordlist", lambda wl: wl)
     monkeypatch.setattr(ffuf_mod, "launch_job", fake_launch)
     r = ffuf_mod.run_ffuf(url="http://127.0.0.1/FUZZ", wordlist="/tmp/custom.txt")
     assert r["default_wordlist_used"] is False

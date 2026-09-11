@@ -32,6 +32,78 @@ class DummyCollection:
             self.items.pop(item_id, None)
 
 
+# --- T-002: find_tools must return results sorted by distance ascending ---
+
+
+class _DistanceQueryCollection:
+    """Fake ChromaDB collection whose .query returns a fixed,
+    deliberately-unsorted distance ordering so the test can verify that
+    find_tools sorts by distance ascending regardless of store order."""
+
+    def __init__(self, rows):
+        # rows: list of (id, metadata, document, distance) in the *store*
+        # order — intentionally NOT ascending by distance.
+        self._rows = rows
+
+    def query(self, query_embeddings=None, n_results=5, **kwargs):
+        ids = [r[0] for r in self._rows[:n_results]]
+        metadatas = [[r[1] for r in self._rows[:n_results]]]
+        documents = [[r[2] for r in self._rows[:n_results]]]
+        distances = [[r[3] for r in self._rows[:n_results]]]
+        return {
+            "ids": [ids],
+            "metadatas": metadatas,
+            "documents": documents,
+            "distances": distances,
+        }
+
+
+def test_find_tools_sorts_by_distance_ascending():
+    """T-002: results must be sorted ascending by distance so array
+    position == relevance order.  The fake store returns the worst match
+    first; find_tools must reorder it."""
+
+    async def _run():
+        registry = daharness.ToolRegistry.__new__(daharness.ToolRegistry)
+        registry.embedding_model = DummyEmbeddingModel()
+
+        # Deliberately worst-first: 0.9, 0.3, 0.7
+        _meta = lambda: {
+            "transport": "brain_dispatch",
+            "parameters_json": "{}",
+            "external_description": "desc",
+            "implementation_path": "some/path",
+            "internal_semantics": "semantics",
+        }
+        rows = [
+            ("tool_far", _meta(), "far capability", 0.9),
+            ("tool_near", _meta(), "near capability", 0.3),
+            ("tool_mid", _meta(), "mid capability", 0.7),
+        ]
+        registry.collection = _DistanceQueryCollection(rows)
+
+        async def fake_embed(text):
+            return [0.1, 0.2, 0.3]
+
+        registry._embed_text = fake_embed
+
+        manifests = await registry.find_tools("some intent", top_k=3)
+
+        assert len(manifests) == 3
+        distances = [m.distance for m in manifests]
+        assert distances == sorted(distances), (
+            f"Distances not ascending: {distances}"
+        )
+        # Best match (lowest distance) must be first.
+        assert manifests[0].module_id == "tool_near"
+        assert manifests[0].distance == 0.3
+        # Worst match must be last.
+        assert manifests[-1].module_id == "tool_far"
+        assert manifests[-1].distance == 0.9
+
+    asyncio.run(_run())
+
+
 def test_register_tool_stores_valid_manifest_once():
     async def _run():
         registry = daharness.ToolRegistry.__new__(daharness.ToolRegistry)
