@@ -297,13 +297,16 @@ def _parse_masscan_verdict(out_path: str):
     "list of open ports per host; results survive interruption (truncated "
     "JSON is tolerated). Default rate is masscan's safe 100 pps; pass a "
     "higher rate only when appropriate. The scanner's own IP is excluded by "
-    "default.",
+    "default. Pass adapter='eth0' (or tun0, etc.) to pin the source "
+    "interface — this overrides $MASSCAN_ADAPTER and prevents masscan's "
+    "default auto-pick from selecting the wrong NIC on multi-interface hosts.",
     next_hints=["masscan_status", "run_nmap"],
 )
 def run_masscan(
     target: str,
     ports: Optional[str] = None,
     rate: Optional[int] = None,
+    adapter: Optional[str] = None,
     flags: Optional[str] = None,
     exclude: Optional[str] = None,
     options: Optional[str] = None,
@@ -324,6 +327,11 @@ def run_masscan(
         rate: Packets/sec.  ``None`` (default) = do not pass ``--rate``, so
             masscan uses its binary default of 100 pps (safe for shared
             networks).  Clamped by ``$MASSCAN_MAX_RATE`` if set.
+        adapter: Source network interface name (e.g. ``"eth0"``, ``"tun0"``).
+            Overrides ``$MASSCAN_ADAPTER``.  When neither this parameter nor
+            the env var is set, masscan auto-picks the first interface with a
+            default gateway — which can break scans on multi-interface hosts.
+            Pass this explicitly whenever the host has more than one NIC.
         flags: Free-form extra masscan flags as a single string
             (e.g. ``"--banners --open-only"``).  Owned/dangerous flags are
             stripped (see module docstring).
@@ -376,12 +384,20 @@ def run_masscan(
 
     # --- adapter pinning -------------------------------------------------
     adapter_ip = os.getenv("MASSCAN_ADAPTER_IP") or _detect_local_ip()
-    adapter_iface = os.getenv("MASSCAN_ADAPTER") or None
+    # Parameter overrides env var; env var is the fallback.
+    adapter_iface = adapter or os.getenv("MASSCAN_ADAPTER") or None
     adapter_warn: Optional[str] = None
     if not os.getenv("MASSCAN_ADAPTER_IP") and adapter_ip:
         adapter_warn = (
             f"adapter-ip auto-detected as {adapter_ip} via default route; "
             "set MASSCAN_ADAPTER_IP to pin explicitly"
+        )
+    if not adapter_iface:
+        adapter_warn = (
+            (adapter_warn + "; " if adapter_warn else "")
+            + "no adapter/interface specified (parameter or MASSCAN_ADAPTER); "
+            "masscan will auto-pick the first iface with a default gateway — "
+            "pass adapter='eth0' to pin explicitly"
         )
 
     # --- assemble free-form flags + options (denylist-filtered) ----------

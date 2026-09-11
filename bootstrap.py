@@ -10,6 +10,17 @@ from typing import Dict, Optional, List, Any
 import socket
 import time
 from daharness import _chat, ToolRegistry, OllamaEmbeddingFunction
+
+# --- .env loading (sudo-safe) ------------------------------------------------
+# When the framework is launched under sudo, the shell environment is stripped
+# and .env is never sourced.  Load it here so all env vars (H1 creds, ZAP,
+# gateway key, etc.) are available regardless of how the process is started.
+# python-dotenv only sets vars not already in os.environ, so shell exports win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
 # --- Setup Logging ---
 logging.basicConfig(
     level=logging.INFO,

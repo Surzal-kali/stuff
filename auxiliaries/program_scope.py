@@ -53,6 +53,18 @@ from urllib.parse import urlparse
 
 from constants import framework_tool
 
+# --- .env loading (sudo-safe) ------------------------------------------------
+# When the framework is launched under sudo, the shell environment is stripped
+# and .env is never sourced.  Load it here as a module-level safety net so
+# H1_API_USERNAME / H1_API_TOKEN (and every other .env var) are available
+# regardless of entry point.  python-dotenv only sets vars that are not already
+# in os.environ, so explicit shell exports always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except Exception:
+    pass  # dotenv not installed or .env missing — silently degrade
+
 
 _H1_API = "https://api.hackerone.com/v1"
 _TIMEOUT = 30.0
@@ -73,11 +85,19 @@ def _h1_auth() -> Tuple[Optional[Tuple[str, str]], bool]:
     return (None, False)
 
 
-def _get(path: str, *, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-    """Authenticated GET against the H1 Hacker API.  Returns (status, json)."""
+def _get(path: str, *, params: Optional[Dict[str, Any]] = None,
+         auth: Optional[Any] = ...) -> Tuple[int, Any]:
+    """GET against the H1 Hacker API.  Returns (status, json).
+
+    By default (``auth=...`` sentinel) the H1 Basic auth tuple is resolved
+    via :func:`_h1_auth` and attached.  Pass ``auth=None`` explicitly to
+    make an unauthenticated request (used for the public hacktivity feed,
+    so stale/bad credentials don't poison a public endpoint with a 401).
+    """
     import requests
 
-    auth, _ = _h1_auth()
+    if auth is ...:
+        auth, _ = _h1_auth()
     url = f"{_H1_API}{path}"
     r = requests.get(url, params=params, auth=auth, headers={"Accept": "application/json"},
                      timeout=_TIMEOUT)
@@ -540,7 +560,8 @@ def program_hacktivity(handle: str = "crypto", query: str = "", limit: int = 25)
     qs = f"team_handle:{handle}"
     if query.strip():
         qs += f" AND {query.strip()}"
-    status, body = _get("/hackers/hacktivity", params={"queryString": qs, "page[size]": limit})
+    status, body = _get("/hackers/hacktivity", params={"queryString": qs, "page[size]": limit},
+                        auth=None)
     if status != 200 or not isinstance(body, dict):
         return {"handle": handle, "status": "error", "error": f"HTTP {status}", "reports": []}
     reports = []

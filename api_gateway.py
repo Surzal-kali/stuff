@@ -7,6 +7,18 @@ import secrets
 import threading
 import time
 import uuid
+from pathlib import Path
+
+# --- .env loading (sudo-safe) ------------------------------------------------
+# When the framework is launched under sudo, the shell environment is stripped
+# and .env is never sourced.  Load it here so all env vars are available
+# regardless of how the process is started.  python-dotenv only sets vars not
+# already in os.environ, so shell exports always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
