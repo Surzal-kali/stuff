@@ -93,3 +93,31 @@
       report) vs lab profile (everything) — registry never surfaces lab tools
       in bounty mode
 - [ ] Map Finding severity to per-program severity scales
+
+## Tickets — from Sept 10 night lab (agnostic, no box/hostname details)
+
+- [ ] T-001 Tool output must not drop runas spec from `sudo -l`:
+      output must preserve/parse the `(user[:group])` target tokens (e.g.
+      `(root : root)`) — a dropped runas spec forces fallback interpretation of
+      the sudoers entry and can misdirect privilege-escalation attempts.
+      Acceptance: any surface rendering `sudo -l` output includes runas spec;
+      wrapper (if truncating) validated against real sudo output.
+
+- [ ] T-002 tools_search results must be sorted by distance ascending:
+      array order currently ≠ relevance order (worst match observed first);
+      agents reading array position instead of the distance field mis-select.
+      Acceptance: menu candidates sorted ascending by distance; test added.
+
+- [ ] T-003 Codify credential-reuse sweep as a standing runbook step:
+      every recovered credential (dumped, cracked, decoded) gets ONE validation
+      attempt against each other reachable service (SSH, web auth, DB) before
+      deeper work continues — reactive-only reuse misses pivots.
+      Acceptance: AGENTS.md runbook line + next_hints pattern from
+      report_finding ("test recovered creds against other services once").
+
+- [ ] T-004 Persistent SSH exec auxiliary (one connection, reused channel):
+      per-command SSH scripts (fresh connect per shot) burned tool budget and
+      flooded sshd (channel-open timeouts → handshake rejections under rate
+      limiting). auxiliaries/ssh_exec.py: connect once, exec(cmd) per shot on a
+      reused channel, paced; pattern proven live Sept 11. Design pattern =
+      nmap.py (allowlist, envelope, fail-fast).
