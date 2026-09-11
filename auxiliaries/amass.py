@@ -148,21 +148,31 @@ def _retrieve_names(domain: str, out_dir: str) -> List[str]:
         "-show",
         "-dir", out_dir,
     ]
-    try:
-        result = subprocess.run(
-            subs_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        names = [
-            line.strip().lower().rstrip(".")
-            for line in (result.stdout or "").splitlines()
-            if line.strip() and "." in line.strip()
-        ]
-        return sorted(set(names))
-    except Exception:
-        return []
+    # A big-domain enum (crypto.com-scale) ingests tens of thousands of names
+    # over hours; the `amass subs` dump of that DB takes MINUTES. The naive
+    # 30s timeout swallowed entire multi-hour runs' results (Sept 11: 2.5h
+    # enum -> 0 names reported, timeout eaten by a bare except). Env-tunable
+    # timeout + one retry before falling through to crt.sh.
+    timeout = float(os.getenv("AMASS_RETRIEVAL_TIMEOUT", "600"))
+    for _attempt in (1, 2):
+        try:
+            result = subprocess.run(
+                subs_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            names = [
+                line.strip().lower().rstrip(".")
+                for line in (result.stdout or "").splitlines()
+                if line.strip() and "." in line.strip()
+            ]
+            return sorted(set(names))
+        except subprocess.TimeoutExpired:
+            continue  # one retry; a warm-DB second pass often gets through
+        except Exception:
+            return []
+    return []
 
 
 def _crtsh_fallback(domain: str) -> List[str]:
@@ -178,7 +188,9 @@ def _crtsh_fallback(domain: str) -> List[str]:
     for attempt in range(2):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "amass-wrapper/1.0"})
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(
+                req, timeout=float(os.getenv("AMASS_CRTSH_TIMEOUT", "120"))
+            ) as resp:
                 if resp.status != 200:
                     continue
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -363,7 +375,12 @@ def amass_status(job_id):
                 "amass returned no subdomains and crt.sh fallback also "
                 "failed (crt.sh may be down — 502/timeout). Possible "
                 "causes: crt.sh overloaded, no data-source API keys "
-                "configured, or the domain has no CT-log entries."
+                "configured, or the domain has no CT-log entries. ALSO: on "
+                "very large result sets the amass-subs retrieval step may "
+                "have timed out even with keys live - the names are still "
+                "in the job out_dir (/tmp/amass_v5_* on the framework "
+                "host); recover with: amass subs -names -show -d <domain> "
+                "-dir <out_dir>."
             ),
             "elapsed": poll.get("elapsed"),
             "timed_out": poll.get("timed_out", False),
@@ -591,7 +608,12 @@ def subdomain_enum_status(job_id):
                 "amass returned no subdomains and crt.sh fallback also "
                 "failed (crt.sh may be down — 502/timeout). Possible "
                 "causes: crt.sh overloaded, no data-source API keys "
-                "configured, or the domain has no CT-log entries."
+                "configured, or the domain has no CT-log entries. ALSO: on "
+                "very large result sets the amass-subs retrieval step may "
+                "have timed out even with keys live - the names are still "
+                "in the job out_dir (/tmp/amass_v5_* on the framework "
+                "host); recover with: amass subs -names -show -d <domain> "
+                "-dir <out_dir>."
             ),
         }
 
