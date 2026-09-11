@@ -35,7 +35,7 @@ one at hackerone.com → Settings → API Tokens.  Set ``H1_API_USERNAME`` and
 works without credentials (the hacktivity feed is public); the other tools
 return a clear ``auth_required`` error if no token is configured.
 
-The manifest is cached to ``.h1_scope_<handle>.json`` under
+The manifest is cached to ``scope/<handle>.json`` under
 ``WORKSPACE_ROOT``; pass ``refresh=True`` to force a fresh fetch, or rely on
 the ``updated_at`` filter for incremental refreshes.
 """
@@ -154,7 +154,9 @@ def _fetch_all_pages(path: str, *, params: Optional[Dict[str, Any]] = None,
 # --- manifest construction --------------------------------------------------
 
 def _scope_cache_path(handle: str) -> Path:
-    return Path(os.getenv("WORKSPACE_ROOT", ".")) / f".h1_scope_{handle}.json"
+    d = Path(os.getenv("WORKSPACE_ROOT", ".")) / "scope"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{handle}.json"
 
 
 def _build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:

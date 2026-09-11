@@ -190,7 +190,7 @@ def test_scope_file_written_amass_compatible(loaded_manifest):
 
 def test_manifest_cached_to_disk(loaded_manifest):
     m, tmp_path = loaded_manifest
-    cache = tmp_path / ".h1_scope_crypto.json"
+    cache = tmp_path / "scope" / "crypto.json"
     assert cache.is_file()
     cached = json.loads(cache.read_text())
     assert cached["counts"]["in_scope"] == 3
@@ -201,7 +201,9 @@ def test_load_uses_cache_when_present(monkeypatch, tmp_path):
     # write a fake cache
     fake = {"handle": "crypto", "fetched_at": 0, "in_scope": [], "out_of_scope_assets": [],
             "excluded_categories": [], "weaknesses": [], "policy": "", "counts": {}}
-    (tmp_path / ".h1_scope_crypto.json").write_text(json.dumps(fake))
+    scope_dir = tmp_path / "scope"
+    scope_dir.mkdir(parents=True, exist_ok=True)
+    (scope_dir / "crypto.json").write_text(json.dumps(fake))
     with mock.patch.object(ps, "_get") as g:  # _get must NOT be called
         m = ps.load_program_scope("crypto", refresh=False)
     assert g.call_count == 0

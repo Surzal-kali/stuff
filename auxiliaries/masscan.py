@@ -145,6 +145,37 @@ def _detect_local_ip() -> Optional[str]:
         s.close()
 
 
+def _get_iface_ip(iface: str) -> Optional[str]:
+    """Resolve the primary IPv4 address bound to a named interface.
+
+    Uses ``ip -o -4 addr show <iface>`` and parses the first ``inet`` token.
+    This matters because :func:`_detect_local_ip` returns the *default-route*
+    source IP, which may belong to a different interface than the one the
+    caller pinned via ``adapter=``.  Without this, masscan gets ``-e eth0``
+    (correct interface) but ``--adapter-ip <default-route-IP>`` (wrong NIC's
+    IP), and the stale ``--adapter-ip`` wins — exactly the silent-wrong-source
+    bug the adapter pinning was meant to prevent.
+
+    Returns ``None`` if the interface doesn't exist or has no IPv4 address.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    # Output format: "wlp0s20f3    inet 10.0.0.49/24 brd ..."
+    parts = r.stdout.split()
+    for i, p in enumerate(parts):
+        if p == "inet" and i + 1 < len(parts):
+            return parts[i + 1].split("/")[0]
+    return None
+
+
 def _default_self_exclude() -> Optional[str]:
     """The IP/CIDR to ``--exclude`` by default (the scanner's own host)."""
     return os.getenv("MASSCAN_SELF_EXCLUDE") or _detect_local_ip()
@@ -383,15 +414,37 @@ def run_masscan(
     exclude = (exclude or "").strip()
 
     # --- adapter pinning -------------------------------------------------
-    adapter_ip = os.getenv("MASSCAN_ADAPTER_IP") or _detect_local_ip()
     # Parameter overrides env var; env var is the fallback.
     adapter_iface = adapter or os.getenv("MASSCAN_ADAPTER") or None
+
+    # Resolve --adapter-ip from the SPECIFIED interface when possible, so
+    # the source IP matches the pinned NIC.  Fall back to $MASSCAN_ADAPTER_IP,
+    # then to the default-route IP.  Without this, --adapter-ip always
+    # reflected the default-route interface (e.g. 10.0.0.7 on enp92s0)
+    # regardless of the -e <iface> flag — masscan then used the wrong NIC's
+    # IP as source, silently breaking scans on multi-interface hosts.
+    adapter_ip: Optional[str] = None
     adapter_warn: Optional[str] = None
-    if not os.getenv("MASSCAN_ADAPTER_IP") and adapter_ip:
-        adapter_warn = (
-            f"adapter-ip auto-detected as {adapter_ip} via default route; "
-            "set MASSCAN_ADAPTER_IP to pin explicitly"
-        )
+    if adapter_iface:
+        adapter_ip = _get_iface_ip(adapter_iface)
+        if adapter_ip:
+            adapter_warn = (
+                f"adapter-ip {adapter_ip} resolved from interface "
+                f"{adapter_iface!r}"
+            )
+        else:
+            adapter_warn = (
+                f"could not resolve IPv4 for interface {adapter_iface!r}; "
+                f"falling back to default-route or MASSCAN_ADAPTER_IP"
+            )
+    if not adapter_ip:
+        adapter_ip = os.getenv("MASSCAN_ADAPTER_IP") or _detect_local_ip()
+        if not os.getenv("MASSCAN_ADAPTER_IP") and adapter_ip:
+            adapter_warn = (
+                (adapter_warn + "; " if adapter_warn else "")
+                + f"adapter-ip auto-detected as {adapter_ip} via default route; "
+                "set MASSCAN_ADAPTER_IP to pin explicitly"
+            )
     if not adapter_iface:
         adapter_warn = (
             (adapter_warn + "; " if adapter_warn else "")

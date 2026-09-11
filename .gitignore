@@ -32,3 +32,5 @@ findings_md/
 /binaries/*
 !/binaries/.gitkeep
 !/binaries/README.md
+*.scope
+scope/
