@@ -155,6 +155,7 @@ class ZAPClient:
         request. Returns the standard message envelope (requestHeader /
         responseHeader / responseBody / id).
         """
+        raw_request = self._ensure_https_scheme(raw_request)
         try:
             resp = self._get(
                 "core/action/sendRequest",
@@ -176,7 +177,44 @@ class ZAPClient:
                 raise ValueError(
                     f"ZAP rejected the raw request: {e.response.text[:2000]}"
                 ) from e
-            raise 
+            raise
+
+    @staticmethod
+    def _ensure_https_scheme(raw_request: str) -> str:
+        """Rewrite origin-form request lines to absolute-form so ZAP honors
+        the scheme. ZAP's sendRequest infers port 80 for origin-form lines
+        ("GET /path HTTP/1.1") -- the Host header alone does not carry the
+        scheme, so TLS hosts get probed over plain HTTP and come back as
+        301s. This prepends ``https://<host>`` to the request target (https
+        by default, since plain-http targets are rare in the wild).
+
+        To force plain http for a specific request, write the request line
+        in absolute form yourself, e.g. ``GET http://host/path HTTP/1.1``.
+        Any line whose target already contains ``://`` is treated as
+        absolute-form and passed through untouched, so ZAP honors whichever
+        scheme you wrote.
+
+        The following are also passed through unchanged: single-line
+        requests with no header section, malformed request lines (not
+        exactly three whitespace-separated tokens), and origin-form
+        requests that carry no Host header (there is nothing to derive
+        the host from).
+        """
+        first, sep, rest = raw_request.partition("\n")
+        if not sep:
+            return raw_request
+        parts = first.split()
+        if len(parts) != 3 or "://" in parts[1]:
+            return raw_request  # malformed, or already absolute-form
+        host = ""
+        for line in rest.split("\n"):
+            if line.lower().startswith("host:"):
+                host = line.split(":", 1)[1].strip()
+                break
+        if not host:
+            return raw_request
+        parts[1] = f"https://{host}{parts[1]}"
+        return " ".join(parts) + "\n" + rest
 
     def spider(self, url: str, max_depth: int = 5, recurse: bool = True) -> str:
         """Start the traditional crawler; returns the scan id (e.g. ``"0"``)."""
