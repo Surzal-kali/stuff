@@ -101,12 +101,34 @@ def _mock_get(path, params=None, **kw):
     if path.endswith("/programs/crypto"):
         return (200, MOCK_PROGRAM)
     if path == "/hackers/hacktivity":
+        # Simulate a real feed: mostly undisclosed items with redacted
+        # title/substate/url, plus the always-present fields.
+        qs = (params or {}).get("queryString", "")
+        if "AND " in qs:
+            # Filtered query — public endpoint silently ignores the filter
+            # and returns 0 (T-005 scenario).
+            return (200, {"data": []})
+        # Bare team_handle query returns items.
         return (200, {"data": [
+            {"id": 3981275, "type": "hacktivity_item", "attributes": {
+                "title": None, "substate": None, "severity_rating": None,
+                "cwe": None, "url": None, "disclosed_at": None,
+                "disclosed": False, "submitted_at": "2026-08-30T21:50:43.500Z",
+                "latest_disclosable_action": "Activities::BountyAwarded",
+                "latest_disclosable_activity_at": "2026-09-03T08:23:59.873Z",
+                "votes": 3, "total_awarded_amount": 100},
+                "relationships": {"reporter": {"data": {"type": "user",
+                 "attributes": {"name": "p4p3r", "username": "p4p3r_hak"}}}}},
             {"id": 1, "type": "hacktivity_item", "attributes": {
                 "title": "SSRF in avatar upload", "substate": "Resolved",
                 "severity_rating": "high", "cwe": "SSRF",
                 "url": "https://hackerone.com/reports/1", "disclosed_at": "2026-08-01T00:00:00Z",
-                "total_awarded_amount": 500}},
+                "disclosed": True, "submitted_at": "2026-07-15T10:00:00Z",
+                "latest_disclosable_action": "Activities::BugResolved",
+                "latest_disclosable_activity_at": "2026-08-01T00:00:00Z",
+                "votes": 12, "total_awarded_amount": 500},
+                "relationships": {"reporter": {"data": {"type": "user",
+                 "attributes": {"name": "test", "username": "testuser"}}}}},
         ]})
     return (404, {"errors": [{"status": 404}]})
 
@@ -282,9 +304,74 @@ def test_hacktivity_mocked(loaded_manifest):
     with mock.patch.object(ps, "_get", side_effect=_mock_get):
         r = ps.program_hacktivity("crypto", limit=5)
     assert r["status"] == "ok"
+    assert r["count"] == 2
+    # Disclosed item (id 1)
+    disclosed = [x for x in r["reports"] if x["disclosed"]][0]
+    assert disclosed["title"] == "SSRF in avatar upload"
+    assert disclosed["severity"] == "high"
+    assert disclosed["reporter"] == "testuser"
+    assert disclosed["latest_disclosable_action"] == "Activities::BugResolved"
+    # Undisclosed item (id 3981275) — title/substate/url are null but
+    # always-present fields are extracted.
+    undisclosed = [x for x in r["reports"] if not x["disclosed"]][0]
+    assert undisclosed["title"] is None
+    assert undisclosed["disclosed"] is False
+    assert undisclosed["votes"] == 3
+    assert undisclosed["reporter"] == "p4p3r_hak"
+    assert undisclosed["latest_disclosable_action"] == "Activities::BountyAwarded"
+    assert undisclosed["submitted_at"] == "2026-08-30T21:50:43.500Z"
+    assert undisclosed["latest_disclosable_activity_at"] == "2026-09-03T08:23:59.873Z"
+
+
+def test_hacktivity_filter_ignored_warning(loaded_manifest):
+    """T-005 (a): filtered=0 + bare>0 → warning present."""
+    with mock.patch.object(ps, "_get", side_effect=_mock_get) as m:
+        r = ps.program_hacktivity("crypto", query="severity_rating:high", limit=10)
+    assert r["status"] == "ok"
+    assert r["count"] == 0
+    assert "warning" in r
+    assert "do NOT read 0 as 'no dupes'" in r["warning"]
+    # The extra bare re-probe was fired (2 calls: filtered + bare).
+    assert m.call_count == 2
+
+
+def test_hacktivity_filter_genuine_zero(loaded_manifest):
+    """T-005 (b): filtered=0 + bare=0 → no warning."""
+    # Patch _get to always return empty data for both filtered and bare.
+    def _empty(path, params=None, **kw):
+        return (200, {"data": []})
+    with mock.patch.object(ps, "_get", side_effect=_empty) as m:
+        r = ps.program_hacktivity("crypto", query="severity_rating:high", limit=10)
+    assert r["status"] == "ok"
+    assert r["count"] == 0
+    assert "warning" not in r
+    # The extra bare re-probe was still fired (2 calls) but bare also 0.
+    assert m.call_count == 2
+
+
+def test_hacktivity_no_extra_probe_on_results(loaded_manifest):
+    """T-005 (c): non-empty filtered results → no extra probe fired."""
+    # Patch _get to return results even for filtered queries.
+    def _always_results(path, params=None, **kw):
+        return (200, {"data": [
+            {"id": 99, "type": "hacktivity_item", "attributes": {
+                "title": "XSS", "substate": "Resolved", "severity_rating": "high",
+                "cwe": "XSS", "url": "https://hackerone.com/reports/99",
+                "disclosed_at": "2026-09-01T00:00:00Z", "disclosed": True,
+                "submitted_at": "2026-08-01T00:00:00Z",
+                "latest_disclosable_action": "Activities::BugResolved",
+                "latest_disclosable_activity_at": "2026-09-01T00:00:00Z",
+                "votes": 5, "total_awarded_amount": 200},
+                "relationships": {"reporter": {"data": {"type": "user",
+                 "attributes": {"username": "hunter1"}}}}},
+        ]})
+    with mock.patch.object(ps, "_get", side_effect=_always_results) as m:
+        r = ps.program_hacktivity("crypto", query="severity_rating:high", limit=10)
+    assert r["status"] == "ok"
     assert r["count"] == 1
-    assert r["reports"][0]["title"] == "SSRF in avatar upload"
-    assert r["reports"][0]["severity"] == "high"
+    assert "warning" not in r
+    # Only 1 call — no bare re-probe because filtered returned results.
+    assert m.call_count == 1
 
 
 if __name__ == "__main__":

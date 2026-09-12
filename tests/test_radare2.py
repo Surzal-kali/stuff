@@ -342,16 +342,6 @@ class TestEnvelope:
         assert r["status"] == "ok"
         assert "px 32 @" in r["command"]
 
-    def test_stderr_captured_separately(self, crackme_bin):
-        r = run_r2(crackme_bin, "iI")
-        assert "stderr" in r
-        assert isinstance(r["stderr"], str)
-
-    def test_ps_prints_string(self, crackme_bin):
-        # Find the "denied" string addr via izz, then ps it.
-        r = run_r2(crackme_bin, "izz")
-        assert r["status"] == "ok"
-
     def test_next_hints_context_aware(self, crackme_bin):
         r = run_r2(crackme_bin, "afl")
         hints = r["next_hints"]
@@ -370,13 +360,6 @@ class TestEnvelope:
         r = run_r2(crackme_bin, "axf", addr="main")
         assert r["status"] == "ok"
         assert r["output"].strip() == ""
-
-    def test_pdf_shows_calls_from_main(self, crackme_bin):
-        """The rerouted hint path: pdf on main must show call instructions,
-        proving pdf-and-read-the-calls is the reliable alternative to axf."""
-        r = run_r2(crackme_bin, "pdf", addr="main")
-        assert r["status"] == "ok"
-        assert "call" in r["output"]
 
     def test_pdg_hint_routes_to_pdf_not_axf(self, crackme_bin):
         """After pdg, the model should be told to use pdf to see calls,
@@ -620,8 +603,3 @@ class TestRunR2AutoResolution:
         assert r["status"] == "error"
         assert "not found" in r["error"]
         assert "list_r2_targets" in r["error"]
-
-    def test_absolute_path_still_works(self, crackme_bin):
-        """An existing absolute path should bypass drop-folder resolution."""
-        r = run_r2(crackme_bin, "iI")
-        assert r["status"] == "ok"

@@ -541,34 +541,112 @@ def check_reportable(category_or_cwe: str, handle: str = "crypto") -> Dict[str, 
 
 
 @framework_tool(
-    "Fetch a HackerOne program's publicly disclosed reports (hacktivity) "
+    "Fetch a HackerOne program's hacktivity feed (LIVE, sorted newest-first "
+    "by latest_disclosable_activity_at — report IDs are NOT the sort key) "
     "for duplicate-checking before you write up a finding. Works WITHOUT "
     "API credentials (the hacktivity feed is public). Optionally filter "
     "with a Lucene query string (e.g. 'severity_rating:high AND "
-    "cwe:SSRF'). Returns a compact list of disclosed report titles, "
-    "substates, severity, and URLs so you can avoid filing a dupe.",
+    "cwe:SSRF'), but note: query filtering on the public endpoint is "
+    "BEST-EFFORT and may silently return 0 results if the filter is not "
+    "honored (a warning is emitted in the response envelope when this is "
+    "detected — do NOT read a filtered count:0 as 'no dupes'). Most items "
+    "in an active program's feed are UNDISCLOSED: title, substate, url, "
+    "severity, cwe, and disclosed_at will be null for those. The always-"
+    "present useful fields are: disclosed, latest_disclosable_action, "
+    "latest_disclosable_activity_at, submitted_at, votes, total_awarded, "
+    "and reporter username.",
     next_hints=["check_reportable", "report_finding"],
 )
 def program_hacktivity(handle: str = "crypto", query: str = "", limit: int = 25) -> Dict[str, Any]:
-    """Fetch disclosed reports for a program (dedup aid).
+    """Fetch a program's hacktivity feed (dedup aid).
+
+    The public hacktivity endpoint is a live feed sorted newest-first by
+    ``latest_disclosable_activity_at``.  Most items in an active program's
+    feed are undisclosed — H1 redacts ``title``, ``substate``, ``url``,
+    ``severity_rating``, ``cwe``, and ``disclosed_at`` for those.  The
+    always-present fields (``disclosed``, ``latest_disclosable_action``,
+    ``latest_disclosable_activity_at``, ``submitted_at``, ``votes``,
+    ``total_awarded_amount``, reporter username) are extracted regardless.
+
+    Query filtering is best-effort: the public endpoint silently ignores
+    unknown/unhonored Lucene filters and returns 0 results with no error.
+    When a non-empty query yields 0 results, a bare re-probe
+    (``team_handle:<handle>`` only, ``page[size]=5``, no auth) is fired to
+    detect this.  If the bare probe returns results, a warning is added to
+    the response envelope so the caller does not mistake a silent zero for
+    "no duplicates."
 
     Args:
         handle: HackerOne program handle. Defaults to ``"crypto"``.
         query: Optional Lucene filter appended to ``team_handle:<handle>``
-            (e.g. ``"severity_rating:high"``).  Empty = all disclosed.
+            (e.g. ``"severity_rating:high"``).  Empty = all items.
         limit: Max items (1-100). Defaults to 25.
     """
     limit = max(1, min(100, int(limit)))
+    has_filter = bool(query.strip())
     qs = f"team_handle:{handle}"
-    if query.strip():
+    if has_filter:
         qs += f" AND {query.strip()}"
-    status, body = _get("/hackers/hacktivity", params={"queryString": qs, "page[size]": limit},
+
+    status, body = _get("/hackers/hacktivity",
+                        params={"queryString": qs, "page[size]": limit},
                         auth=None)
     if status != 200 or not isinstance(body, dict):
         return {"handle": handle, "status": "error", "error": f"HTTP {status}", "reports": []}
+
+    reports = _extract_hacktivity_items(body.get("data", []))
+
+    # --- T-005: behavioral guard against silent filter ignoring ------------
+    # When a non-empty query returns 0 results, the public endpoint may have
+    # silently ignored the filter.  Re-probe with bare team_handle only
+    # (page[size]=5, no auth) to distinguish "filter ignored" from "genuinely
+    # no data."  This extra probe fires ONLY on the ambiguous zero path.
+    warning = None
+    if has_filter and len(reports) == 0:
+        bare_qs = f"team_handle:{handle}"
+        bare_status, bare_body = _get(
+            "/hackers/hacktivity",
+            params={"queryString": bare_qs, "page[size]": 5},
+            auth=None,
+        )
+        bare_count = 0
+        if bare_status == 200 and isinstance(bare_body, dict):
+            bare_count = len(bare_body.get("data", []))
+        if bare_count > 0:
+            warning = (
+                f"filter returned 0 but bare team_handle:{handle} returned "
+                f"{bare_count} — public endpoint likely ignores this filter; "
+                f"do NOT read 0 as 'no dupes'"
+            )
+
+    result: Dict[str, Any] = {
+        "handle": handle,
+        "status": "ok",
+        "count": len(reports),
+        "reports": reports,
+    }
+    if warning:
+        result["warning"] = warning
+    return result
+
+
+def _extract_hacktivity_items(items: list) -> list:
+    """Extract a compact dict from each hacktivity item.
+
+    Undisclosed items have null for title/substate/url/severity/cwe/
+    disclosed_at.  The always-present fields are extracted regardless so
+    the feed is useful even when most items are undisclosed.
+    """
     reports = []
-    for it in body.get("data", []):
+    for it in items:
         a = it.get("attributes", {}) or {}
+        # Reporter username is nested at relationships.reporter.data.attributes.username
+        reporter_username = None
+        rels = it.get("relationships", {}) or {}
+        reporter = rels.get("reporter", {}) or {}
+        reporter_data = reporter.get("data", {}) or {}
+        reporter_attrs = reporter_data.get("attributes", {}) or {}
+        reporter_username = reporter_attrs.get("username")
         reports.append({
             "id": it.get("id"),
             "title": a.get("title"),
@@ -576,7 +654,13 @@ def program_hacktivity(handle: str = "crypto", query: str = "", limit: int = 25)
             "severity": a.get("severity_rating"),
             "cwe": a.get("cwe"),
             "url": a.get("url"),
+            "disclosed": a.get("disclosed"),
             "disclosed_at": a.get("disclosed_at"),
+            "submitted_at": a.get("submitted_at"),
+            "latest_disclosable_action": a.get("latest_disclosable_action"),
+            "latest_disclosable_activity_at": a.get("latest_disclosable_activity_at"),
+            "votes": a.get("votes"),
             "total_awarded": a.get("total_awarded_amount"),
+            "reporter": reporter_username,
         })
-    return {"handle": handle, "status": "ok", "count": len(reports), "reports": reports}
+    return reports
