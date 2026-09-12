@@ -23,22 +23,31 @@ amass v5 output model (v5.1+):
   stdout only gets a summary header ("Session Scope / FQDN: / <domain>").
   Results live in the engine's SQLite DB and session logs.  The correct
   retrieval path is:
-    1. ``amass enum -d <domain> -dir <tmpdir>``  (writes session log + DB)
-    2. ``amass subs -names -show -d <domain> -dir <tmpdir>``  (prints names)
-  This wrapper automates both steps.  A crt.sh HTTP fallback is layered on
-  top because the engine's crt.sh plugin depends on crt.sh being up, and
-  crt.sh is frequently overloaded (502).
+    1. ``amass enum -d <domain>``  (writes to the default home DB)
+    2. ``amass subs -names -show -d <domain>``  (prints names from home DB)
+
+  **No ``-dir`` flag**: we intentionally use amass's default home DB
+  (``~/.config/amass/asset.db`` under the running user) so that:
+    - Results persist across runs and survive process kills (the home DB
+      is checkpointed; a per-job ``-dir`` DB loses uncommitted WAL data
+      on SIGTERM).
+    - ``amass subs`` retrieves everything ever discovered, not just the
+      current run's (possibly empty) per-job DB.
+    - Accumulated data from prior completed runs is immediately available.
+
+  This wrapper automates both steps.  Free CT/passive sources
+  (certspotter, hackertarget, crt.sh) are layered as augmentation on top
+  because different sources find different subdomains and crt.sh is
+  frequently overloaded (502) for large domains.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import shlex
 import socket
 import subprocess
-import tempfile
 import threading
 import urllib.request
 import urllib.parse
@@ -134,25 +143,28 @@ _AMASS_LOCK = threading.Lock()
 _MAX_AMASS_JOBS = 64
 
 
-def _retrieve_names(domain: str, out_dir: str) -> List[str]:
-    """Retrieve discovered subdomain names from the engine via ``amass subs``.
+def _retrieve_names(domain: str) -> List[str]:
+    """Retrieve discovered subdomain names from the engine's home DB.
 
     In amass v5, ``amass enum`` does NOT print names to stdout.  Results are
-    stored in the engine's DB / session log inside ``out_dir``.  This runs
-    ``amass subs -names -show -d <domain> -dir <out_dir>`` to pull them out.
+    stored in the engine's default home DB (``~/.config/amass/asset.db``).
+    This runs ``amass subs -names -show -d <domain>`` to pull them out.
+
+    No ``-dir`` flag is used — we rely on the home DB so results from prior
+    completed runs persist and are retrievable even if the most recent enum
+    was killed before committing.
     """
     subs_cmd = [
         "amass", "subs",
         "-d", domain,
         "-names",
         "-show",
-        "-dir", out_dir,
     ]
     # A big-domain enum (crypto.com-scale) ingests tens of thousands of names
     # over hours; the `amass subs` dump of that DB takes MINUTES. The naive
     # 30s timeout swallowed entire multi-hour runs' results (Sept 11: 2.5h
     # enum -> 0 names reported, timeout eaten by a bare except). Env-tunable
-    # timeout + one retry before falling through to crt.sh.
+    # timeout + one retry before falling through to CT sources.
     timeout = float(os.getenv("AMASS_RETRIEVAL_TIMEOUT", "600"))
     for _attempt in (1, 2):
         try:
@@ -176,12 +188,12 @@ def _retrieve_names(domain: str, out_dir: str) -> List[str]:
 
 
 def _crtsh_fallback(domain: str) -> List[str]:
-    """Query crt.sh CT logs directly when amass finds nothing.
+    """Query crt.sh CT logs directly.
 
-    crt.sh is frequently overloaded (502/timeout), so this is best-effort
-    with a generous timeout and a single retry.  Returns a sorted list of
-    unique subdomain names that are the domain or a subdomain of it
-    (wildcard certs stripped).
+    crt.sh is frequently overloaded (502/timeout), especially for domains
+    with large CT-log footprints (e.g. crypto.com crashes crt.sh's backend).
+    Best-effort with a generous timeout and a single retry.  Returns a
+    sorted list of unique subdomain names (wildcard certs stripped).
     """
     domain = domain.lower().rstrip(".")
     url = f"https://crt.sh/?q=%25.{domain}&output=json"
@@ -207,26 +219,101 @@ def _crtsh_fallback(domain: str) -> List[str]:
     return []
 
 
-def _get_names(domain: str, out_dir: str) -> List[str]:
-    """Retrieve names from amass v5, falling back to crt.sh if empty.
+def _certspotter_fallback(domain: str) -> List[str]:
+    """Query CertSpotter CT-log API (free, no key required).
 
-    This is the shared post-processing step called by both ``amass_status``
-    and ``subdomain_enum_status`` once the ``amass enum`` subprocess has
-    finished.
+    CertSpotter is more reliable than crt.sh for large domains and returns
+    JSON with dns_names expanded.  Free tier is rate-limited but sufficient
+    for per-domain queries.  Returns sorted unique subdomain names.
     """
-    names = _retrieve_names(domain, out_dir)
+    domain = domain.lower().rstrip(".")
+    url = (
+        f"https://api.certspotter.com/v1/issuances"
+        f"?domain={urllib.parse.quote(domain)}"
+        f"&include_subdomains=true&expand=dns_names"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "amass-wrapper/1.0"})
+        with urllib.request.urlopen(
+            req, timeout=float(os.getenv("AMASS_CERTSPOTTER_TIMEOUT", "30"))
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        names: set[str] = set()
+        for entry in data:
+            for name in entry.get("dns_names", []):
+                name = name.strip().lower().rstrip(".")
+                if name and (name == domain or name.endswith("." + domain)):
+                    if not name.startswith("*."):
+                        names.add(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def _hackertarget_fallback(domain: str) -> List[str]:
+    """Query HackerTarget hostsearch API (free, no key required).
+
+    Returns ``hostname,ip`` lines.  Free tier allows ~50 queries/day per
+    source IP.  Reliable and fast for both small and large domains.
+    """
+    domain = domain.lower().rstrip(".")
+    url = f"https://api.hackertarget.com/hostsearch/?q={urllib.parse.quote(domain)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "amass-wrapper/1.0"})
+        with urllib.request.urlopen(
+            req, timeout=float(os.getenv("AMASS_HACKERTARGET_TIMEOUT", "30"))
+        ) as resp:
+            if resp.status != 200:
+                return []
+            text = resp.read().decode("utf-8", errors="replace")
+        names: set[str] = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "," not in line:
+                continue
+            name = line.split(",")[0].strip().lower().rstrip(".")
+            if name and (name == domain or name.endswith("." + domain)):
+                names.add(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def _get_names(domain: str) -> List[str]:
+    """Retrieve names from amass's home DB, augmented with free CT sources.
+
+    Amass's home DB is the primary source (accumulates across runs).  Free
+    CT/passive sources (certspotter, hackertarget) are always merged in as
+    augmentation because different sources find different subdomains and
+    they're fast (<2s each).  crt.sh is a last resort because it frequently
+    502s on large domains.
+    """
+    names: set[str] = set()
+
+    # Primary: amass home DB (may contain results from prior completed runs
+    # even if the latest enum was killed before committing).
+    amass_names = _retrieve_names(domain)
+    names.update(amass_names)
+
+    # Augmentation: free CT/passive sources (fast, find different subs).
+    names.update(_certspotter_fallback(domain))
+    names.update(_hackertarget_fallback(domain))
+
+    # Last resort: crt.sh (frequently 502 on large domains).
     if not names:
-        names = _crtsh_fallback(domain)
-    return names
+        names.update(_crtsh_fallback(domain))
+
+    return sorted(names)
 
 
-def _store_amass_meta(job_id: str, domain: str, out_dir: str,
+def _store_amass_meta(job_id: str, domain: str,
                       options: str, composite: bool) -> None:
     """Stash extra metadata for a launched amass job."""
     with _AMASS_LOCK:
         _AMASS_JOBS[job_id] = {
             "domain": domain,
-            "out_dir": out_dir,
             "options": options,
             "composite": composite,
             "result": None,       # cached retrieval result (set on first done-poll)
@@ -239,11 +326,7 @@ def _store_amass_meta(job_id: str, domain: str, out_dir: str,
                 key=lambda k: _AMASS_JOBS[k].get("started", 0),
             )
             for k in done[: len(_AMASS_JOBS) - _MAX_AMASS_JOBS]:
-                meta = _AMASS_JOBS.pop(k)
-                try:
-                    shutil.rmtree(meta["out_dir"], ignore_errors=True)
-                except Exception:
-                    pass
+                _AMASS_JOBS.pop(k, None)
 
 
 def _get_amass_meta(job_id: str) -> Optional[Dict[str, Any]]:
@@ -282,7 +365,9 @@ def run_amass(target, options=""):
     """
     validated = _validate_options(options)
 
-    # Filter out -dir/-d/-oA from user options — we manage those internally.
+    # Filter out -dir/-d/-oA from user options — -d and -oA are managed
+    # internally; -dir is intentionally NOT used (we rely on amass's default
+    # home DB so results persist across runs and survive process kills).
     user_flags = []
     skip_next = False
     for tok in validated:
@@ -294,17 +379,24 @@ def run_amass(target, options=""):
             continue
         user_flags.append(tok)
 
-    out_dir = tempfile.mkdtemp(prefix="amass_v5_")
+    # -rigid prevents scope expansion into third-party infrastructure
+    # (sendgrid, AWS EC2, etc.) that wastes the enum's time budget on noise.
+    if "-rigid" not in user_flags:
+        user_flags.append("-rigid")
+
     command = [
         "amass", "enum",
         "-d", target,
         "-nocolor",
-        "-dir", out_dir,
         *user_flags,
     ]
 
-    dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
-    amass_cap = min(600, dispatch_timeout - 10)
+    # Use the full dispatch timeout (minus headroom) by default.  The old
+    # min(600, ...) cap killed every enum at 10 minutes — before amass v5
+    # could commit its WAL transaction, causing total data loss.  Override
+    # with AMASS_ENUM_TIMEOUT env var if a shorter cap is needed.
+    dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "1900"))
+    amass_cap = float(os.getenv("AMASS_ENUM_TIMEOUT", str(max(60, dispatch_timeout - 10))))
 
     job = launch_job(
         command,
@@ -312,7 +404,7 @@ def run_amass(target, options=""):
         timeout=amass_cap,
     )
     job_id = job["job_id"]
-    _store_amass_meta(job_id, target, out_dir, options, composite=False)
+    _store_amass_meta(job_id, target, options, composite=False)
 
     return {
         "job_id": job_id,
@@ -358,7 +450,7 @@ def amass_status(job_id):
     # --- Job is done: retrieve names (once, cache the result) ---
     if not meta["retrieved"]:
         domain = meta["domain"]
-        names = _get_names(domain, meta["out_dir"])
+        names = _get_names(domain)
         with _AMASS_LOCK:
             meta["retrieved"] = True
             meta["result"] = names
@@ -372,15 +464,14 @@ def amass_status(job_id):
             "status": "done",
             "subdomains": [],
             "note": (
-                "amass returned no subdomains and crt.sh fallback also "
-                "failed (crt.sh may be down — 502/timeout). Possible "
-                "causes: crt.sh overloaded, no data-source API keys "
-                "configured, or the domain has no CT-log entries. ALSO: on "
-                "very large result sets the amass-subs retrieval step may "
-                "have timed out even with keys live - the names are still "
-                "in the job out_dir (/tmp/amass_v5_* on the framework "
-                "host); recover with: amass subs -names -show -d <domain> "
-                "-dir <out_dir>."
+                "amass returned no subdomains and all free CT sources "
+                "(certspotter, hackertarget, crt.sh) also returned nothing. "
+                "Possible causes: no data-source API keys active in "
+                "datasources.yaml, the domain has no CT-log entries, or all "
+                "CT sources are down.  If amass enum was killed before "
+                "completing, prior run results may still be in the home DB "
+                "(~/.config/amass/asset.db) — try: amass subs -names -show "
+                "-d <domain>."
             ),
             "elapsed": poll.get("elapsed"),
             "timed_out": poll.get("timed_out", False),
@@ -510,7 +601,9 @@ def subdomain_enum(target, options=""):
     """
     validated = _validate_options(options)
 
-    # Filter out -dir/-d/-oA from user options — we manage those internally.
+    # Filter out -dir/-d/-oA from user options — -d and -oA are managed
+    # internally; -dir is intentionally NOT used (we rely on amass's default
+    # home DB so results persist across runs and survive process kills).
     user_flags = []
     skip_next = False
     for tok in validated:
@@ -522,17 +615,24 @@ def subdomain_enum(target, options=""):
             continue
         user_flags.append(tok)
 
-    out_dir = tempfile.mkdtemp(prefix="amass_v5_")
+    # -rigid prevents scope expansion into third-party infrastructure
+    # (sendgrid, AWS EC2, etc.) that wastes the enum's time budget on noise.
+    if "-rigid" not in user_flags:
+        user_flags.append("-rigid")
+
     command = [
         "amass", "enum",
         "-d", target,
         "-nocolor",
-        "-dir", out_dir,
         *user_flags,
     ]
 
-    dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
-    amass_cap = min(600, dispatch_timeout - 10)
+    # Use the full dispatch timeout (minus headroom) by default.  The old
+    # min(600, ...) cap killed every enum at 10 minutes — before amass v5
+    # could commit its WAL transaction, causing total data loss.  Override
+    # with AMASS_ENUM_TIMEOUT env var if a shorter cap is needed.
+    dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "1900"))
+    amass_cap = float(os.getenv("AMASS_ENUM_TIMEOUT", str(max(60, dispatch_timeout - 10))))
 
     job = launch_job(
         command,
@@ -540,7 +640,7 @@ def subdomain_enum(target, options=""):
         timeout=amass_cap,
     )
     job_id = job["job_id"]
-    _store_amass_meta(job_id, target, out_dir, options, composite=True)
+    _store_amass_meta(job_id, target, options, composite=True)
 
     return {
         "job_id": job_id,
@@ -586,7 +686,7 @@ def subdomain_enum_status(job_id):
     # --- Job is done: retrieve names (once, cache the result) ---
     if not meta["retrieved"]:
         domain = meta["domain"]
-        names = _get_names(domain, meta["out_dir"])
+        names = _get_names(domain)
         with _AMASS_LOCK:
             meta["retrieved"] = True
             meta["result"] = names
@@ -605,15 +705,14 @@ def subdomain_enum_status(job_id):
             "elapsed": poll.get("elapsed"),
             "timed_out": poll.get("timed_out", False),
             "note": (
-                "amass returned no subdomains and crt.sh fallback also "
-                "failed (crt.sh may be down — 502/timeout). Possible "
-                "causes: crt.sh overloaded, no data-source API keys "
-                "configured, or the domain has no CT-log entries. ALSO: on "
-                "very large result sets the amass-subs retrieval step may "
-                "have timed out even with keys live - the names are still "
-                "in the job out_dir (/tmp/amass_v5_* on the framework "
-                "host); recover with: amass subs -names -show -d <domain> "
-                "-dir <out_dir>."
+                "amass returned no subdomains and all free CT sources "
+                "(certspotter, hackertarget, crt.sh) also returned nothing. "
+                "Possible causes: no data-source API keys active in "
+                "datasources.yaml, the domain has no CT-log entries, or all "
+                "CT sources are down.  If amass enum was killed before "
+                "completing, prior run results may still be in the home DB "
+                "(~/.config/amass/asset.db) — try: amass subs -names -show "
+                "-d <domain>."
             ),
         }
 
