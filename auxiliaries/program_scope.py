@@ -262,6 +262,20 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
                 patterns.append(host)
     if not patterns:
         return None
+    # Out-of-scope DOMAIN/WILDCARD/URL assets become `!`-prefixed deny lines
+    # so amass's filter can exclude explicit OOS hosts even when they also
+    # match an in-scope wildcard.  amass._load_scope returns these separately.
+    for a in manifest.get("out_of_scope_assets", []):
+        atype = (a.get("asset_type") or "").upper()
+        ident = (a.get("asset_identifier") or "").strip()
+        if not ident:
+            continue
+        if atype in ("WILDCARD", "DOMAIN"):
+            patterns.append("!" + ident)
+        elif atype == "URL":
+            host = urlparse(ident if "://" in ident else f"http://{ident}").hostname
+            if host:
+                patterns.append("!" + host)
     scope_path = Path(os.getenv("WORKSPACE_ROOT", ".")) / ".scope"
     seen = set()
     lines = ["# Auto-generated from HackerOne program scope — do not edit by hand.",
@@ -433,13 +447,20 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False) -> Dict[st
     "(from cache or live) if not already loaded.",
     next_hints=["run_nmap", "run_ffuf", "run_masscan", "zap_open_url"],
 )
-def check_scope(target: str, handle: str = "crypto") -> Dict[str, Any]:
+def check_scope(target: str, handle: str) -> Dict[str, Any]:
     """Test ``target`` against the loaded scope manifest for ``handle``.
 
     Args:
         target: A hostname, URL, IP, CIDR, or mobile app package id.
-        handle: HackerOne program handle. Defaults to ``"crypto"``.
+        handle: HackerOne program handle (REQUIRED — no default; a silent
+            default silently checks against the wrong program's manifest).
     """
+    if not handle or not str(handle).strip():
+        raise ValueError(
+            "handle is required: scope checks against a silent default "
+            "program produced wrong-verdict bugs (see bugcheck ledger 2026-09-12)"
+        )
+    handle = str(handle).strip()
     manifest = _load_cache(handle)
     if manifest is None:
         manifest = load_program_scope(handle, refresh=False)
@@ -448,15 +469,10 @@ def check_scope(target: str, handle: str = "crypto") -> Dict[str, Any]:
 
     in_assets = manifest.get("in_scope", [])
     out_assets = manifest.get("out_of_scope_assets", [])
-    match = _find_match(target, in_assets)
-    if match:
-        return {
-            "target": target,
-            "in_scope": True,
-            "matched_asset": match,
-            "max_severity": match.get("max_severity"),
-            "reason": f"matches in-scope {match.get('asset_type')} asset {match.get('asset_identifier')!r}",
-        }
+    # Precedence rule: an explicit OUT-OF-SCOPE asset match ALWAYS wins over
+    # an in-scope wildcard.  Otherwise a host listed OOS under *.example.com
+    # (e.g. selfservice.grindr.com under *.grindr.com) silently comes back
+    # in_scope=True because the wildcard is consulted first.
     out_match = _find_match(target, out_assets)
     if out_match:
         return {
@@ -465,6 +481,15 @@ def check_scope(target: str, handle: str = "crypto") -> Dict[str, Any]:
             "matched_asset": out_match,
             "reason": (f"matches an explicitly out-of-scope asset "
                        f"{out_match.get('asset_identifier')!r}"),
+        }
+    match = _find_match(target, in_assets)
+    if match:
+        return {
+            "target": target,
+            "in_scope": True,
+            "matched_asset": match,
+            "max_severity": match.get("max_severity"),
+            "reason": f"matches in-scope {match.get('asset_type')} asset {match.get('asset_identifier')!r}",
         }
     return {
         "target": target,
@@ -483,15 +508,18 @@ def check_scope(target: str, handle: str = "crypto") -> Dict[str, Any]:
     "spam-grade reports that hurt your HackerOne reputation.",
     next_hints=["report_finding", "program_hacktivity"],
 )
-def check_reportable(category_or_cwe: str, handle: str = "crypto") -> Dict[str, Any]:
+def check_reportable(category_or_cwe: str, handle: str) -> Dict[str, Any]:
     """Test a finding category/CWE against the program's exclusion + weakness rules.
 
     Args:
         category_or_cwe: A vulnerability category name (e.g. "Missing security
             headers", "Brute force", "Open redirect") or a CWE id
             (e.g. "CWE-89", "cwe-352").  Matched case-insensitively.
-        handle: HackerOne program handle. Defaults to ``"crypto"``.
+        handle: HackerOne program handle (REQUIRED — no default).
     """
+    if not handle or not str(handle).strip():
+        raise ValueError("handle is required: silent program default produced wrong-verdict bugs")
+    handle = str(handle).strip()
     manifest = _load_cache(handle)
     if manifest is None:
         manifest = load_program_scope(handle, refresh=False)

@@ -203,11 +203,12 @@ def test_scope_file_written_amass_compatible(loaded_manifest):
     assert "crypto.com" in text  # URL host reduced
     assert "co.mona.android" not in text  # mobile app id is not a domain pattern
     # amass's own loader consumes it and matches correctly
-    patterns = _load_scope()
-    assert patterns is not None
-    assert _in_scope("api.crypto.com", patterns) is True
-    assert _in_scope("crypto.com", patterns) is True
-    assert _in_scope("evil.com", patterns) is False
+    scope = _load_scope()
+    assert scope is not None
+    in_p, out_p = scope
+    assert _in_scope("api.crypto.com", in_p, out_p) is True
+    assert _in_scope("crypto.com", in_p, out_p) is True
+    assert _in_scope("evil.com", in_p, out_p) is False
 
 
 def test_manifest_cached_to_disk(loaded_manifest):
@@ -376,3 +377,61 @@ def test_hacktivity_no_extra_probe_on_results(loaded_manifest):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- regression: OOS precedence & required-handle guards ---------------------
+
+def test_check_scope_oos_wins_over_wildcard(loaded_manifest, monkeypatch, tmp_path):
+    """REGRESSION (bugcheck 2026-09-12): selfservice.grindr.com is explicitly
+    OOS under *.grindr.com but used to return in_scope=True because the
+    wildcard match short-circuited before the OOS list was consulted."""
+    m, _ = loaded_manifest
+    m["out_of_scope_assets"] = [{
+        "id": "9", "asset_type": "DOMAIN", "asset_identifier": "mail.crypto.com",
+        "eligible_for_bounty": False, "eligible_for_submission": False,
+        "max_severity": "none", "instruction": "legacy OOS host shadowing the in-scope wildcard",
+        "reference": None, "updated_at": "2026-01-01T00:00:00Z"}]
+    # check_scope reads from the on-disk cache, so persist the mutation.
+    ps._save_cache("crypto", m)
+    r = ps.check_scope("mail.crypto.com", handle="crypto")
+    assert r["in_scope"] is False
+    assert "out-of-scope" in r["reason"]
+    # non-shadowed host still matches the in-scope wildcard
+    assert ps.check_scope("api.crypto.com", handle="crypto")["in_scope"] is True
+
+
+def test_check_scope_oos_exact_beats_url_asset(loaded_manifest):
+    m, _ = loaded_manifest
+    m["out_of_scope_assets"] = [{
+        "id": "9", "asset_type": "URL",
+        "asset_identifier": "https://crypto.com/exchange",
+        "eligible_for_submission": False, "max_severity": "none",
+        "instruction": "legacy path OOS"}]
+    # check_scope reads from the on-disk cache, so persist the mutation.
+    ps._save_cache("crypto", m)
+    r = ps.check_scope("https://crypto.com/exchange/BTC", handle="crypto")
+    assert r["in_scope"] is False
+
+
+def test_check_scope_handle_required():
+    with pytest.raises(ValueError):
+        ps.check_scope("crypto.com", handle="")
+    with pytest.raises(ValueError):
+        ps.check_scope("crypto.com", handle="   ")
+
+
+def test_check_reportable_handle_required():
+    with pytest.raises(ValueError):
+        ps.check_reportable("CWE-89", handle="")
+
+
+def test_in_scope_oos_exclamation_pattern(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkey = tmp_path / ".scope"
+    monkey.write_text("*.crypto.com\n!selfservice.crypto.com\n")
+    scope = _load_scope()
+    assert scope is not None
+    in_p, out_p = scope
+    assert _in_scope("api.crypto.com", in_p, out_p) is True
+    assert _in_scope("selfservice.crypto.com", in_p, out_p) is False
+    assert _in_scope("evil.com", in_p, out_p) is False

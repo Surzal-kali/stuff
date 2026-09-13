@@ -53,7 +53,7 @@ import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job
@@ -479,8 +479,8 @@ def amass_status(job_id):
         return result
 
     # Scope filtering (same as the old run_amass).
-    patterns = _load_scope()
-    if patterns is None:
+    scope = _load_scope()
+    if scope is None:
         # Lab mode — no scope file, return raw names.
         return {
             "job_id": job_id,
@@ -492,7 +492,8 @@ def amass_status(job_id):
             "note": "prefer subdomain_enum for alive-checking + structured result",
         }
 
-    in_scope = [s for s in names if _in_scope(s, patterns)]
+    in_patterns, out_patterns = scope
+    in_scope = [s for s in names if _in_scope(s, in_patterns, out_patterns)]
     out_of_scope = [s for s in names if s not in in_scope]
     return {
         "job_id": job_id,
@@ -509,33 +510,56 @@ def amass_status(job_id):
 
 # --- subdomain_enum composite ------------------------------------------------
 
-def _load_scope() -> List[str] | None:
+def _load_scope() -> Tuple[List[str], List[str]] | None:
     """Load scope patterns from ``.scope`` in the workspace root.
 
     Returns None if no scope file exists (lab mode — everything in scope).
-    Each line is a scope pattern: ``*.example.com``, ``example.com``, or
-    ``api.example.com``.  Lines starting with # are comments.
+    Otherwise returns ``(in_patterns, out_patterns)``.  In-patterns are
+    ``*.example.com`` / ``example.com`` / ``api.example.com`` lines;
+    out-patterns are the same shapes prefixed with ``!`` (explicit
+    out-of-scope assets written by program_scope._write_scope_file).
+    Lines starting with # are comments.
     """
     scope_file = Path(os.getenv("WORKSPACE_ROOT", ".")) / ".scope"
     if not scope_file.is_file():
         return None
-    patterns = []
+    in_patterns: List[str] = []
+    out_patterns: List[str] = []
     for line in scope_file.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
-            patterns.append(line)
-    return patterns or None
+            if line.startswith("!"):
+                out_patterns.append(line[1:])
+            else:
+                in_patterns.append(line)
+    if not in_patterns and not out_patterns:
+        return None
+    return (in_patterns, out_patterns)
 
 
-def _in_scope(subdomain: str, patterns: List[str]) -> bool:
+def _in_scope(subdomain: str, patterns: List[str],
+              out_patterns: Optional[List[str]] = None) -> bool:
     """Check if a subdomain matches any scope pattern.
 
     Patterns:
       *.example.com  -> any subdomain of example.com (and example.com itself)
       example.com    -> example.com and any *.example.com
       api.example.com -> exact match only
+
+    Any match in ``out_patterns`` (explicit OOS assets) FORCES in-scope
+    False — OOS always wins over wildcards, mirroring program_scope's
+    check_scope precedence rule.
     """
     sub = subdomain.lower().rstrip(".")
+    if out_patterns:
+        for pat in out_patterns:
+            pat = pat.lower().rstrip(".")
+            if pat.startswith("*."):
+                root = pat[2:]
+                if sub == root or sub.endswith("." + root):
+                    return False
+            elif sub == pat or sub.endswith("." + pat):
+                return False
     for pat in patterns:
         pat = pat.lower().rstrip(".")
         if pat.startswith("*."):
@@ -557,21 +581,40 @@ def _is_alive(hostname: str, timeout: float = 3.0) -> bool:
 
 
 def _resolve_alive(
-    hostnames: List[str], timeout: float = 3.0, workers: int = 20
-) -> List[str]:
+    hostnames: List[str], timeout: float = 3.0, workers: int = 20,
+    out_patterns: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """Concurrently DNS-resolve a list of hostnames.
 
-    Returns the subset that resolve, preserving input order.  Using a
+    Returns one record per input host, preserving input order:
+    ``{"host": h, "alive": bool, "oos": bool}``.  ``oos`` is True when the
+    host also matches an explicit out-of-scope pattern (a defensive
+    double-check — ``subdomain_enum_status`` filters OOS before calling
+    this, so ``oos`` is normally False; a non-empty alive+oos set is the
+    visible alarm that the OOS filter saw something alive).  Using a
     ThreadPoolExecutor(20) turns 500 subs × 3s worst case from ~25 minutes
     sequential into ~75 seconds.
     """
-    alive_set: set[str] = set()
+    out_norm = [p.lower().rstrip(".") for p in (out_patterns or [])]
+
+    def _is_oos(host: str) -> bool:
+        sub = host.lower().rstrip(".")
+        for pat in out_norm:
+            if pat.startswith("*."):
+                root = pat[2:]
+                if sub == root or sub.endswith("." + root):
+                    return True
+            elif sub == pat or sub.endswith("." + pat):
+                return True
+        return False
+
+    records: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_is_alive, h, timeout): h for h in hostnames}
         for future in as_completed(futures):
-            if future.result():
-                alive_set.add(futures[future])
-    return [h for h in hostnames if h in alive_set]
+            h = futures[future]
+            records[h] = {"host": h, "alive": bool(future.result()), "oos": _is_oos(h)}
+    return [records[h] for h in hostnames]
 
 
 # --- subdomain_enum (async launcher) + subdomain_enum_status (poller) -------
@@ -717,26 +760,32 @@ def subdomain_enum_status(job_id):
         }
 
     # Scope filtering.
-    patterns = _load_scope()
-    if patterns is None:
+    scope = _load_scope()
+    if scope is None:
         in_scope = names
         out_of_scope = []
+        out_patterns = []
     else:
-        in_scope = [s for s in names if _in_scope(s, patterns)]
+        in_patterns, out_patterns = scope
+        in_scope = [s for s in names if _in_scope(s, in_patterns, out_patterns)]
         out_of_scope = [s for s in names if s not in in_scope]
 
     # DNS resolution (alive check) — only on in-scope subs.
-    alive = _resolve_alive(in_scope)
+    resolved = _resolve_alive(in_scope, out_patterns=out_patterns if scope else [])
+    alive = [r["host"] for r in resolved if r["alive"] and not r["oos"]]
+    alive_oos = [r["host"] for r in resolved if r["alive"] and r["oos"]]
 
     return {
         "job_id": job_id,
         "status": "done",
         "subdomains": in_scope,
         "alive": alive,
+        "alive_oos": alive_oos,
         "out_of_scope": out_of_scope,
         "total_discovered": len(names),
         "total_in_scope": len(in_scope),
         "total_alive": len(alive),
+        "total_alive_oos": len(alive_oos),
         "elapsed": poll.get("elapsed"),
         "timed_out": poll.get("timed_out", False),
     }
