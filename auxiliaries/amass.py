@@ -49,14 +49,34 @@ import shlex
 import socket
 import subprocess
 import threading
+import time
 import urllib.request
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job
+
+# --- bounded DNS resolver for the alive-check sweep -------------------------
+#
+# The alive-check previously called ``socket.getaddrinfo`` with a ``timeout``
+# argument that getaddrinfo does NOT accept — the arg was silently ignored and
+# every resolve was bounded only by the system resolver's default (tens of
+# seconds on a nameserver retry/serfail).  On a 260-host in-scope set that
+# pushed the sweep far past the MCP caller's socket deadline (the connecting
+# agent destroys any call that runs >30s), so ``subdomain_enum_status`` timed
+# out on every poll while the discovery-only ``amass_status`` returned
+# instantly.  We now resolve via dnspython with a real per-host ``lifetime``
+# (default 3s) plus an overall sweep budget (default 25s) so partial results
+# are returned within the deadline instead of hanging the whole call.
+try:
+    import dns.resolver as _dns_resolver
+    _DNS_RESOLVER = _dns_resolver.Resolver(configure=True)
+    _DNS_AVAILABLE = True
+except Exception:  # pragma: no cover - dnspython is a declared dep, defensive
+    _DNS_AVAILABLE = False
 
 # --- flag allowlist ----------------------------------------------------------
 
@@ -318,6 +338,10 @@ def _store_amass_meta(job_id: str, domain: str,
             "composite": composite,
             "result": None,       # cached retrieval result (set on first done-poll)
             "retrieved": False,
+            "alive": None,        # cached alive-check (set on first subdomain_enum_status done-poll)
+            "alive_retrieved": False,
+            "alive_checked": 0,   # hosts actually resolved before the budget expired
+            "alive_partial": False,
         }
         if len(_AMASS_JOBS) > _MAX_AMASS_JOBS:
             # Evict oldest entries that have been retrieved.
@@ -599,29 +623,89 @@ def _in_scope(subdomain: str, patterns: List[str],
 
 
 def _is_alive(hostname: str, timeout: float = 3.0) -> bool:
-    """DNS-resolve a hostname; return True if it resolves to any A/AAAA record."""
-    try:
-        socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        return True
-    except (socket.gaierror, socket.timeout, OSError):
-        return False
+    """Return True if ``hostname`` has any A/AAAA DNS record.
+
+    Uses dnspython with a real per-host ``lifetime`` (default 3s, env
+    ``AMASS_ALIVE_HOST_TIMEOUT``) so a hung/unreachable nameserver cannot pin
+    the sweep.  Falls back to a thread-bounded ``socket.getaddrinfo`` if
+    dnspython is unavailable.
+
+    The previous implementation called ``socket.getaddrinfo`` with a
+    ``timeout`` argument that getaddrinfo does NOT accept — it was silently
+    dropped and each resolve was bounded only by the system resolver default,
+    which routinely ran tens of seconds on a serfail/retry and pushed the
+    alive-check sweep past the caller's socket deadline.
+    """
+    if _DNS_AVAILABLE:
+        # Per-call lifetime keeps the shared resolver thread-safe across the
+        # sweep's worker pool (resolve() builds a per-query context).
+        try:
+            _DNS_RESOLVER.resolve(hostname, "A", lifetime=timeout)
+            return True
+        except _dns_resolver.NXDOMAIN:
+            pass
+        except _dns_resolver.NoAnswer:
+            pass
+        except (_dns_resolver.NoNameservers, _dns_resolver.LifetimeTimeout,
+                _dns_resolver.Timeout):
+            return False
+        except Exception:  # pragma: no cover - defensive
+            return False
+        try:
+            _DNS_RESOLVER.resolve(hostname, "AAAA", lifetime=timeout)
+            return True
+        except Exception:
+            return False
+
+    # Fallback: bound the blocking getaddrinfo in a throwaway thread so the
+    # dead ``timeout`` semantics can't hang us when dnspython is absent.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(
+            socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        try:
+            fut.result(timeout=timeout)
+            return True
+        except _FutureTimeout:
+            return False
+        except (socket.gaierror, socket.timeout, OSError):
+            return False
 
 
 def _resolve_alive(
-    hostnames: List[str], timeout: float = 3.0, workers: int = 20,
+    hostnames: List[str], timeout: float = 3.0, workers: int = 40,
     out_patterns: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Concurrently DNS-resolve a list of hostnames.
+    budget: Optional[float] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Concurrently DNS-resolve a list of hostnames within a hard deadline.
 
-    Returns one record per input host, preserving input order:
-    ``{"host": h, "alive": bool, "oos": bool}``.  ``oos`` is True when the
-    host also matches an explicit out-of-scope pattern (a defensive
-    double-check — ``subdomain_enum_status`` filters OOS before calling
-    this, so ``oos`` is normally False; a non-empty alive+oos set is the
-    visible alarm that the OOS filter saw something alive).  Using a
-    ThreadPoolExecutor(20) turns 500 subs × 3s worst case from ~25 minutes
-    sequential into ~75 seconds.
+    Returns ``(records, checked)`` where ``records`` is one entry per input
+    host in input order ``{"host": h, "alive": bool, "oos": bool}`` and
+    ``checked`` is how many hosts actually got a resolution attempt before
+    the budget expired (hosts not reached in time are returned as
+    ``alive=False``).
+
+    ``oos`` is True when the host also matches an explicit out-of-scope
+    pattern (a defensive double-check — ``subdomain_enum_status`` filters
+    OOS before calling this, so ``oos`` is normally False; a non-empty
+    alive+oos set is the visible alarm that the OOS filter saw something
+    alive).
+
+    Two caps keep this under the MCP caller's ~30s socket deadline:
+      * per-host ``timeout`` (env ``AMASS_ALIVE_HOST_TIMEOUT``, default 3s)
+        via dnspython ``lifetime`` — a hung resolver can't stall one slot.
+      * overall ``budget`` (env ``AMASS_ALIVE_BUDGET``, default 25s) —
+        ``as_completed(timeout=budget)`` returns whatever finished; the rest
+        are reported as not-alive rather than hanging the call.  With 40
+        workers and a 3s per-host cap, 260 hosts finish in <= ~20s worst
+        case, well under budget.
     """
+    host_timeout = float(os.getenv("AMASS_ALIVE_HOST_TIMEOUT", str(timeout)))
+    n_workers = int(os.getenv("AMASS_ALIVE_WORKERS", str(workers)))
+    overall = float(os.getenv(
+        "AMASS_ALIVE_BUDGET", "25" if budget is None else str(budget)
+    ))
+
     out_norm = [p.lower().rstrip(".") for p in (out_patterns or [])]
 
     def _is_oos(host: str) -> bool:
@@ -636,12 +720,27 @@ def _resolve_alive(
         return False
 
     records: Dict[str, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_is_alive, h, timeout): h for h in hostnames}
-        for future in as_completed(futures):
-            h = futures[future]
-            records[h] = {"host": h, "alive": bool(future.result()), "oos": _is_oos(h)}
-    return [records[h] for h in hostnames]
+    checked = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_is_alive, h, host_timeout): h for h in hostnames}
+        try:
+            for future in as_completed(futures, timeout=overall):
+                h = futures[future]
+                records[h] = {"host": h, "alive": bool(future.result()), "oos": _is_oos(h)}
+                checked += 1
+        except _FutureTimeout:
+            # Budget expired — return whatever finished; the rest are
+            # reported as not-alive below.  ``checked < len(hostnames)``
+            # tells the caller the result is partial.
+            pass
+    # Hosts that didn't get a verdict in time are conservatively not-alive.
+    out: List[Dict[str, Any]] = []
+    for h in hostnames:
+        if h in records:
+            out.append(records[h])
+        else:
+            out.append({"host": h, "alive": False, "oos": _is_oos(h)})
+    return out, checked
 
 
 # --- subdomain_enum (async launcher) + subdomain_enum_status (poller) -------
@@ -825,7 +924,24 @@ def subdomain_enum_status(job_id):
         out_of_scope = [s for s in names if s not in in_scope]
 
     # DNS resolution (alive check) — only on in-scope subs.
-    resolved = _resolve_alive(in_scope, out_patterns=out_patterns if scope else [])
+    #
+    # The alive-check is bounded (per-host lifetime + overall budget, see
+    # ``_resolve_alive``) AND cached on the job meta so retries are free —
+    # previously every poll re-ran the full uncached sweep, and the dead
+    # ``timeout`` arg let each resolve run to the system resolver default,
+    # pushing the call past the MCP caller's socket deadline every time.
+    if not meta["alive_retrieved"]:
+        resolved, checked = _resolve_alive(
+            in_scope, out_patterns=out_patterns if scope else []
+        )
+        with _AMASS_LOCK:
+            meta["alive_retrieved"] = True
+            meta["alive"] = resolved
+            meta["alive_checked"] = checked
+            meta["alive_partial"] = checked < len(in_scope)
+    else:
+        resolved = meta["alive"]
+        checked = meta["alive_checked"]
     alive = [r["host"] for r in resolved if r["alive"] and not r["oos"]]
     alive_oos = [r["host"] for r in resolved if r["alive"] and r["oos"]]
 
@@ -840,6 +956,8 @@ def subdomain_enum_status(job_id):
         "total_in_scope": len(in_scope),
         "total_alive": len(alive),
         "total_alive_oos": len(alive_oos),
+        "alive_checked": checked,
+        "alive_partial": meta["alive_partial"],
         "elapsed": poll.get("elapsed"),
         "timed_out": poll.get("timed_out", False),
     }

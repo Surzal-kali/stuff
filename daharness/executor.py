@@ -324,10 +324,33 @@ class ExecutorMixin:
             # with "unexpected keyword argument '_raw'" instead of a clear
             # missing-argument error.
             args.pop("_raw", None)
+            # Cap in-process tools with the same BRAIN_DISPATCH_TIMEOUT the
+            # out-of-process Brain path already enforces. Without this a
+            # blocking in-process tool (e.g. the amass alive-check sweep) can
+            # hang the worker thread indefinitely while the MCP caller's
+            # socket dies opaquely. Mirroring the Brain path turns a silent
+            # socket-timeout into an honest "did not return within Ns".
+            dispatch_timeout = float(os.getenv("BRAIN_DISPATCH_TIMEOUT", "600"))
             if inspect.iscoroutinefunction(func):
-                result = await func(**args)
+                coro = func(**args)
             else:
-                result = await asyncio.to_thread(functools.partial(func, **args))
+                coro = asyncio.to_thread(functools.partial(func, **args))
+            try:
+                result = await asyncio.wait_for(coro, timeout=dispatch_timeout)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[INPROC_LAUNCH] %s did not return within %.0fs (BRAIN_DISPATCH_TIMEOUT)",
+                    tool_id, dispatch_timeout,
+                )
+                return {
+                    "error": (
+                        f"In-process tool '{tool_id}' did not return a result "
+                        f"within {dispatch_timeout:.0f}s (BRAIN_DISPATCH_TIMEOUT). "
+                        "If this is expected for a long-running tool, raise "
+                        "BRAIN_DISPATCH_TIMEOUT or split into a launch+poll job."
+                    ),
+                    "status": "Failed",
+                }
 
             return self._wrap_launch_result(result)
         except TypeError as e:
