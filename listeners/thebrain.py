@@ -63,7 +63,21 @@ class FunctionRegistry:
         """
         key = (str(session_id), self._class_key(cls))
         if key not in self._instances:
-            self._instances[key] = cls()
+            # Prefer an explicit shared-instance classmethod (e.g.
+            # MetasploitClient.get_instance) so brain-dispatched stateful
+            # clients reuse the live handle bootstrap started, instead of a
+            # bare cls() twin whose connection was never established. This
+            # mirrors _resolve_callable in daharness/executor.py; without it
+            # the brain path silently diverged from the in-process fallback
+            # (which only became the active path once brain.sock was
+            # unreachable, masking the bug until the umask fix made the
+            # socket world-connectable). Per-session isolation still holds
+            # for classes that don't define get_instance.
+            factory = getattr(cls, "get_instance", None)
+            if callable(factory):
+                self._instances[key] = factory()
+            else:
+                self._instances[key] = cls()
         return self._instances[key]
 
     def _instance_for(self, cls):
@@ -357,15 +371,25 @@ async def start_brain():
                 return
 
             print(f"Received {event_type} for session {session_id}: {payload}")
-            
-            # Create the event struct
+
+            # Create the event struct. The FrameworkEvent.data field is a fixed
+            # c_char*1024 buffer inherited from the legacy C plugin (frameit.so
+            # / lib.send_event) and CANNOT carry payloads larger than 1023
+            # bytes. The wire transport (pack_message/read_message) already
+            # uses a 4-byte big-endian length prefix ("!I") and delivers the
+            # FULL message intact -- so instead of truncating into the struct
+            # and losing the tail of large CALL_TOOL arg dicts, pass the full
+            # payload string through to dispatch for the Python-handled event
+            # types. The struct is still populated (truncated) for the legacy
+            # C send_event pathway at the bottom of dispatch, which only ever
+            # dealt with small C events and never JSON tool args.
             event = FrameworkEvent()
             event.event_type = event_type.encode()[:31]
             event.session_id = session_id
             event.data = payload.encode()[:1023]
             event.data_len = len(payload)
-            
-            result = await dispatch(event)
+
+            result = await dispatch(event, full_payload=payload)
             response = result.encode() if result else b"Event dispatched."
             writer.write(pack_message(response))
             await writer.drain()
@@ -417,12 +441,19 @@ async def start_brain():
             pass
         _cleanup_brain_log()
 
-async def dispatch(event):
+async def dispatch(event, full_payload=None):
     event_type = event.event_type.decode().strip('\x00')
-    
+
+    # full_payload is the un-truncated message body the wire transport
+    # delivered (pack_message/read_message already handle arbitrary sizes via
+    # the "!I" big-endian length prefix). When absent (e.g. a legacy caller
+    # that only has the FrameworkEvent struct), fall back to the struct's
+    # 1024-byte buffer -- the old, truncating behaviour.
+    payload_str = full_payload if full_payload is not None else event.data.decode().strip('\x00')
+
     # Handle tool discovery: "SCAN_TOOLS|session_id|path/to/scan"
     if event_type == "SCAN_TOOLS":
-        scan_path = event.data.decode().strip('\x00')
+        scan_path = payload_str
         if not scan_path:
             # Default to framework root if no path provided
             scan_path = str(SCRIPT_DIR.parent)
@@ -432,8 +463,13 @@ async def dispatch(event):
     if event_type == "CALL_TOOL":
         tool_id = "unknown"
         try:
-            # Expecting data as "tool_id|args_json" (dict -> kwargs, list -> positional)
-            payload = event.data.decode().strip('\x00')
+            # Expecting data as "tool_id|args_json" (dict -> kwargs, list -> positional).
+            # Use the full un-truncated payload -- large options dicts (many
+            # RHOSTS, credential sets) routinely exceed the 1024-byte
+            # FrameworkEvent.data buffer; reading event.data here would slice
+            # mid-JSON, fail json.loads, and silently fall back to the legacy
+            # comma-split producing garbage kwargs.
+            payload = payload_str
             kwargs: Dict[str, Any] = {}
             args: list = []
             if '|' in payload:
