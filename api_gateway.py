@@ -16,7 +16,7 @@ from pathlib import Path
 # already in os.environ, so shell exports always win.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 except Exception:
     pass
 

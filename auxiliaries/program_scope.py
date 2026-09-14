@@ -61,7 +61,7 @@ from constants import framework_tool
 # in os.environ, so explicit shell exports always win.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 except Exception:
     pass  # dotenv not installed or .env missing — silently degrade
 

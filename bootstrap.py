@@ -18,7 +18,7 @@ from daharness import _chat, ToolRegistry, OllamaEmbeddingFunction
 # python-dotenv only sets vars not already in os.environ, so shell exports win.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 except Exception:
     pass
 # --- Setup Logging ---

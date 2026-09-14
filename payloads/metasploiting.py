@@ -13,7 +13,7 @@ from constants import framework_tool
 from pymetasploit3.msfrpc import MsfRpcClient
 from utils.handles import format_handle, parse_handle
 
-load_dotenv()
+load_dotenv(override=True)
 
 MSGRPC_PASSWORD = os.getenv("MSGRPC_PASSWORD", "msfadmin4824")
 MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
