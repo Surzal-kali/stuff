@@ -36,12 +36,22 @@ WORDLISTS_ROOT: Path = Path(
 # preflight to report which "headline" lists are present vs absent, so a
 # missing rockyou.txt (gzip-only on Kali) is flagged explicitly rather than
 # buried in a 6 000-entry count.
+#
+# NOTE: wordlist availability is BOX-VARIABLE.  A wordlist present on one
+# box (e.g. directory-list-2.3-medium on this box) may be absent on another
+# (it was absent on the Sept-10 box).  The preflight and list_wordlists
+# tool report what is actually present on THIS box — never assume a
+# wordlist exists without checking.  Aliases below cover the common set;
+# absent ones are reported in ``common_absent`` so the operator knows to
+# install them (e.g. ``apt install seclists`` or clone the repo).
 COMMON_WORDLISTS: Dict[str, str] = {
     "rockyou.txt": "SecLists/Passwords/Leaked-Databases/rockyou.txt",
     "dirb_common": "SecLists/Discovery/Web-Content/dirb/common.txt",
     "directory_list_2.3_small": "SecLists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-small.txt",
+    "directory_list_2.3_medium": "SecLists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-medium.txt",
     "raft_small_dirs": "SecLists/Discovery/Web-Content/raft-small-directories.txt",
     "names_top": "SecLists/Usernames/top-usernames-shortlist.txt",
+    "burp_parameter_names": "SecLists/Discovery/Web-Content/burp-parameter-names.txt",
 }
 
 # Short, pre-existing SecLists defaults used as "just in case" fallbacks when a

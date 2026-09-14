@@ -95,25 +95,48 @@ class ExecutorMixin:
            keeps tools runnable when the Brain sidecar is down (its startup code
            unlinks the socket, and if the sidecar dies the socket goes with it,
            surfacing as FileNotFoundError: [Errno 2] No such file or directory).
+
+        When the fallback is triggered because the Brain **socket is down**
+        (not merely because the Brain doesn't know the tool), the result is
+        tagged ``degraded=True`` so callers know the data came from a
+        fallback path, not the sidecar.  Negative-existence conclusions
+        ("no modules found", "zero results") from a degraded session are
+        void until re-verified on a healthy Brain (standing rule T-01).
         """
-        brain_result = await self._dispatch_via_brain(tool_id, arguments, session_id=session_id)
+        brain_result, socket_down = await self._dispatch_via_brain(
+            tool_id, arguments, session_id=session_id
+        )
         if brain_result is not None:
             return brain_result
 
         logger.info(
             f"[BRAIN_DISPATCH] Socket unavailable or tool unknown; launching {tool_id} in-process"
         )
-        return await self._launch_in_process(tool_id, arguments)
+        result = await self._launch_in_process(tool_id, arguments)
+        # Only tag as degraded when the Brain socket was actually down — a
+        # tool-not-in-registry fallback is normal (the Brain didn't scan
+        # that module) and doesn't indicate a degraded session.
+        if socket_down and isinstance(result, dict):
+            result["degraded"] = True
+            result["degraded_reason"] = (
+                "Brain socket unavailable; executed via in-process fallback. "
+                "Negative-existence conclusions from this result are void until "
+                "re-verified on a healthy Brain."
+            )
+        return result
 
     async def _dispatch_via_brain(
         self, tool_id: str, arguments: dict, *, session_id: str = "0"
-    ) -> Optional[Dict[str, Any]]:
-        """Try the Brain socket. Returns None when the socket is unusable or the
-        Brain does not know the tool, so the caller can fall back in-process.
+    ) -> tuple:
+        """Try the Brain socket. Returns ``(result, socket_down)``.
 
-        Returns a real result dict when the Brain actually ran (or genuinely
-        failed) the tool — those are NOT retried in-process to avoid double
-        side effects.
+        - ``(dict, False)`` — the Brain ran (or genuinely failed) the tool.
+          The result is NOT retried in-process to avoid double side effects.
+        - ``(None, False)`` — the Brain is up but doesn't know the tool;
+          caller falls back in-process (normal, not degraded).
+        - ``(None, True)`` — the Brain socket is down (FileNotFoundError,
+          ConnectionError, OSError); caller falls back in-process and
+          should tag the result ``degraded``.
         """
         socket_path = "/tmp/brain.sock"
         # A tool that never returns (a listener, a wedged subprocess, a slow
@@ -160,11 +183,11 @@ class ExecutorMixin:
                 # Legacy raw-text Brain: fall back to string matching.
                 if "not found in registry" in text:
                     logger.info(f"[BRAIN_DISPATCH] Brain does not know '{tool_id}'; falling back in-process")
-                    return None
+                    return None, False
                 return {
                     "stdout": text,
                     "status": "Success" if "ERROR" not in text else "Failed",
-                }
+                }, False
 
             status = str(envelope.get("status", "")).lower()
             error_msg = envelope.get("error")
@@ -173,7 +196,7 @@ class ExecutorMixin:
             # fall back in-process instead of failing.
             if status == "error" and error_msg and "not found in registry" in error_msg:
                 logger.info(f"[BRAIN_DISPATCH] Brain does not know '{tool_id}'; falling back in-process")
-                return None
+                return None, False
 
             result_value = envelope.get("result")
             stdout = result_value if result_value is not None else (error_msg or "")
@@ -189,10 +212,10 @@ class ExecutorMixin:
                 shaped["result"] = result_value
             if status != "success" and error_msg:
                 shaped["error"] = error_msg
-            return shaped
+            return shaped, False
         except FileNotFoundError:
             logger.info(f"[BRAIN_DISPATCH] {socket_path} does not exist; Brain sidecar is down")
-            return None
+            return None, True
         except asyncio.TimeoutError:
             # Abandon the connection cleanly: an unclosed writer leaks the fd
             # (and the socket pair) for as long as the tool keeps running.
@@ -213,13 +236,13 @@ class ExecutorMixin:
                     "It may still be running on the Brain; check the sidecar logs before retrying."
                 ),
                 "status": "Failed",
-            }
+            }, False
         except (ConnectionError, OSError) as e:
             logger.info(f"[BRAIN_DISPATCH] Socket connect failed ({e}); falling back in-process")
-            return None
+            return None, True
         except Exception as e:
             logger.error(f"[BRAIN_ERROR] Failed to dispatch tool {tool_id}: {e}")
-            return {"error": f"Brain dispatch failed: {str(e)}", "status": "Failed"}
+            return {"error": f"Brain dispatch failed: {str(e)}", "status": "Failed"}, False
 
     def _resolve_callable(self, tool_id: str) -> tuple:
         """Resolve a tool_id like 'pkg.mod.func' or 'pkg.mod.Class.func' to a
@@ -424,7 +447,8 @@ async def execute_local_script(script_path: str, arguments: dict):
 
 async def dispatch_via_brain(tool_id: str, arguments: dict):
     """Attempt Brain dispatch without constructing a registry client."""
-    return await _new_registry()._dispatch_via_brain(tool_id, arguments)
+    result, _socket_down = await _new_registry()._dispatch_via_brain(tool_id, arguments)
+    return result
 
 
 async def launch_in_process(tool_id: str, arguments: dict):

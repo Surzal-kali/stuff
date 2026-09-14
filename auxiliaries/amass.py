@@ -384,6 +384,33 @@ def run_amass(target, options=""):
     if "-rigid" not in user_flags:
         user_flags.append("-rigid")
 
+    # Inject trusted DNS resolvers (-tr, 15 QPS each) to raise the
+    # MaxDNSQueries cap.  amass's default 17 baseline resolvers give ~255
+    # QPS; adding more trusted resolvers multiplies throughput linearly.
+    # Skip injection if the caller already passed -tr or -rf (don't clobber
+    # their explicit choice).  Override the list via AMASS_TRUSTED_RESOLVERS
+    # env var (comma-separated IPs); set to empty string to disable injection.
+    _DEFAULT_TRUSTED_RESOLVERS = [
+        "8.8.8.8", "8.8.4.4",          # Google
+        "1.1.1.1", "1.0.0.1",          # Cloudflare
+        "9.9.9.9", "149.112.112.112",  # Quad9
+        "208.67.222.222", "208.67.220.220",  # Cisco OpenDNS
+        "84.200.69.80", "84.200.70.40",      # DNS.WATCH
+        "64.6.64.6", "64.6.65.6",            # Neustar
+        "94.140.14.14", "94.140.15.15",      # AdGuard
+        "76.76.19.19", "76.76.2.0",          # ControlD / Alternate DNS
+    ]
+    has_tr = any(tok == "-tr" for tok in user_flags)
+    has_rf = any(tok == "-rf" for tok in user_flags)
+    env_resolvers = os.getenv("AMASS_TRUSTED_RESOLVERS", "")
+    if not has_tr and not has_rf:
+        if env_resolvers:
+            resolver_list = [r.strip() for r in env_resolvers.split(",") if r.strip()]
+        else:
+            resolver_list = _DEFAULT_TRUSTED_RESOLVERS
+        for ip in resolver_list:
+            user_flags.extend(["-tr", ip])
+
     command = [
         "amass", "enum",
         "-d", target,
@@ -662,6 +689,33 @@ def subdomain_enum(target, options=""):
     # (sendgrid, AWS EC2, etc.) that wastes the enum's time budget on noise.
     if "-rigid" not in user_flags:
         user_flags.append("-rigid")
+
+    # Inject trusted DNS resolvers (-tr, 15 QPS each) to raise the
+    # MaxDNSQueries cap.  amass's default 17 baseline resolvers give ~255
+    # QPS; adding more trusted resolvers multiplies throughput linearly.
+    # Skip injection if the caller already passed -tr or -rf (don't clobber
+    # their explicit choice).  Override the list via AMASS_TRUSTED_RESOLVERS
+    # env var (comma-separated IPs); set to empty string to disable injection.
+    _DEFAULT_TRUSTED_RESOLVERS = [
+        "8.8.8.8", "8.8.4.4",          # Google
+        "1.1.1.1", "1.0.0.1",          # Cloudflare
+        "9.9.9.9", "149.112.112.112",  # Quad9
+        "208.67.222.222", "208.67.220.220",  # Cisco OpenDNS
+        "84.200.69.80", "84.200.70.40",      # DNS.WATCH
+        "64.6.64.6", "64.6.65.6",            # Neustar
+        "94.140.14.14", "94.140.15.15",      # AdGuard
+        "76.76.19.19", "76.76.2.0",          # ControlD / Alternate DNS
+    ]
+    has_tr = any(tok == "-tr" for tok in user_flags)
+    has_rf = any(tok == "-rf" for tok in user_flags)
+    env_resolvers = os.getenv("AMASS_TRUSTED_RESOLVERS", "")
+    if not has_tr and not has_rf:
+        if env_resolvers:
+            resolver_list = [r.strip() for r in env_resolvers.split(",") if r.strip()]
+        else:
+            resolver_list = _DEFAULT_TRUSTED_RESOLVERS
+        for ip in resolver_list:
+            user_flags.extend(["-tr", ip])
 
     command = [
         "amass", "enum",

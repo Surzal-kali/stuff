@@ -208,6 +208,17 @@ def poll_job(job_id: str, *, tool_name: str = "") -> Dict[str, Any]:
             "error": f"no {tool_name or 'background'} job with id {job_id!r} (it may have been evicted)",
         }
 
+    # Defensive: never serve data for a different job_id than requested.
+    # This catches any path where the entry's job_id diverges from the
+    # lookup key (corrupt sidecar, race, etc.) — return "unknown" instead
+    # of silently returning another job's results.
+    if entry.get("job_id") != job_id:
+        return {
+            "job_id": job_id,
+            "status": "unknown",
+            "error": f"job id mismatch: requested {job_id!r} but entry has {entry.get('job_id')!r}",
+        }
+
     proc: Optional[subprocess.Popen] = entry.get("proc")
     rc: Optional[int]
     if proc is not None:
@@ -299,6 +310,11 @@ def _reconstruct_job(job_id: str, tool_name: str) -> Optional[Dict[str, Any]]:
         with open(meta_path) as f:
             meta = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return None
+    # Defensive: verify the meta file's job_id matches the one requested.
+    # A mismatch (corrupt sidecar, wrong file) must never silently serve
+    # another job's data — return None so poll_job reports "unknown".
+    if meta.get("job_id") != job_id:
         return None
     return {
         "job_id": job_id,

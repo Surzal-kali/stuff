@@ -277,11 +277,22 @@ async def start_brain():
     # lock.
     try:
         lock_fh = open("/tmp/brain.lock", "w")
+        lock_path = "/tmp/brain.lock"
     except OSError:
         # Shared lockfile unwritable (poisoned ownership / immutable bit /
         # MAC). Fall back to a uid-scoped lockfile so a bad /tmp/brain.lock
         # can't kill the sidecar; the singleton guard then applies per-uid.
-        lock_fh = open(f"/tmp/brain.lock-{os.geteuid()}", "w")
+        lock_path = f"/tmp/brain.lock-{os.geteuid()}"
+        lock_fh = open(lock_path, "w")
+    # Ensure the lock file is world-writable so a brain started as a
+    # different uid (e.g. root vs surzal) can open it for flock.  Without
+    # this, a root-created 0644 lock file blocks non-root starts, which
+    # fall back to a uid-scoped lock and spawn a SECOND brain that can't
+    # bind the socket — the duplicate-brain bug.
+    try:
+        os.chmod(lock_path, 0o666)
+    except OSError:
+        pass  # best-effort; the file is still flockable by same-uid callers
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError) as e:
@@ -307,7 +318,18 @@ async def start_brain():
                 )
         finally:
             probe.close()
-        os.remove(socket_path)
+        try:
+            os.remove(socket_path)
+        except PermissionError:
+            # Stale socket owned by a different uid (e.g. root died and left
+            # it; we're non-root and /tmp has the sticky bit).  We can't
+            # remove it, but we also can't bind over it.  Fail with a clear
+            # message so the operator knows to delete it manually.
+            raise RuntimeError(
+                f"Stale socket {socket_path} is owned by a different user and "
+                f"cannot be removed (sticky bit on /tmp).  Run: "
+                f"sudo rm {socket_path}"
+            ) from None
 
     # Prime the registry BEFORE binding the socket, so the connect-probe in
     # bootstrap only reports "ready" once tools are actually callable.
@@ -358,7 +380,20 @@ async def start_brain():
                 writer.close()
             except Exception:
                 pass
-    server = await asyncio.start_unix_server(handle_client, path=socket_path)
+    # Bind the socket with a permissive umask so non-root callers can
+    # connect.  When the framework is launched via sudo, the inherited
+    # umask is 0022, which creates the socket as srwxr-xr-x (755) —
+    # Unix domain sockets require WRITE permission to connect, so only
+    # root can reach it.  Any non-root process (a dropped-privilege
+    # subprocess, tool_repl run as the operator, etc.) gets
+    # PermissionError and the framework silently falls back to in-process
+    # dispatch.  Temporarily setting umask=0 makes the socket 0777
+    # atomically (no race window between bind and chmod).
+    _old_umask = os.umask(0o000)
+    try:
+        server = await asyncio.start_unix_server(handle_client, path=socket_path)
+    finally:
+        os.umask(_old_umask)
     # Remember which socket file inode WE bound, so the shutdown unlink below
     # can never delete a newer sidecar's live socket after we lingered past it.
     try:

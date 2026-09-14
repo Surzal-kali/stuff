@@ -36,9 +36,20 @@ def _check_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
 
 
 def _check_unix_socket(path: str) -> bool:
-    """Unix domain socket probe — True if the socket file exists and is a socket."""
-    p = Path(path)
-    return p.is_socket()
+    """Unix domain socket probe — True only if something is actually LISTENING.
+
+    ``Path.is_socket()`` is a lie for stale sockets: the kernel does not unlink
+    a socket file when its owner dies, so a killed sidecar leaves a file that
+    passes ``is_socket()`` while every ``connect()`` bounces off it.  Probe with
+    a real connection instead — mirrors bootstrap's ``_brain_ready()``.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(path)
+            return True
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+        return False
 
 
 @framework_tool(

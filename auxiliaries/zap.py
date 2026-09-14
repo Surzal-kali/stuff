@@ -50,13 +50,22 @@ ZAP_BASE = f"http://{ZAP_HOST}:{ZAP_PORT}"
 
 def _canonical(url: str) -> str:
     """Normalise a URL for comparison: strip trailing slashes, lowercase
-    host. Used to verify ``core/view/messages?url=...`` returned the URL
-    we actually asked for (it does fuzzy substring matching otherwise)."""
+    host, **preserve the query string**. Used to verify
+    ``core/view/messages?url=...`` returned the URL we actually asked for
+    (it does fuzzy substring matching otherwise).
+
+    The query string MUST be preserved: without it, ``http://h/page?a=1``
+    and ``http://h/page`` both canonicalise to ``hpage`` and the first
+    match (the bare entry) is returned instead of the query-string entry
+    — proven by the ``?zzprobe9=x`` probe returning the bare body (67808)
+    instead of the real response (67952).
+    """
     from urllib.parse import urlsplit
     parts = urlsplit(url.strip())
     host = (parts.hostname or "").lower()
     path = parts.path.rstrip("/") or "/"
-    return f"{host}{path}"
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{host}{path}{query}"
 
 
 def _canonical_from_envelope(envelope: Dict[str, Any]) -> str:
@@ -394,7 +403,7 @@ class ZAPClient:
                 + envelope.get("responseBody", "")
             )
         try:
-            rx = re.compile(pattern)
+            rx = re.compile(pattern, re.DOTALL)
         except re.error as e:
             return {"error": f"invalid regex: {e}", "matches": []}
         matches = rx.findall(body)
