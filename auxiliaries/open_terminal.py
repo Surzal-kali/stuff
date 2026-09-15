@@ -49,6 +49,16 @@ _SESSION.headers.update({"Authorization": f"Bearer {_API_KEY}"})
 # with the ``wait`` argument for long-running commands.
 _DEFAULT_WAIT = 30
 
+# Workspace root inside the terminal container.  The terminal API server runs
+# with cwd /app (root-owned), so relative paths sent to it resolve against /app
+# instead of the user workspace.  _abs() normalizes relative paths to here.
+_WORKSPACE = "/home/user"
+
+
+def _abs(path: str) -> str:
+    """Normalize relative paths to the container workspace (server cwd is /app)."""
+    return path if path.startswith("/") else f"{_WORKSPACE}/{path.lstrip('/')}"
+
 
 def _post(path: str, json_body: dict) -> Dict[str, Any]:
     """POST to the terminal API and return a structured result dict."""
@@ -131,7 +141,7 @@ def terminal_exec(
     """
     body: Dict[str, Any] = {"command": command}
     if cwd:
-        body["cwd"] = cwd
+        body["cwd"] = _abs(cwd)
     params = {"wait": wait if wait > 0 else None}
     try:
         r = _SESSION.post(
@@ -192,7 +202,7 @@ def terminal_write_file(
         path: Absolute or relative path. Parent dirs are auto-created.
         content: Text content to write.
     """
-    return _post("/files/write", {"path": path, "content": content})
+    return _post("/files/write", {"path": _abs(path), "content": content})
 
 
 @framework_tool(
@@ -213,7 +223,7 @@ def terminal_read_file(
         start_line: First line to return (1-indexed, inclusive). 0 = beginning.
         end_line: Last line to return (1-indexed, inclusive). 0 = end.
     """
-    params: Dict[str, Any] = {"path": path}
+    params: Dict[str, Any] = {"path": _abs(path)}
     if start_line > 0:
         params["start_line"] = start_line
     if end_line > 0:
@@ -231,7 +241,7 @@ def terminal_list_files(directory: str = ".") -> Dict[str, Any]:
     Args:
         directory: Directory path to list (default: workspace root).
     """
-    return _get("/files/list", params={"directory": directory})
+    return _get("/files/list", params={"directory": _abs(directory)})
 
 
 @framework_tool(
@@ -259,7 +269,7 @@ def terminal_grep(
     """
     params: Dict[str, Any] = {
         "query": query,
-        "path": path,
+        "path": _abs(path),
         "regex": str(regex).lower(),
         "case_insensitive": str(case_insensitive).lower(),
         "max_results": max_results,
@@ -285,4 +295,4 @@ def terminal_search(
         pattern: Glob pattern (e.g. '*.json', 'output/*.txt').
         path: Directory to search in (default: workspace root).
     """
-    return _get("/files/glob", params={"pattern": pattern, "path": path})
+    return _get("/files/glob", params={"pattern": pattern, "path": _abs(path)})
