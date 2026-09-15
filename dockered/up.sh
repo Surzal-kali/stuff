@@ -16,7 +16,4 @@ echo
 echo "=== Workbench is up ==="
 echo "  Open Terminal API : http://localhost:8000"
 echo "  Framework gateway : http://localhost:6000"
-echo
-echo "  Open WebUI connection: Admin Settings -> Integrations -> Open Terminal"
-echo "    URL: http://<this-host>:8000"
-echo "    API key: whatever you set OPEN_TERMINAL_API_KEY to"
+
