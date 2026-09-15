@@ -42,6 +42,7 @@ the ``updated_at`` filter for incremental refreshes.
 
 from __future__ import annotations
 
+import html as _html
 import ipaddress
 import json as _json
 import os
@@ -153,10 +154,11 @@ def _fetch_all_pages(path: str, *, params: Optional[Dict[str, Any]] = None,
 
 # --- manifest construction --------------------------------------------------
 
-def _scope_cache_path(handle: str) -> Path:
+def _scope_cache_path(handle: str, platform: str = "h1") -> Path:
     d = Path(os.getenv("WORKSPACE_ROOT", ".")) / "scope"
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"{handle}.json"
+    name = handle if platform == "h1" else f"{platform}_{handle}"
+    return d / f"{name}.json"
 
 
 def _build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -240,6 +242,155 @@ def _build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:
     return (manifest, None)
 
 
+# --- Bugcrowd lane (public engagement brief, anonymous) ---------------------
+
+_BC_BASE = "https://bugcrowd.com"
+_BC_UA = "Mozilla/5.0"  # UA verified against live endpoints Sept 2026
+_UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def _bc_get(url: str, *, accept: str = "application/json") -> Tuple[int, Any]:
+    """Anonymous GET against bugcrowd.com. Returns (status, parsed-json-or-text)."""
+    import requests
+
+    r = requests.get(url, headers={"Accept": accept, "User-Agent": _BC_UA},
+                     timeout=_TIMEOUT)
+    if "json" in r.headers.get("content-type", ""):
+        try:
+            return (r.status_code, r.json())
+        except ValueError:
+            pass
+    return (r.status_code, r.text)
+
+
+def _bc_fetch_engagement_page(handle: str) -> Tuple[int, str]:
+    """Fetch the public engagement page (follows /<handle> -> /engagements/<handle>)."""
+    import requests
+
+    r = requests.get(f"{_BC_BASE}/{handle}",
+                     headers={"Accept": "text/html", "User-Agent": _BC_UA},
+                     timeout=_TIMEOUT)
+    return (r.status_code, r.text)
+
+
+def _bc_brief_url(handle: str, page_html: str) -> Optional[str]:
+    """Derive the brief-version-document JSON URL from an engagement page.
+
+    Primary: the page's self-documenting ``data-api-endpoints`` attribute
+    (``engagementBriefApi.getBriefVersionDocument``).  Fallback: regex the
+    raw HTML for a ``changelog/<uuid>`` path.  The brief app bundle appends
+    ``.json`` to endpoint paths — mirrored here.
+    """
+    m = re.search(r'data-api-endpoints="([^"]+)"', page_html)
+    if m:
+        try:
+            eps = _json.loads(_html.unescape(m.group(1)))
+            path = (eps.get("engagementBriefApi") or {}).get("getBriefVersionDocument")
+            if path:
+                return f"{_BC_BASE}{path}.json"
+        except (ValueError, AttributeError):
+            pass
+    m = re.search(rf"/engagements/{re.escape(handle)}/changelog/({_UUID_RE})", page_html)
+    if m:
+        return f"{_BC_BASE}/engagements/{handle}/changelog/{m.group(1)}.json"
+    return None
+
+
+def _bc_target_entry(t: Dict[str, Any], group: Dict[str, Any]) -> Dict[str, Any]:
+    """Map one Bugcrowd target onto the H1-shaped asset-entry schema."""
+    name = (t.get("name") or "").strip()
+    ident, note = name, None
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", name, re.S)
+    if m and m.group(1).strip():
+        ident, note = m.group(1).strip(), m.group(2).strip()
+    category = (t.get("category") or "other").lower()
+    uri = t.get("uri")
+    ipaddr = t.get("ipAddress")
+    if ipaddr:
+        atype, ident = "IP", ipaddr
+    elif category in ("ios", "android"):
+        # app targets carry an app-store uri — type by category, keep store
+        # link out of asset_identifier (it would break host matching)
+        atype = category.upper()
+    elif name.startswith("*."):
+        atype = "WILDCARD"
+    elif uri:
+        atype = "URL"
+    elif category == "website":
+        atype = "DOMAIN"
+        if "://" in ident:  # reduce bare URLs to hosts for DOMAIN semantics
+            ident = urlparse(ident).hostname or ident
+    elif category in ("ios", "android"):
+        atype = category.upper()
+    else:
+        atype = "OTHER"
+    return {
+        "id": t.get("id"),
+        "asset_type": atype,
+        "asset_identifier": ident,
+        "raw_identifier": name,
+        "eligible_for_bounty": bool(group.get("rewardRange")),
+        "max_severity": None,
+        "instruction": note,
+        "confidentiality_requirement": None,
+        "integrity_requirement": None,
+        "availability_requirement": None,
+        "reference": group.get("name"),
+        "updated_at": None,
+        "bc_category": category,
+        "bc_tags": [tg.get("name") for tg in (t.get("tags") or []) if tg.get("name")],
+    }
+
+
+def _bc_build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Fetch a public Bugcrowd engagement brief anonymously; H1-shaped manifest."""
+    st, page = _bc_fetch_engagement_page(handle)
+    if st != 200:
+        return ({}, f"engagement page: HTTP {st} (handle may not exist or program is private)")
+    brief_url = _bc_brief_url(handle, page)
+    if not brief_url:
+        return ({}, "no brief endpoint on engagement page (no data-api-endpoints, "
+                    "no changelog/<uuid>) — program may be private or non-standard")
+    bst, brief = _bc_get(brief_url)
+    if bst != 200 or not isinstance(brief, dict):
+        return ({}, f"brief fetch: HTTP {bst} at {brief_url}")
+    data = brief.get("data") or {}
+    scope = data.get("scope")
+    if not isinstance(scope, list) or not scope:
+        return ({}, "brief JSON has no data.scope target groups — unsupported layout")
+    b = data.get("brief") or {}
+    in_scope: List[Dict[str, Any]] = []
+    out_of_scope_assets: List[Dict[str, Any]] = []
+    for g in scope:
+        is_in = bool(g.get("inScope"))
+        for t in (g.get("targets") or []):
+            entry = _bc_target_entry(t, g)
+            entry["eligible_for_submission"] = is_in
+            (in_scope if is_in else out_of_scope_assets).append(entry)
+    manifest = {
+        "handle": handle,
+        "platform": "bugcrowd",
+        "fetched_at": time.time(),
+        "in_scope": in_scope,
+        "out_of_scope_assets": out_of_scope_assets,
+        "excluded_categories": [],   # Bugcrowd briefs carry no structured exclusions
+        "weaknesses": [],            # ...and no structured weakness allowlist
+        "policy": b.get("description") or "",
+        "program_name": b.get("name"),
+        "safe_harbor": b.get("safeHarborStatus"),
+        "counts": {
+            "in_scope": len(in_scope),
+            "out_of_scope_assets": len(out_of_scope_assets),
+            "excluded_categories": 0,
+            "weaknesses": 0,
+        },
+        "_warning": ("bugcrowd lane: check_reportable unsupported (no structured "
+                     "exclusions/weaknesses in brief); reward info is per-group "
+                     "(rewardRange), max_severity is None"),
+    }
+    return (manifest, None)
+
+
 def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
     """Write amass-compatible ``.scope`` from DOMAIN/WILDCARD/URL assets.
 
@@ -249,10 +400,16 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
     ``#`` comments.  URL assets are reduced to their host.
     """
     patterns: List[str] = []
+
+    def _hostlike(s: str) -> bool:
+        # Skip policy prose ("Any host verified to be owned by Tesla...") —
+        # only wildcard/host-shaped identifiers belong in the amass filter.
+        return bool(re.match(r"^(\*\.)?[a-z0-9]([a-z0-9*._-]*[a-z0-9])?$", s.strip(), re.I))
+
     for a in manifest.get("in_scope", []):
         atype = (a.get("asset_type") or "").upper()
         ident = (a.get("asset_identifier") or "").strip()
-        if not ident:
+        if not ident or not _hostlike(ident):
             continue
         if atype in ("WILDCARD", "DOMAIN"):
             patterns.append(ident)
@@ -268,7 +425,7 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
     for a in manifest.get("out_of_scope_assets", []):
         atype = (a.get("asset_type") or "").upper()
         ident = (a.get("asset_identifier") or "").strip()
-        if not ident:
+        if not ident or not _hostlike(ident):
             continue
         if atype in ("WILDCARD", "DOMAIN"):
             patterns.append("!" + ident)
@@ -276,9 +433,11 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
             host = urlparse(ident if "://" in ident else f"http://{ident}").hostname
             if host:
                 patterns.append("!" + host)
-    scope_path = Path(os.getenv("WORKSPACE_ROOT", ".")) / ".scope"
+    platform = manifest.get("platform", "h1")
+    scope_path = (Path(os.getenv("WORKSPACE_ROOT", "."))
+                  / f"{platform}_{manifest.get('handle', 'unknown')}.scope")
     seen = set()
-    lines = ["# Auto-generated from HackerOne program scope — do not edit by hand.",
+    lines = [f"# Auto-generated from {platform.upper()} program scope — do not edit by hand.",
              f"# Source: {manifest.get('handle')} @ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(manifest.get('fetched_at', time.time())))}"]
     for p in patterns:
         if p not in seen:
@@ -288,14 +447,14 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
     return str(scope_path)
 
 
-def _save_cache(handle: str, manifest: Dict[str, Any]) -> str:
-    p = _scope_cache_path(handle)
+def _save_cache(handle: str, manifest: Dict[str, Any], platform: str = "h1") -> str:
+    p = _scope_cache_path(handle, platform)
     p.write_text(_json.dumps(manifest, indent=2))
     return str(p)
 
 
-def _load_cache(handle: str) -> Optional[Dict[str, Any]]:
-    p = _scope_cache_path(handle)
+def _load_cache(handle: str, platform: str = "h1") -> Optional[Dict[str, Any]]:
+    p = _scope_cache_path(handle, platform)
     if not p.is_file():
         return None
     try:
@@ -394,8 +553,10 @@ def _find_match(target: str, assets: List[Dict[str, Any]]) -> Optional[Dict[str,
 # --- tools ------------------------------------------------------------------
 
 @framework_tool(
-    "Load a HackerOne bug-bounty program's scope as a structured, "
-    "checkable manifest: in-scope assets (typed: URL/WILDCARD/DOMAIN/CIDR/"
+    "Load a bug-bounty program's scope as a structured, checkable "
+    "manifest (platform='h1' HackerOne API [default, member-gated] or "
+    "platform='bugcrowd' public engagement brief [anonymous, public "
+    "programs]): in-scope assets (typed: URL/WILDCARD/DOMAIN/CIDR/"
     "IP/ANDROID/IOS/BLOCKCHAIN with max_severity and CIA requirements), "
     "out-of-scope assets, excluded report categories, the reportable "
     "weakness/CWE allowlist, and the program policy text. Also writes the "
@@ -404,22 +565,31 @@ def _find_match(target: str, assets: List[Dict[str, Any]]) -> Optional[Dict[str,
     "fetch. Requires H1_API_USERNAME and H1_API_TOKEN in the environment.",
     next_hints=["check_scope", "check_reportable", "subdomain_enum"],
 )
-def load_program_scope(handle: str = "crypto", refresh: bool = False) -> Dict[str, Any]:
-    """Fetch (or load cached) HackerOne program scope for ``handle``.
+def load_program_scope(handle: str = "crypto", refresh: bool = False,
+                       platform: str = "h1") -> Dict[str, Any]:
+    """Fetch (or load cached) program scope for ``handle``.
 
     Args:
-        handle: The HackerOne program handle, e.g. ``"crypto"`` for
-            crypto.com.  Defaults to ``"crypto"``.
-        refresh: If True, ignore the on-disk cache and fetch fresh from
-            the API.  Defaults to False (use cache if present and recent).
+        handle: The program handle, e.g. ``"crypto"`` (H1) or ``"tesla"``
+            (Bugcrowd).  Defaults to ``"crypto"``.
+        refresh: If True, ignore the on-disk cache and fetch fresh.
+        platform: ``"h1"`` (HackerOne API, member-gated; default) or
+            ``"bugcrowd"`` (public engagement brief, anonymous).
     """
+    platform = (platform or "h1").strip().lower()
+    if platform not in ("h1", "bugcrowd"):
+        return {"handle": handle, "platform": platform,
+                "status": "error", "error": f"unknown platform {platform!r}"}
     if not refresh:
-        cached = _load_cache(handle)
+        cached = _load_cache(handle, platform)
         if cached:
             cached["_cache"] = "hit"
             return cached
 
-    manifest, err = _build_manifest(handle)
+    if platform == "bugcrowd":
+        manifest, err = _bc_build_manifest(handle)
+    else:
+        manifest, err = _build_manifest(handle)
     if err:
         # Fall back to cache if the live fetch failed but we have one.
         cached = _load_cache(handle)
@@ -429,7 +599,7 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False) -> Dict[st
             return cached
         return {"handle": handle, "status": "error", "error": err}
 
-    _save_cache(handle, manifest)
+    _save_cache(handle, manifest, platform)
     scope_path = _write_scope_file(manifest)
     manifest["_cache"] = "miss"
     manifest["scope_file"] = scope_path
@@ -439,7 +609,8 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False) -> Dict[st
 
 @framework_tool(
     "Check whether a target (host, URL, IP/CIDR, or mobile app package id) "
-    "is inside a HackerOne program's authorised scope. Returns in_scope "
+    "is inside a program's authorised scope (platform: 'h1' default or "
+    "'bugcrowd'). Returns in_scope "
     "True/False, the matched asset (with asset_type, max_severity, CIA "
     "requirements, and any instruction), and a reason. Call this BEFORE "
     "running nmap/masscan/ffuf/ZAP against any target to avoid scanning "
@@ -447,13 +618,14 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False) -> Dict[st
     "(from cache or live) if not already loaded.",
     next_hints=["run_nmap", "run_ffuf", "run_masscan", "zap_open_url"],
 )
-def check_scope(target: str, handle: str) -> Dict[str, Any]:
+def check_scope(target: str, handle: str, platform: str = "h1") -> Dict[str, Any]:
     """Test ``target`` against the loaded scope manifest for ``handle``.
 
     Args:
         target: A hostname, URL, IP, CIDR, or mobile app package id.
-        handle: HackerOne program handle (REQUIRED — no default; a silent
-            default silently checks against the wrong program's manifest).
+        handle: Program handle (REQUIRED — no default; a silent default
+            silently checks against the wrong program's manifest).
+        platform: ``"h1"`` (default) or ``"bugcrowd"``.
     """
     if not handle or not str(handle).strip():
         raise ValueError(
@@ -461,9 +633,9 @@ def check_scope(target: str, handle: str) -> Dict[str, Any]:
             "program produced wrong-verdict bugs (see bugcheck ledger 2026-09-12)"
         )
     handle = str(handle).strip()
-    manifest = _load_cache(handle)
+    manifest = _load_cache(handle, platform)
     if manifest is None:
-        manifest = load_program_scope(handle, refresh=False)
+        manifest = load_program_scope(handle, refresh=False, platform=platform)
     if manifest.get("status") == "error" and not manifest.get("in_scope"):
         return {"target": target, "in_scope": False, "reason": manifest.get("error", "no scope loaded")}
 
@@ -499,8 +671,10 @@ def check_scope(target: str, handle: str) -> Dict[str, Any]:
 
 
 @framework_tool(
-    "Check whether a candidate finding is reportable under a HackerOne "
-    "program's rules: tests a category name or CWE id against the program's "
+    "Check whether a candidate finding is reportable under a program's "
+    "rules (H1 only — Bugcrowd briefs lack structured exclusions/weaknesses "
+    "and return an explicit unsupported envelope): tests a category name or "
+    "CWE id against the program's "
     "excluded report categories (scope_exclusions) and the reportable "
     "weakness allowlist. Returns reportable True/False, which exclusion it "
     "hit (if any), and whether the CWE is in the program's weakness list. "
@@ -508,21 +682,31 @@ def check_scope(target: str, handle: str) -> Dict[str, Any]:
     "spam-grade reports that hurt your HackerOne reputation.",
     next_hints=["report_finding", "program_hacktivity"],
 )
-def check_reportable(category_or_cwe: str, handle: str) -> Dict[str, Any]:
+def check_reportable(category_or_cwe: str, handle: str,
+                     platform: str = "h1") -> Dict[str, Any]:
     """Test a finding category/CWE against the program's exclusion + weakness rules.
 
     Args:
         category_or_cwe: A vulnerability category name (e.g. "Missing security
             headers", "Brute force", "Open redirect") or a CWE id
             (e.g. "CWE-89", "cwe-352").  Matched case-insensitively.
-        handle: HackerOne program handle (REQUIRED — no default).
+        handle: Program handle (REQUIRED — no default).
+        platform: ``"h1"`` (default) or ``"bugcrowd"`` (returns an explicit
+            ``unsupported`` envelope — Bugcrowd briefs carry no structured
+            exclusions/weaknesses; judge from brief prose).
     """
     if not handle or not str(handle).strip():
         raise ValueError("handle is required: silent program default produced wrong-verdict bugs")
     handle = str(handle).strip()
-    manifest = _load_cache(handle)
+    if platform == "bugcrowd":
+        return {"platform": "bugcrowd", "handle": handle,
+                "status": "unsupported", "reportable": None,
+                "reason": ("Bugcrowd briefs carry no structured exclusion/weakness "
+                           "allowlists — judge reportability from brief prose "
+                           "(manifest['policy'])")}
+    manifest = _load_cache(handle, platform)
     if manifest is None:
-        manifest = load_program_scope(handle, refresh=False)
+        manifest = load_program_scope(handle, refresh=False, platform=platform)
 
     needle = category_or_cwe.strip().lower()
     cwe_norm = re.sub(r"[^0-9]", "", needle) if "cwe" in needle else None

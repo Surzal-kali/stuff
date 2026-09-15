@@ -329,13 +329,17 @@ def _get_names(domain: str) -> List[str]:
 
 
 def _store_amass_meta(job_id: str, domain: str,
-                      options: str, composite: bool) -> None:
+                      options: str, composite: bool,
+                      scope_platform: Optional[str] = None,
+                      scope_handle: Optional[str] = None) -> None:
     """Stash extra metadata for a launched amass job."""
     with _AMASS_LOCK:
         _AMASS_JOBS[job_id] = {
             "domain": domain,
             "options": options,
             "composite": composite,
+            "scope_platform": scope_platform,
+            "scope_handle": scope_handle,
             "result": None,       # cached retrieval result (set on first done-poll)
             "retrieved": False,
             "alive": None,        # cached alive-check (set on first subdomain_enum_status done-poll)
@@ -371,7 +375,7 @@ def _get_amass_meta(job_id: str) -> Optional[Dict[str, Any]]:
     "-include <sources>, -exclude <sources>, -max-depth <n>, -p <ports>.",
     next_hints=["amass_status", "subdomain_enum (structured result with alive check)"],
 )
-def run_amass(target, options=""):
+def run_amass(target, options="", scope_platform=None, scope_handle=None):
     """Launch amass enum against a domain and return immediately.
 
     amass runs as a detached background subprocess writing to a per-job log
@@ -455,20 +459,28 @@ def run_amass(target, options=""):
         timeout=amass_cap,
     )
     job_id = job["job_id"]
-    _store_amass_meta(job_id, target, options, composite=False)
+    _store_amass_meta(job_id, target, options, composite=False,
+                      scope_platform=scope_platform, scope_handle=scope_handle)
 
-    return {
+    resp = {
         "job_id": job_id,
         "status": "running",
         "target": target,
         "message": "poll with amass_status(job_id) until status == 'done'",
     }
+    if scope_platform and scope_handle:
+        resp["scope_filter"] = f"{scope_platform}_{scope_handle}.scope"
+    else:
+        resp["scope_filter"] = None
+        resp["warning"] = "no scope_handle given — amass results will NOT be scope-filtered"
+    return resp
 
 
 @framework_tool(
     "Poll an amass enum job: returns running/done, discovered subdomain "
     "names (retrieved via amass v5's subs command + crt.sh fallback), and "
-    "scope-filtered results if a .scope file exists. Call until status "
+    "scope-filtered results if a per-company scope file was selected at "
+    "launch. Call until status "
     "reports done.",
     next_hints=["subdomain_enum", "run_nmap -iL <subdomains>"],
 )
@@ -478,7 +490,7 @@ def amass_status(job_id):
     When the enum subprocess finishes, this retrieves discovered names via
     ``amass subs -names -show`` (amass v5's retrieval path), falls back to
     a direct crt.sh CT-log query if amass found nothing, and filters against
-    the program scope (``.scope`` file) if one exists.
+    the per-company scope selected at launch (``<platform>_<handle>.scope``).
 
     Args:
         job_id: The ``job_id`` returned by ``run_amass``.
@@ -529,11 +541,12 @@ def amass_status(job_id):
         }
         return result
 
-    # Scope filtering (same as the old run_amass).
-    scope = _load_scope()
+    # Scope filtering (per-company, keyed at launch time).
+    scope = _load_scope(meta.get("scope_platform"), meta.get("scope_handle"))
     if scope is None:
-        # Lab mode — no scope file, return raw names.
-        return {
+        # No scope file for this handle (or no handle given at launch) —
+        # return raw names, loudly.
+        resp = {
             "job_id": job_id,
             "status": "done",
             "subdomains": names,
@@ -542,6 +555,13 @@ def amass_status(job_id):
             "timed_out": poll.get("timed_out", False),
             "note": "prefer subdomain_enum for alive-checking + structured result",
         }
+        if meta.get("scope_handle"):
+            resp["warning"] = (f"scope file {meta.get('scope_platform')}_"
+                               f"{meta.get('scope_handle')}.scope not found — "
+                               f"results UNFILTERED; load_program_scope first")
+        else:
+            resp["warning"] = "launched without scope_handle — results NOT scope-filtered"
+        return resp
 
     in_patterns, out_patterns = scope
     in_scope = [s for s in names if _in_scope(s, in_patterns, out_patterns)]
@@ -561,8 +581,13 @@ def amass_status(job_id):
 
 # --- subdomain_enum composite ------------------------------------------------
 
-def _load_scope() -> Tuple[List[str], List[str]] | None:
-    """Load scope patterns from ``.scope`` in the workspace root.
+def _load_scope(platform: Optional[str] = None, handle: Optional[str] = None) -> Tuple[List[str], List[str]] | None:
+    """Load scope patterns from ``<platform>_<handle>.scope`` (per-company).
+
+    With ``platform``/``handle`` given, reads ``scope/<platform>_<handle>.scope``
+    (the per-company file written by program_scope._write_scope_file).
+    With both None, falls back to the legacy singular ``.scope`` for
+    backward compatibility (lab mode = no file anywhere).
 
     Returns None if no scope file exists (lab mode — everything in scope).
     Otherwise returns ``(in_patterns, out_patterns)``.  In-patterns are
@@ -571,7 +596,11 @@ def _load_scope() -> Tuple[List[str], List[str]] | None:
     out-of-scope assets written by program_scope._write_scope_file).
     Lines starting with # are comments.
     """
-    scope_file = Path(os.getenv("WORKSPACE_ROOT", ".")) / ".scope"
+    if platform and handle:
+        scope_file = (Path(os.getenv("WORKSPACE_ROOT", "."))
+                      / f"{platform}_{handle}.scope")
+    else:
+        scope_file = Path(os.getenv("WORKSPACE_ROOT", ".")) / ".scope"
     if not scope_file.is_file():
         return None
     in_patterns: List[str] = []
@@ -748,14 +777,16 @@ def _resolve_alive(
 @framework_tool(
     "Launch subdomain enumeration for a domain in the background using "
     "amass, then resolve each discovered subdomain to verify it's alive, "
-    "and filter against the program scope (if a .scope file exists). "
+    "and filter against the per-company program scope "
+    "(scope_platform+scope_handle, e.g. 'bugcrowd'+'tesla' after "
+    "load_program_scope(platform=...) — omit to run UNFILTERED). "
     "Non-blocking — starts the scan and returns immediately with a job_id. "
     "Poll with subdomain_enum_status(job_id) until status == 'done' for a "
     "structured JSON result: {subdomains, alive, out_of_scope}. "
     "Passive by default; pass options for active/brute modes.",
     next_hints=["subdomain_enum_status", "run_nmap -iL <alive subdomains>"],
 )
-def subdomain_enum(target, options=""):
+def subdomain_enum(target, options="", scope_platform=None, scope_handle=None):
     """Launch amass enum + alive-check composite and return immediately.
 
     amass runs as a detached background subprocess; this call does NOT block.
@@ -767,6 +798,12 @@ def subdomain_enum(target, options=""):
     Args:
         target: Root domain to enumerate (e.g. example.com).
         options: Extra amass flags (same allowlist as run_amass).
+        scope_platform: Optional platform key ("h1"|"bugcrowd") for the
+            per-company scope filter.  Requires scope_handle.
+        scope_handle: Optional program handle — selects
+            ``<scope_platform>_<handle>.scope`` for filtering.  OMIT both
+            to run unfiltered (results flagged with a warning); a scan
+            never silently inherits another company's scope.
     """
     validated = _validate_options(options)
 
@@ -836,7 +873,8 @@ def subdomain_enum(target, options=""):
         timeout=amass_cap,
     )
     job_id = job["job_id"]
-    _store_amass_meta(job_id, target, options, composite=True)
+    _store_amass_meta(job_id, target, options, composite=True,
+                      scope_platform=scope_platform, scope_handle=scope_handle)
 
     return {
         "job_id": job_id,
@@ -857,7 +895,7 @@ def subdomain_enum_status(job_id):
 
     When the amass enum subprocess finishes, this:
     1. Retrieves discovered names (``amass subs -names`` + crt.sh fallback)
-    2. Filters against program scope (``.scope`` file) if one exists
+    2. Filters against the per-company scope selected at launch
     3. DNS-resolves in-scope subdomains to check if they're alive
     4. Returns structured JSON: ``{subdomains, alive, out_of_scope, ...}``
 
@@ -912,16 +950,21 @@ def subdomain_enum_status(job_id):
             ),
         }
 
-    # Scope filtering.
-    scope = _load_scope()
+    # Scope filtering (per-company, keyed at launch time).
+    scope = _load_scope(meta.get("scope_platform"), meta.get("scope_handle"))
     if scope is None:
         in_scope = names
         out_of_scope = []
         out_patterns = []
+        scope_warning = ("launched without scope_handle — results NOT scope-filtered"
+                         if not meta.get("scope_handle") else
+                         f"scope file {meta.get('scope_platform')}_{meta.get('scope_handle')}.scope "
+                         f"not found — results UNFILTERED; load_program_scope first")
     else:
         in_patterns, out_patterns = scope
         in_scope = [s for s in names if _in_scope(s, in_patterns, out_patterns)]
         out_of_scope = [s for s in names if s not in in_scope]
+        scope_warning = None
 
     # DNS resolution (alive check) — only on in-scope subs.
     #
@@ -961,3 +1004,6 @@ def subdomain_enum_status(job_id):
         "elapsed": poll.get("elapsed"),
         "timed_out": poll.get("timed_out", False),
     }
+    if scope_warning:
+        result["warning"] = scope_warning
+    return result
