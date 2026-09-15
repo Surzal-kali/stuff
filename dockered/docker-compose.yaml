@@ -32,7 +32,7 @@ services:
       dockerfile: dockered/open-terminal.Dockerfile
     ports:
       - "8000:8000"    # Open Terminal API (connect Open WebUI here)
-      - "5000:5000"    # Framework REST + MCP gateway (debug from host)
+      - "6000:6000"    # Framework REST + MCP gateway (debug from host)
     networks:
       workbench:
         ipv4_address: 172.28.0.20

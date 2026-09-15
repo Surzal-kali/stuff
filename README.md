@@ -333,7 +333,7 @@ Environment variables (see `.env`):
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.md
 
 # Index tools into the vector registry
 python -m daharness.core

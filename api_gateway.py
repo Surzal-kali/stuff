@@ -715,7 +715,7 @@ class APIGateway:
             isError=True,
         )
 
-async def run(loader, host="127.0.0.1", port=6000):
+async def run(loader, host="127.0.0.1", port=5000):
     # Reuse the loader's already-initialized ToolRegistry instead of building a
     # second one.  The loader's registry shares the same ChromaDB collection,
     # cached tool instances (MetasploitClient, SMBScanner, ...), and Brain

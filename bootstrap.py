@@ -452,7 +452,7 @@ class FrameworkLoader:
         """Starts the API server as an async task."""
         try:
             from api_gateway import run as FrameworkAPI
-            await FrameworkAPI(loader=self, host="0.0.0.0", port=6000)
+            await FrameworkAPI(loader=self, host="0.0.0.0", port=5000)
         except Exception as e:
             logger.error("[!] API server failed to start: %s", e, exc_info=True)
 
@@ -623,7 +623,7 @@ class FrameworkLoader:
         # ConnectionError on a half-initialised daemon.
         await self.wait_for_zap()
 
-        logger.info("[+] API Control Panel started on port 6000")
+        logger.info("[+] API Control Panel started on port 5000")
         logger.info("[*] Background servers initialized.")
 
 # --- Main ---
