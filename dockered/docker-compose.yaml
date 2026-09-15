@@ -1,0 +1,61 @@
+# =============================================================================
+# Framework workbench: Open Terminal (network-isolated) + existing ChromaDB
+#
+# The open-terminal container has the full framework baked in but can only
+# reach ChromaDB (Docker-internal) and Ollama (10.0.0.245:11434). All other
+# outbound traffic is blocked by iptables in the entrypoint.
+#
+# ChromaDB is NOT defined here — it is the existing standalone `chroma`
+# container.  The up.sh script connects it to the workbench network after
+# compose starts so open-terminal can reach it by DNS name `chroma`.
+#
+# Usage:
+#   cd dockered
+#   ./up.sh                  # builds + starts + wires chroma into the network
+#
+#   # or manually:
+#   docker compose up -d --build
+#   docker network connect workbench chroma
+#
+# Open Terminal API:  http://localhost:8000   (connect Open WebUI here)
+# Framework gateway:  http://localhost:6000   (REST + MCP, from host)
+#
+# Override API keys via shell env or a dockered/.env file:
+#   OPEN_TERMINAL_API_KEY=your-key
+#   GATEWAY_API_KEY=your-key
+# =============================================================================
+
+services:
+  open-terminal:
+    build:
+      context: ..
+      dockerfile: dockered/open-terminal.Dockerfile
+    ports:
+      - "8000:8000"    # Open Terminal API (connect Open WebUI here)
+      - "5000:5000"    # Framework REST + MCP gateway (debug from host)
+    networks:
+      workbench:
+        ipv4_address: 172.28.0.20
+    cap_add:
+      - NET_ADMIN       # needed only for entrypoint iptables setup
+    env_file:
+      - framework.env
+    environment:
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY:-changeme-terminal-key}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-changeme-gateway-key}
+    volumes:
+      - terminal-workspace:/home/user        # agent workspace (ephemeral files)
+      - framework-memory:/opt/framework/.memory  # persistent vector memory
+    restart: unless-stopped
+
+networks:
+  workbench:
+    name: workbench
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  terminal-workspace:
+  framework-memory:
