@@ -269,7 +269,7 @@ in `schema.md`. The findings table shares this database.
 
 ### API Gateway (`api_gateway.py`)
 
-FastAPI server (port 6000) exposing:
+FastAPI server (port 5000) exposing:
 - `GET /health` — framework health check
 - `POST /tools/execute` — semantic tool lookup + execution
 - `POST /tools/search` — semantic tool search (no execution)
@@ -279,11 +279,6 @@ FastAPI server (port 6000) exposing:
 Also serves MCP (Model Context Protocol) handlers for tool listing and
 execution. If `GATEWAY_API_KEY` is set, every request is authenticated;
 otherwise the gateway runs in unauthenticated dev mode.
-
-### OpenWebUI Integration (`owui-tool.py`)
-
-External tool definitions for OpenWebUI that call the framework API for
-tool execution and memory operations.
 
 ## Quick Start
 
@@ -418,7 +413,7 @@ daharness/              Tool secretary agent + semantic registry (core package)
   core.py               Backwards-compat shim / CLI entry point
 constants.py            @framework_tool decorator + TransportType enum
 bootstrap.py            Daemon entry point; launches all sidecars (Brain, ZAP, MSF MCP, API)
-api_gateway.py          FastAPI control panel + MCP server (port 6000)
+api_gateway.py          FastAPI control panel + MCP server (port 5000)
 memories.py             ChromaDB-backed namespaced vector memory
 listeners/
   thebrain.py           Unix socket sidecar + function registry
