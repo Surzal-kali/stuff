@@ -5,17 +5,19 @@
 # reach ChromaDB (Docker-internal) and Ollama (10.0.0.245:11434). All other
 # outbound traffic is blocked by iptables in the entrypoint.
 #
-# ChromaDB is NOT defined here — it is the existing standalone `chroma`
-# container.  The up.sh script connects it to the workbench network after
-# compose starts so open-terminal can reach it by DNS name `chroma`.
+# ChromaDB is now defined below as the `chroma` service — it mirrors the
+# previous standalone `chroma` container (same image, same config.yaml,
+# same `chroma-data` bind mount, host port 9000).  open-terminal reaches it
+# by DNS name `chroma` on the workbench network.  See the note above the
+# service block about removing the standalone container first.
 #
 # Usage:
 #   cd dockered
-#   ./up.sh                  # builds + starts + wires chroma into the network
+#   ./up.sh                  # builds + starts (removes legacy chroma first)
 #
 #   # or manually:
+#   docker rm -f chroma       # clear the standalone container if present
 #   docker compose up -d --build
-#   docker network connect workbench chroma
 #
 # Open Terminal API:  http://localhost:8000   (connect Open WebUI here)
 # Framework gateway:  http://localhost:6000   (REST + MCP, from host)
@@ -26,6 +28,28 @@
 # =============================================================================
 
 services:
+  # ─────────────────────────────────────────────────────────────────────────
+  # ChromaDB — mirrored from the existing standalone `chroma` container so the
+  # workbench is self-contained.  Service name `chroma` is the DNS name on the
+  # workbench network, matching CHROMA_HOST=chroma in framework.env.
+  #
+  # Before `docker compose up`, stop/remove the standalone container to avoid a
+  # host port-9000 / container-name collision:
+  #   docker rm -f chroma
+  # ─────────────────────────────────────────────────────────────────────────
+  chroma:
+    image: chromadb/chroma
+    command: ["run", "/config.yaml"]
+    ports:
+      - "9000:8000"      # host 9000 -> container 8000 (matches existing mapping)
+    networks:
+      workbench:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ../chroma-data:/data          # reuse the existing on-disk vector store
+      - ./chroma-config.yaml:/config.yaml:ro
+    restart: unless-stopped
+
   open-terminal:
     build:
       context: ..
