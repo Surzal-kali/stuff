@@ -28,7 +28,7 @@ def wait_for_chromadb(timeout=90):
     import chromadb
 
     host = os.getenv("CHROMA_HOST", "chromadb")
-    port = int(os.getenv("CHROMA_PORT", "8000"))
+    port = int(os.getenv("CHROMA_PORT", "9000"))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
