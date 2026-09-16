@@ -391,6 +391,201 @@ def _bc_build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:
     return (manifest, None)
 
 
+# --- Intigriti lane (Researcher API v1, PAT-gated) --------------------------
+#
+# The Intigriti researcher API (https://api.intigriti.com/external/researcher)
+# uses Bearer-token auth with a Personal Access Token (PAT), generated from
+# the Intigriti web UI → Settings → Personal access tokens.  Unlike H1, the
+# detail endpoint takes a GUID ``programId``, not a handle — so we first list
+# all accessible programs and resolve the handle to its GUID.
+#
+# Intigriti domains carry a **tier** (Tier 1/2/3, No bounty, Out of scope)
+# instead of H1's ``eligible_for_bounty`` / ``eligible_for_submission`` flags.
+# Tier "Out of scope" → out_of_scope_assets; everything else → in_scope.
+# There are no structured scope_exclusions or weaknesses allowlists (the
+# rules of engagement are prose), so check_reportable returns an explicit
+# ``unsupported`` envelope (same as Bugcrowd).  The API does expose structured
+# testing requirements (max requests/sec, custom User-Agent, request header)
+# which we capture in the manifest so scan tools can self-configure.
+
+_INTI_API = "https://api.intigriti.com/external/researcher"
+
+# Intigriti domain type (value string) → H1-shaped asset_type.
+_INTI_DOMAIN_TYPE_MAP: Dict[str, str] = {
+    "URL": "URL",
+    "Android": "ANDROID",
+    "IOS": "IOS",
+    "IP range": "CIDR",
+    "Device": "OTHER",
+    "Other": "OTHER",
+    "Wildcard": "WILDCARD",
+}
+
+
+def _inti_auth() -> Optional[str]:
+    """Return the Intigriti PAT bearer token, or None if not configured."""
+    return os.getenv("INTIGRITI_API_TOKEN")
+
+
+def _inti_get(path: str, *, params: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
+    """GET against the Intigriti Researcher API with Bearer auth."""
+    import requests
+
+    token = _inti_auth()
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = requests.get(f"{_INTI_API}{path}", params=params, headers=headers,
+                     timeout=_TIMEOUT)
+    try:
+        body = r.json()
+    except ValueError:
+        body = r.text
+    return (r.status_code, body)
+
+
+def _inti_resolve_handle(handle: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a program ``handle`` to its GUID ``programId``.
+
+    Intigriti's detail endpoint requires a GUID, not a handle, so we page
+    through ``GET /v1/programs`` (max 500/page) and match by ``handle``.
+    Returns ``(program_id, error)``.
+    """
+    offset = 0
+    for _ in range(20):  # max 20 pages × 500 = 10 000 programs
+        status, body = _inti_get("/v1/programs", params={"limit": 500, "offset": offset})
+        if status != 200 or not isinstance(body, dict):
+            return (None, f"program listing: HTTP {status}")
+        records = body.get("records") or []
+        for rec in records:
+            if (rec.get("handle") or "").lower() == handle.lower():
+                return (rec.get("id"), None)
+        max_count = body.get("maxCount", 0)
+        offset += len(records)
+        if not records or offset >= max_count:
+            break
+    return (None, f"handle {handle!r} not found in program listing "
+                  f"(you may not have access, or the handle is wrong)")
+
+
+def _inti_map_domain(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Map one Intigriti ``DomainViewModel`` onto the H1-shaped asset schema."""
+    dtype = (d.get("type") or {}).get("value") or "Other"
+    atype = _INTI_DOMAIN_TYPE_MAP.get(dtype, "OTHER")
+    endpoint = (d.get("endpoint") or "").strip()
+    tier = (d.get("tier") or {}).get("value") or ""
+    desc = d.get("description") or ""
+
+    # IP range without a CIDR mask → treat as /32 (single host)
+    if atype == "CIDR" and "/" not in endpoint:
+        endpoint = f"{endpoint}/32"
+
+    tier_lc = tier.lower()
+    return {
+        "id": d.get("id"),
+        "asset_type": atype,
+        "asset_identifier": endpoint,
+        "eligible_for_bounty": tier_lc not in ("no bounty", "out of scope", ""),
+        "eligible_for_submission": tier_lc != "out of scope",
+        "max_severity": None,
+        "instruction": desc or None,
+        "confidentiality_requirement": None,
+        "integrity_requirement": None,
+        "availability_requirement": None,
+        "reference": None,
+        "updated_at": None,
+        "inti_tier": tier,
+    }
+
+
+def _inti_build_manifest(handle: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Fetch a program's scope + rules of engagement from the Intigriti
+    Researcher API and assemble an H1-shaped manifest.
+
+    Requires ``INTIGRITI_API_TOKEN`` (PAT) in the environment.
+    """
+    token = _inti_auth()
+    if not token:
+        return ({}, ("auth_required: set INTIGRITI_API_TOKEN "
+                     "(generate at app.intigriti.com → Settings → "
+                     "Personal access tokens)"))
+
+    # Step 1: resolve handle → GUID programId
+    program_id, err = _inti_resolve_handle(handle)
+    if err:
+        return ({}, err)
+
+    # Step 2: fetch program detail (includes domains + rules of engagement)
+    status, body = _inti_get(f"/v1/programs/{program_id}")
+    if status != 200 or not isinstance(body, dict):
+        if status == 403:
+            return ({}, "HTTP 403: you must accept the program's terms and "
+                        "conditions via the Intigriti web interface before "
+                        "the API grants detail access")
+        return ({}, f"program detail: HTTP {status}")
+
+    # Step 3: extract domains (versioned blob → content list)
+    domains_version = body.get("domains") or {}
+    domains = domains_version.get("content") or []
+    in_scope: List[Dict[str, Any]] = []
+    out_of_scope_assets: List[Dict[str, Any]] = []
+    for d in domains:
+        entry = _inti_map_domain(d)
+        (in_scope if entry.get("eligible_for_submission")
+         else out_of_scope_assets).append(entry)
+
+    # Step 4: extract rules of engagement (versioned blob → content)
+    roe_version = body.get("rulesOfEngagement") or {}
+    roe_content = roe_version.get("content") or {}
+    policy = roe_content.get("description") or ""
+    testing_req = roe_content.get("testingRequirements") or {}
+    safe_harbour = roe_content.get("safeHarbour")
+    attachments = roe_version.get("attachments") or []
+
+    # Program metadata
+    conf_level = (body.get("confidentialityLevel") or {}).get("value")
+    prog_status = (body.get("status") or {}).get("value")
+    prog_type = (body.get("type") or {}).get("value")
+    prog_name = body.get("name")
+
+    manifest = {
+        "handle": handle,
+        "platform": "intigriti",
+        "program_id": program_id,
+        "program_name": prog_name,
+        "fetched_at": time.time(),
+        "in_scope": in_scope,
+        "out_of_scope_assets": out_of_scope_assets,
+        "excluded_categories": [],   # Intigriti RoE is prose, not structured
+        "weaknesses": [],            # ...no structured CWE allowlist
+        "policy": policy,
+        "safe_harbor": safe_harbour,
+        "testing_requirements": {
+            "intigriti_me": testing_req.get("intigritiMe"),
+            "max_requests_per_second": testing_req.get("automatedTooling"),
+            "user_agent": testing_req.get("userAgent"),
+            "request_header": testing_req.get("requestHeader"),
+        },
+        "roe_attachments": [{"url": a.get("url")} for a in attachments],
+        "confidentiality_level": conf_level,
+        "program_status": prog_status,
+        "program_type": prog_type,
+        "counts": {
+            "in_scope": len(in_scope),
+            "out_of_scope_assets": len(out_of_scope_assets),
+            "excluded_categories": 0,
+            "weaknesses": 0,
+        },
+        "_warning": ("intigriti lane: check_reportable unsupported (no structured "
+                     "exclusions/weaknesses in API; judge from RoE prose "
+                     "[manifest['policy']]); no hacktivity/disclosed-reports "
+                     "endpoint available for researchers; testing_requirements "
+                     "may mandate a custom User-Agent or request header — "
+                     "consult manifest['testing_requirements']"),
+    }
+    return (manifest, None)
+
+
 def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
     """Write amass-compatible ``.scope`` from DOMAIN/WILDCARD/URL assets.
 
@@ -554,15 +749,17 @@ def _find_match(target: str, assets: List[Dict[str, Any]]) -> Optional[Dict[str,
 
 @framework_tool(
     "Load a bug-bounty program's scope as a structured, checkable "
-    "manifest (platform='h1' HackerOne API [default, member-gated] or "
+    "manifest (platform='h1' HackerOne API [default, member-gated], "
     "platform='bugcrowd' public engagement brief [anonymous, public "
-    "programs]): in-scope assets (typed: URL/WILDCARD/DOMAIN/CIDR/"
+    "programs], or platform='intigriti' Researcher API v1 [PAT-gated]): "
+    "in-scope assets (typed: URL/WILDCARD/DOMAIN/CIDR/"
     "IP/ANDROID/IOS/BLOCKCHAIN with max_severity and CIA requirements), "
     "out-of-scope assets, excluded report categories, the reportable "
     "weakness/CWE allowlist, and the program policy text. Also writes the "
     "workspace .scope file so subdomain_enum auto-filters against the real "
-    "HackerOne scope. Cached to disk; pass refresh=True to force a fresh "
-    "fetch. Requires H1_API_USERNAME and H1_API_TOKEN in the environment.",
+    "program scope. Cached to disk; pass refresh=True to force a fresh "
+    "fetch. H1 requires H1_API_USERNAME and H1_API_TOKEN; Intigriti "
+    "requires INTIGRITI_API_TOKEN; Bugcrowd is anonymous.",
     next_hints=["check_scope", "check_reportable", "subdomain_enum"],
 )
 def load_program_scope(handle: str = "crypto", refresh: bool = False,
@@ -570,14 +767,15 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False,
     """Fetch (or load cached) program scope for ``handle``.
 
     Args:
-        handle: The program handle, e.g. ``"crypto"`` (H1) or ``"tesla"``
-            (Bugcrowd).  Defaults to ``"crypto"``.
+        handle: The program handle, e.g. ``"crypto"`` (H1), ``"tesla"``
+            (Bugcrowd), or ``"sap"`` (Intigriti).  Defaults to ``"crypto"``.
         refresh: If True, ignore the on-disk cache and fetch fresh.
-        platform: ``"h1"`` (HackerOne API, member-gated; default) or
-            ``"bugcrowd"`` (public engagement brief, anonymous).
+        platform: ``"h1"`` (HackerOne API, member-gated; default),
+            ``"bugcrowd"`` (public engagement brief, anonymous), or
+            ``"intigriti"`` (Researcher API v1, PAT-gated).
     """
     platform = (platform or "h1").strip().lower()
-    if platform not in ("h1", "bugcrowd"):
+    if platform not in ("h1", "bugcrowd", "intigriti"):
         return {"handle": handle, "platform": platform,
                 "status": "error", "error": f"unknown platform {platform!r}"}
     if not refresh:
@@ -588,6 +786,8 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False,
 
     if platform == "bugcrowd":
         manifest, err = _bc_build_manifest(handle)
+    elif platform == "intigriti":
+        manifest, err = _inti_build_manifest(handle)
     else:
         manifest, err = _build_manifest(handle)
     if err:
@@ -609,8 +809,8 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False,
 
 @framework_tool(
     "Check whether a target (host, URL, IP/CIDR, or mobile app package id) "
-    "is inside a program's authorised scope (platform: 'h1' default or "
-    "'bugcrowd'). Returns in_scope "
+    "is inside a program's authorised scope (platform: 'h1' default, "
+    "'bugcrowd', or 'intigriti'). Returns in_scope "
     "True/False, the matched asset (with asset_type, max_severity, CIA "
     "requirements, and any instruction), and a reason. Call this BEFORE "
     "running nmap/masscan/ffuf/ZAP against any target to avoid scanning "
@@ -625,7 +825,7 @@ def check_scope(target: str, handle: str, platform: str = "h1") -> Dict[str, Any
         target: A hostname, URL, IP, CIDR, or mobile app package id.
         handle: Program handle (REQUIRED — no default; a silent default
             silently checks against the wrong program's manifest).
-        platform: ``"h1"`` (default) or ``"bugcrowd"``.
+        platform: ``"h1"`` (default), ``"bugcrowd"``, or ``"intigriti"``.
     """
     if not handle or not str(handle).strip():
         raise ValueError(
@@ -679,7 +879,9 @@ def check_scope(target: str, handle: str, platform: str = "h1") -> Dict[str, Any
     "weakness allowlist. Returns reportable True/False, which exclusion it "
     "hit (if any), and whether the CWE is in the program's weakness list. "
     "Use this as a gate before report_finding to avoid filing N/A or "
-    "spam-grade reports that hurt your HackerOne reputation.",
+    "spam-grade reports that hurt your HackerOne reputation. Bugcrowd and "
+    "Intigriti return an explicit ``unsupported`` envelope (no structured "
+    "exclusions/weaknesses; judge from prose).",
     next_hints=["report_finding", "program_hacktivity"],
 )
 def check_reportable(category_or_cwe: str, handle: str,
@@ -691,19 +893,21 @@ def check_reportable(category_or_cwe: str, handle: str,
             headers", "Brute force", "Open redirect") or a CWE id
             (e.g. "CWE-89", "cwe-352").  Matched case-insensitively.
         handle: Program handle (REQUIRED — no default).
-        platform: ``"h1"`` (default) or ``"bugcrowd"`` (returns an explicit
+        platform: ``"h1"`` (default), ``"bugcrowd"`` (returns an explicit
             ``unsupported`` envelope — Bugcrowd briefs carry no structured
-            exclusions/weaknesses; judge from brief prose).
+            exclusions/weaknesses; judge from brief prose), or
+            ``"intigriti"`` (same ``unsupported`` envelope — Intigriti RoE
+            is prose, not structured exclusions/weaknesses).
     """
     if not handle or not str(handle).strip():
         raise ValueError("handle is required: silent program default produced wrong-verdict bugs")
     handle = str(handle).strip()
-    if platform == "bugcrowd":
-        return {"platform": "bugcrowd", "handle": handle,
+    if platform in ("bugcrowd", "intigriti"):
+        return {"platform": platform, "handle": handle,
                 "status": "unsupported", "reportable": None,
-                "reason": ("Bugcrowd briefs carry no structured exclusion/weakness "
-                           "allowlists — judge reportability from brief prose "
-                           "(manifest['policy'])")}
+                "reason": (f"{platform.capitalize()} carries no structured "
+                           "exclusion/weakness allowlists — judge reportability "
+                           "from RoE/brief prose (manifest['policy'])")}
     manifest = _load_cache(handle, platform)
     if manifest is None:
         manifest = load_program_scope(handle, refresh=False, platform=platform)

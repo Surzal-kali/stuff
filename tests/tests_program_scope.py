@@ -195,7 +195,8 @@ def test_load_manifest_structure(loaded_manifest):
 
 def test_scope_file_written_amass_compatible(loaded_manifest):
     m, tmp_path = loaded_manifest
-    scope_file = tmp_path / ".scope"
+    # Per-company scope file: <platform>_<handle>.scope (not legacy .scope)
+    scope_file = tmp_path / "h1_crypto.scope"
     assert scope_file.is_file()
     text = scope_file.read_text()
     # WILDCARD and URL-host assets become patterns; ANDROID does NOT (not a domain)
@@ -203,7 +204,7 @@ def test_scope_file_written_amass_compatible(loaded_manifest):
     assert "crypto.com" in text  # URL host reduced
     assert "co.mona.android" not in text  # mobile app id is not a domain pattern
     # amass's own loader consumes it and matches correctly
-    scope = _load_scope()
+    scope = _load_scope("h1", "crypto")
     assert scope is not None
     in_p, out_p = scope
     assert _in_scope("api.crypto.com", in_p, out_p) is True
@@ -435,3 +436,223 @@ def test_in_scope_oos_exclamation_pattern(monkeypatch, tmp_path):
     assert _in_scope("api.crypto.com", in_p, out_p) is True
     assert _in_scope("selfservice.crypto.com", in_p, out_p) is False
     assert _in_scope("evil.com", in_p, out_p) is False
+
+
+# ============================================================================
+# Intigriti lane (Researcher API v1, PAT-gated)
+# ============================================================================
+
+# --- Intigriti mock fixtures ------------------------------------------------
+
+MOCK_INTI_PROGRAMS = {
+    "maxCount": 1,
+    "records": [
+        {"id": "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee", "handle": "sap",
+         "name": "SAP SE", "following": False,
+         "confidentialityLevel": {"id": 4, "value": "Public"},
+         "status": {"id": 3, "value": "Open"},
+         "type": {"id": 1, "value": "Bug bounty"},
+         "webLinks": {"detail": "https://app.intigriti.com/researcher/programs/sap/sap"}},
+    ],
+}
+
+MOCK_INTI_DETAIL = {
+    "id": "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "handle": "sap",
+    "name": "SAP SE",
+    "confidentialityLevel": {"id": 4, "value": "Public"},
+    "status": {"id": 3, "value": "Open"},
+    "type": {"id": 1, "value": "Bug bounty"},
+    "domains": {
+        "id": "dom-ver-1",
+        "createdAt": 1700000000,
+        "content": [
+            {"id": "d1", "type": {"id": 7, "value": "Wildcard"},
+             "endpoint": "*.sap.com", "tier": {"id": 4, "value": "Tier 1"},
+             "description": "All SAP subdomains"},
+            {"id": "d2", "type": {"id": 1, "value": "URL"},
+             "endpoint": "https://store.sap.com", "tier": {"id": 3, "value": "Tier 2"},
+             "description": "SAP Store"},
+            {"id": "d3", "type": {"id": 4, "value": "IP range"},
+             "endpoint": "155.56.0.0/16", "tier": {"id": 2, "value": "Tier 3"},
+             "description": "SAP corporate IP range"},
+            {"id": "d4", "type": {"id": 2, "value": "Android"},
+             "endpoint": "com.sap.mobile", "tier": {"id": 1, "value": "No bounty"},
+             "description": "SAP Android app (no bounty)"},
+            {"id": "d5", "type": {"id": 1, "value": "URL"},
+             "endpoint": "help.sap.com", "tier": {"id": 5, "value": "Out Of Scope"},
+             "description": "Documentation — OOS"},
+        ],
+    },
+    "rulesOfEngagement": {
+        "id": "roe-ver-1",
+        "createdAt": 1700000000,
+        "content": {
+            "description": "Only reproducible vulnerabilities with PoC. No DoS.",
+            "testingRequirements": {
+                "intigritiMe": True,
+                "automatedTooling": 10,
+                "userAgent": "researcher-intigriti",
+                "requestHeader": "X-Intigriti: true",
+            },
+            "safeHarbour": True,
+        },
+        "attachments": [{"url": "https://app.intigriti.com/attach/1", "code": 1}],
+    },
+    "webLinks": {"detail": "https://app.intigriti.com/researcher/programs/sap/sap"},
+}
+
+
+def _inti_mock_get(path: str, *, params=None, **kw):
+    """Route mocked _inti_get calls to the right fixture."""
+    if path == "/v1/programs":
+        return (200, MOCK_INTI_PROGRAMS)
+    if path.startswith("/v1/programs/"):
+        return (200, MOCK_INTI_DETAIL)
+    return (404, {})
+
+
+@pytest.fixture
+def inti_manifest(monkeypatch, tmp_path):
+    """Build an Intigriti manifest from mocked API responses."""
+    monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat-token")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    with mock.patch.object(ps, "_inti_get", side_effect=_inti_mock_get):
+        m = ps.load_program_scope("sap", refresh=True, platform="intigriti")
+    return m, tmp_path
+
+
+# --- Intigriti manifest structure -------------------------------------------
+
+def test_inti_manifest_structure(inti_manifest):
+    m, _ = inti_manifest
+    assert m["handle"] == "sap"
+    assert m["platform"] == "intigriti"
+    assert m["status"] == "ok"
+    assert m["program_id"] == "aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee"
+    assert m["program_name"] == "SAP SE"
+    assert m["counts"]["in_scope"] == 4   # wildcard, URL, IP range, Android
+    assert m["counts"]["out_of_scope_assets"] == 1  # help.sap.com (Out of scope tier)
+    assert m["counts"]["excluded_categories"] == 0
+    assert m["counts"]["weaknesses"] == 0
+
+
+def test_inti_tier_splits_in_out(inti_manifest):
+    m, _ = inti_manifest
+    in_handles = {a["asset_identifier"] for a in m["in_scope"]}
+    out_handles = {a["asset_identifier"] for a in m["out_of_scope_assets"]}
+    assert "*.sap.com" in in_handles
+    assert "https://store.sap.com" in in_handles
+    assert "155.56.0.0/16" in in_handles
+    assert "com.sap.mobile" in in_handles  # No bounty tier → still in scope
+    assert "help.sap.com" in out_handles    # Out of scope tier → OOS
+
+
+def test_inti_no_bounty_eligible_for_submission(inti_manifest):
+    m, _ = inti_manifest
+    android = [a for a in m["in_scope"] if a["asset_identifier"] == "com.sap.mobile"][0]
+    assert android["eligible_for_submission"] is True   # in scope
+    assert android["eligible_for_bounty"] is False       # No bounty tier
+
+
+def test_inti_domain_type_mapping(inti_manifest):
+    m, _ = inti_manifest
+    by_ident = {a["asset_identifier"]: a for a in m["in_scope"]}
+    assert by_ident["*.sap.com"]["asset_type"] == "WILDCARD"
+    assert by_ident["https://store.sap.com"]["asset_type"] == "URL"
+    assert by_ident["155.56.0.0/16"]["asset_type"] == "CIDR"
+    assert by_ident["com.sap.mobile"]["asset_type"] == "ANDROID"
+    # tier is preserved
+    assert by_ident["*.sap.com"]["inti_tier"] == "Tier 1"
+
+
+def test_inti_roe_and_testing_reqs(inti_manifest):
+    m, _ = inti_manifest
+    assert "reproducible" in m["policy"]
+    assert m["safe_harbor"] is True
+    assert m["testing_requirements"]["intigriti_me"] is True
+    assert m["testing_requirements"]["max_requests_per_second"] == 10
+    assert m["testing_requirements"]["user_agent"] == "researcher-intigriti"
+    assert m["testing_requirements"]["request_header"] == "X-Intigriti: true"
+    assert len(m["roe_attachments"]) == 1
+
+
+def test_inti_cache_written(inti_manifest):
+    m, tmp_path = inti_manifest
+    cache = tmp_path / "scope" / "intigriti_sap.json"
+    assert cache.is_file()
+    cached = json.loads(cache.read_text())
+    assert cached["platform"] == "intigriti"
+    assert cached["counts"]["in_scope"] == 4
+
+
+# --- Intigriti check_scope (platform-agnostic matcher) -----------------------
+
+def test_inti_check_scope_wildcard(inti_manifest):
+    r = ps.check_scope("api.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is True
+    assert r["matched_asset"]["asset_type"] == "WILDCARD"
+
+
+def test_inti_check_scope_url(inti_manifest):
+    r = ps.check_scope("https://store.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is True
+
+
+def test_inti_check_scope_cidr(inti_manifest):
+    r = ps.check_scope("155.56.10.20", handle="sap", platform="intigriti")
+    assert r["in_scope"] is True
+
+
+def test_inti_check_scope_oos(inti_manifest):
+    r = ps.check_scope("help.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is False
+    assert "out-of-scope" in r["reason"]
+
+
+def test_inti_check_scope_no_match(inti_manifest):
+    r = ps.check_scope("evil.example.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is False
+    assert "no matching asset" in r["reason"]
+
+
+# --- Intigriti check_reportable (unsupported envelope) ----------------------
+
+def test_inti_check_reportable_unsupported(inti_manifest):
+    r = ps.check_reportable("CWE-89", handle="sap", platform="intigriti")
+    assert r["status"] == "unsupported"
+    assert r["reportable"] is None
+    assert "prose" in r["reason"]
+
+
+# --- Intigriti auth path ----------------------------------------------------
+
+def test_inti_no_token_auth_required(monkeypatch, tmp_path):
+    monkeypatch.delenv("INTIGRITI_API_TOKEN", raising=False)
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    _, err = ps._inti_build_manifest("sap")
+    assert "auth_required" in err
+    assert "INTIGRITI_API_TOKEN" in err
+
+
+def test_inti_handle_not_found(monkeypatch, tmp_path):
+    monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    def _empty(path, *, params=None, **kw):
+        return (200, {"maxCount": 0, "records": []})
+    with mock.patch.object(ps, "_inti_get", side_effect=_empty):
+        _, err = ps._inti_build_manifest("nonexistent")
+    assert "not found" in err
+
+
+def test_inti_403_terms_not_accepted(monkeypatch, tmp_path):
+    monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    def _programs_then_403(path, *, params=None, **kw):
+        if path == "/v1/programs":
+            return (200, MOCK_INTI_PROGRAMS)
+        return (403, {})
+    with mock.patch.object(ps, "_inti_get", side_effect=_programs_then_403):
+        _, err = ps._inti_build_manifest("sap")
+    assert "403" in err
+    assert "terms" in err.lower()
