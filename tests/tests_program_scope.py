@@ -897,6 +897,40 @@ def test_get_scan_config_none_when_no_manifest(monkeypatch, tmp_path):
     monkeypatch.setenv("INTIGRITI_USERNAME", "testuser")
     assert ps.get_scan_config("nonexistent", "intigriti") is None
 
+def test_get_scan_config_intigriti_rate_only(monkeypatch, tmp_path):
+    """Finding 1: a program mandating ONLY a rate cap (no custom UA/header)
+    must return a config dict with the rate — not None (which would silently
+    drop the rate cap at the source)."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_rateonly.json").write_text(json.dumps({
+        "platform": "intigriti", "handle": "rateonly",
+        "testing_requirements": {
+            "max_requests_per_second": 8,
+            # no user_agent, no request_header
+        },
+    }))
+    cfg = ps.get_scan_config("rateonly", "intigriti")
+    assert cfg is not None
+    assert cfg["platform"] == "intigriti"
+    assert cfg["max_requests_per_second"] == 8
+    assert cfg["headers"] == {}  # no headers mandated
+    assert cfg["source"] == "structured"
+
+def test_get_scan_config_intigriti_no_requirements_returns_none(monkeypatch, tmp_path):
+    """When the program mandates nothing at all (no UA, no header, no rate),
+    get_scan_config returns None — no config to apply."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_empty.json").write_text(json.dumps({
+        "platform": "intigriti", "handle": "empty",
+        "testing_requirements": {},
+    }))
+    cfg = ps.get_scan_config("empty", "intigriti")
+    assert cfg is None
+
 
 def test_get_scan_config_username_placeholder_unresolved(monkeypatch, tmp_path):
     """When INTIGRITI_USERNAME is not set, {Username} stays as-is (the scan

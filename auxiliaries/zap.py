@@ -160,6 +160,60 @@ class ZAPClient:
 
     # ---- scan-config enforcement (Intigriti RoE) -------------------------
 
+    def clear_ri_rules(self) -> List[Dict[str, str]]:
+        """Remove all framework-managed replacer + rate-limit rules.
+
+        ZAP replacer and rate-limit rules are **daemon-global** — they
+        persist across scope switches.  After an Adobe session, a stale
+        ``X-Intigriti-Username`` header and Adobe's rate cap would still
+        be applied to whatever you scan next (cross-program header leak).
+
+        This method enumerates all rules whose description starts with
+        ``_RI_PREFIX`` and removes them.  Called at the start of
+        ``configure_scan_config`` so stale rules from a previous program
+        are cleared before new ones are applied.
+
+        Returns a list of ``{"type": ..., "description": ..., "status": ...}``
+        dicts so callers can audit what was cleared.
+        """
+        cleared: List[Dict[str, str]] = []
+
+        # --- Replacer rules ---
+        try:
+            rules = self._get("replacer/view/rules")
+            rule_list = rules.get("replacerRules", rules) if isinstance(rules, dict) else []
+            if not isinstance(rule_list, list):
+                rule_list = []
+            for r in rule_list:
+                desc = r.get("description", "")
+                if desc.startswith(_RI_PREFIX):
+                    try:
+                        self._get("replacer/action/removeRule", description=desc)
+                        cleared.append({"type": "replacer", "description": desc, "status": "removed"})
+                    except Exception as e:
+                        cleared.append({"type": "replacer", "description": desc, "status": f"remove_failed: {e}"})
+        except Exception as e:
+            cleared.append({"type": "replacer", "description": "_list", "status": f"list_failed: {e}"})
+
+        # --- Rate-limit rules ---
+        try:
+            rules = self._get("network/view/rateLimitRules")
+            rule_list = rules.get("rateLimitRules", rules) if isinstance(rules, dict) else []
+            if not isinstance(rule_list, list):
+                rule_list = []
+            for r in rule_list:
+                desc = r.get("description", "")
+                if desc.startswith(_RI_PREFIX):
+                    try:
+                        self._get("network/action/removeRateLimitRule", description=desc)
+                        cleared.append({"type": "ratelimit", "description": desc, "status": "removed"})
+                    except Exception as e:
+                        cleared.append({"type": "ratelimit", "description": desc, "status": f"remove_failed: {e}"})
+        except Exception as e:
+            cleared.append({"type": "ratelimit", "description": "_list", "status": f"list_failed: {e}"})
+
+        return cleared
+
     def configure_scan_config(self, target: str,
                               scope_handle: str,
                               scope_platform: str) -> Optional[Dict[str, Any]]:
@@ -182,22 +236,40 @@ class ZAPClient:
           a conservative number derived from the req/sec cap, so the rate
           limit isn't overwhelmed by concurrency.
 
-        Returns the resolved scan config dict (for surfacing in the tool
-        envelope), or ``None`` when no config applies.
+        **Stale-rule cleanup**: all framework-managed rules (prefixed
+        ``_RI_PREFIX``) are cleared at the start so rules from a previous
+        program session don't leak into the current one (cross-program
+        header contamination).
+
+        **Rate-only programs**: rate caps are injected independently of
+        headers — a program that mandates only a req/sec cap (no custom
+        UA/header) still gets its rate limit enforced.
+
+        Returns the resolved scan config dict augmented with a
+        ``"rule_status"`` list (per-rule apply/clear outcome) for surfacing
+        in the tool envelope, or ``None`` when no config applies.
         """
         try:
             from auxiliaries.program_scope import get_scan_config
             cfg = get_scan_config(scope_handle, scope_platform)
         except Exception:
             return None
-        if not cfg or not cfg.get("headers"):
+        if not cfg:
             return cfg
 
         from urllib.parse import urlparse
         host = urlparse(target if "://" in target else f"http://{target}").hostname or target
 
+        rule_status: List[Dict[str, str]] = []
+
+        # --- Clear stale framework rules from previous scope switches -----
+        # Replacer/rate rules are daemon-global; without this, an Adobe
+        # session's X-Intigriti-Username header leaks into the next scan.
+        rule_status.extend(self.clear_ri_rules())
+
         # --- Replacer rules: inject headers into all requests ------------
-        for hname, hval in cfg["headers"].items():
+        # Rate-only configs have no headers — skip this block cleanly.
+        for hname, hval in (cfg.get("headers") or {}).items():
             desc = f"{_RI_PREFIX}header-{hname.lower()}"
             # Idempotent: remove an existing rule with the same description
             # before adding the fresh one.
@@ -216,10 +288,15 @@ class ZAPClient:
                     initiators="",
                     matchRegex="false",
                 )
-            except Exception:
-                pass  # best-effort; don't block the scan
+                rule_status.append({"type": "replacer", "description": desc, "status": "applied"})
+            except Exception as e:
+                # Don't swallow — surface the failure so the envelope
+                # reports it.  A RoE-mandated header that silently failed
+                # to apply is a compliance violation, not a best-effort nicety.
+                rule_status.append({"type": "replacer", "description": desc, "status": f"failed: {e}"})
 
         # --- Rate limit rule: cap req/sec to the target host --------------
+        # Injected independently of headers so rate-only programs are enforced.
         rate = cfg.get("max_requests_per_second")
         if rate and rate > 0:
             rl_desc = f"{_RI_PREFIX}ratelimit-{host}"
@@ -237,21 +314,25 @@ class ZAPClient:
                     requestsPerSecond=str(rate),
                     groupBy="host",
                 )
-            except Exception:
-                pass
+                rule_status.append({"type": "ratelimit", "description": rl_desc, "status": "applied"})
+            except Exception as e:
+                rule_status.append({"type": "ratelimit", "description": rl_desc, "status": f"failed: {e}"})
 
             # Cap threads to a conservative number so concurrency doesn't
             # overwhelm the rate limiter.  ~1 thread per 5 req/sec, min 1.
             threads = max(1, min(8, rate // 5))
             try:
                 self._get("spider/action/setOptionThreadCount", Integer=str(threads))
-            except Exception:
-                pass
+                rule_status.append({"type": "spider_threads", "description": str(threads), "status": "applied"})
+            except Exception as e:
+                rule_status.append({"type": "spider_threads", "description": str(threads), "status": f"failed: {e}"})
             try:
                 self._get("ascan/action/setOptionThreadPerHost", Integer=str(threads))
-            except Exception:
-                pass
+                rule_status.append({"type": "ascan_threads", "description": str(threads), "status": "applied"})
+            except Exception as e:
+                rule_status.append({"type": "ascan_threads", "description": str(threads), "status": f"failed: {e}"})
 
+        cfg["rule_status"] = rule_status
         return cfg
 
     def send_raw(self, raw_request: str,

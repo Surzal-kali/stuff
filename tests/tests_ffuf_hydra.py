@@ -18,11 +18,16 @@ import functools
 import http.server
 import json
 import re
+
 import shutil
 import subprocess
 import threading
 
 import pytest
+# Import program_scope BEFORE any test runs so its module-level
+# load_dotenv(override=True) fires here, not inside a lazy import during a
+# test (which would clobber a monkeypatched WORKSPACE_ROOT).
+import auxiliaries.program_scope  # noqa: F401
 
 from payloads.ffuf import (
     _FFUF_ROW_RE,
@@ -357,6 +362,33 @@ def test_inject_scan_config_none_without_scope():
     extra, cfg = _inject_scan_config([], "http://test.com/FUZZ", None, None)
     assert cfg is None
     assert extra == []
+
+def test_inject_scan_config_rate_only_no_headers(monkeypatch, tmp_path):
+    """Finding 1: a program mandating ONLY a rate cap (no custom UA/header)
+    must still get -rate injected — not silently dropped by the old
+    `if not cfg.get("headers")` guard."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    import json as _json
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_test.json").write_text(_json.dumps({
+        "platform": "intigriti", "handle": "test",
+        "testing_requirements": {
+            "max_requests_per_second": 12,
+            # no user_agent, no request_header
+        },
+    }))
+    from payloads.ffuf import _inject_scan_config
+    extra, cfg = _inject_scan_config([], "http://test.com/FUZZ", "test", "intigriti")
+    assert cfg is not None
+    assert cfg["max_requests_per_second"] == 12
+    assert cfg["headers"] == {}  # no headers mandated
+    # Rate must be injected even though no headers exist
+    assert "-rate" in extra
+    rate_idx = extra.index("-rate")
+    assert extra[rate_idx + 1] == "12"
+    # No -H flags should be present
+    assert "-H" not in extra
 
 
 def test_run_ffuf_surfaces_scan_config_applied(monkeypatch, tmp_path):

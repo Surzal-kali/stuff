@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job, terminate_job
@@ -91,7 +91,7 @@ def _inject_scan_config(extra: List[str], url: str,
         cfg = get_scan_config(scope_handle, scope_platform)
     except Exception:
         return extra, None
-    if not cfg or not cfg.get("headers"):
+    if not cfg:
         return extra, cfg
 
     # Detect what the caller already set so we don't clobber explicit overrides.
@@ -99,13 +99,16 @@ def _inject_scan_config(extra: List[str], url: str,
     has_rate = "-rate" in caller_lower
 
     injected = list(extra)
-    for hname, hval in cfg["headers"].items():
+
+    # Inject headers if any are mandated (rate-only configs have no headers).
+    for hname, hval in (cfg.get("headers") or {}).items():
         header_str = f"{hname}: {hval}"
         # Skip if the caller already set this exact header name.
         if hname.lower() in caller_lower:
             continue
         injected += ["-H", header_str]
 
+    # Inject rate independently of headers so rate-only programs are enforced.
     rate = cfg.get("max_requests_per_second")
     if rate and not has_rate:
         injected += ["-rate", str(rate)]

@@ -859,8 +859,9 @@ def _get_scan_config_intigriti(manifest: Dict[str, Any],
     tr = manifest.get("testing_requirements") or {}
     ua_raw = tr.get("user_agent")
     hdr_raw = tr.get("request_header")
-    if not ua_raw and not hdr_raw:
-        return None  # program mandates no custom UA / header
+    rate = _normalise_rate(tr.get("max_requests_per_second"))
+    if not ua_raw and not hdr_raw and not rate:
+        return None  # program mandates no custom UA / header / rate
 
     username = os.getenv("INTIGRITI_USERNAME", "")
     headers: Dict[str, str] = {}
@@ -888,7 +889,7 @@ def _get_scan_config_intigriti(manifest: Dict[str, Any],
         "platform": "intigriti",
         "handle": handle,
         "headers": headers,
-        "max_requests_per_second": _normalise_rate(tr.get("max_requests_per_second")),
+        "max_requests_per_second": rate,
         "source": "structured",
     }
 
