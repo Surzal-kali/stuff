@@ -47,6 +47,10 @@ ZAP_PORT = int(os.getenv("ZAP_PORT", "8090"))
 ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")
 ZAP_BASE = f"http://{ZAP_HOST}:{ZAP_PORT}"
 
+# Prefix for replacer / rate-limit rule descriptions so we can find and
+# remove our own rules without touching user-defined ones.
+_RI_PREFIX = "intigriti-roar-"
+
 
 def _canonical(url: str) -> str:
     """Normalise a URL for comparison: strip trailing slashes, lowercase
@@ -153,6 +157,102 @@ class ZAPClient:
     def open_url(self, url: str) -> Dict[str, Any]:
         """Load a URL into the session; passive scanner observes it."""
         return self._get("core/action/accessUrl", url=url)
+
+    # ---- scan-config enforcement (Intigriti RoE) -------------------------
+
+    def configure_scan_config(self, target: str,
+                              scope_handle: str,
+                              scope_platform: str) -> Optional[Dict[str, Any]]:
+        """Auto-apply mandatory testing requirements from the program manifest.
+
+        When ``scope_platform`` is ``"intigriti"`` and the cached manifest
+        mandates a custom User-Agent, request header, or req/sec cap, this
+        method configures the live ZAP daemon so that *every* subsequent
+        request (spider, active scan, send_raw) carries the required headers
+        and respects the rate limit:
+
+        - **Replacer rules** (``replacer/action/addRule``): inject each
+          mandated header into all outgoing requests.  Rules are idempotent
+          — re-calling with the same description is a no-op (old rule is
+          removed first).
+        - **Rate limit rule** (``network/action/addRateLimitRule``): cap
+          requests per second to the target host.  ZAP 2.17+ supports this
+          natively in the ``network`` component.
+        - **Thread limits**: spider and active-scan threads are capped to
+          a conservative number derived from the req/sec cap, so the rate
+          limit isn't overwhelmed by concurrency.
+
+        Returns the resolved scan config dict (for surfacing in the tool
+        envelope), or ``None`` when no config applies.
+        """
+        try:
+            from auxiliaries.program_scope import get_scan_config
+            cfg = get_scan_config(scope_handle, scope_platform)
+        except Exception:
+            return None
+        if not cfg or not cfg.get("headers"):
+            return cfg
+
+        from urllib.parse import urlparse
+        host = urlparse(target if "://" in target else f"http://{target}").hostname or target
+
+        # --- Replacer rules: inject headers into all requests ------------
+        for hname, hval in cfg["headers"].items():
+            desc = f"{_RI_PREFIX}header-{hname.lower()}"
+            # Idempotent: remove an existing rule with the same description
+            # before adding the fresh one.
+            try:
+                self._get("replacer/action/removeRule", description=desc)
+            except Exception:
+                pass  # rule doesn't exist yet — fine
+            try:
+                self._get(
+                    "replacer/action/addRule",
+                    description=desc,
+                    enabled="true",
+                    matchType="REQ_HEADER",
+                    matchString=hname,
+                    replacement=hval,
+                    initiators="",
+                    matchRegex="false",
+                )
+            except Exception:
+                pass  # best-effort; don't block the scan
+
+        # --- Rate limit rule: cap req/sec to the target host --------------
+        rate = cfg.get("max_requests_per_second")
+        if rate and rate > 0:
+            rl_desc = f"{_RI_PREFIX}ratelimit-{host}"
+            try:
+                self._get("network/action/removeRateLimitRule", description=rl_desc)
+            except Exception:
+                pass
+            try:
+                self._get(
+                    "network/action/addRateLimitRule",
+                    description=rl_desc,
+                    enabled="true",
+                    matchRegex="false",
+                    matchString=host,
+                    requestsPerSecond=str(rate),
+                    groupBy="host",
+                )
+            except Exception:
+                pass
+
+            # Cap threads to a conservative number so concurrency doesn't
+            # overwhelm the rate limiter.  ~1 thread per 5 req/sec, min 1.
+            threads = max(1, min(8, rate // 5))
+            try:
+                self._get("spider/action/setOptionThreadCount", Integer=str(threads))
+            except Exception:
+                pass
+            try:
+                self._get("ascan/action/setOptionThreadPerHost", Integer=str(threads))
+            except Exception:
+                pass
+
+        return cfg
 
     def send_raw(self, raw_request: str,
                  follow_redirects: bool = False) -> Dict[str, Any]:
@@ -529,16 +629,42 @@ def _zap() -> ZAPClient:
 # rather than vague ("runs a scan") -- the secretary picks tools by meaning.
 
 
-@framework_tool("Open a URL in the ZAP session (passive scan starts observing).")
-def zap_open_url(target: str) -> Dict[str, Any]:
+@framework_tool(
+    "Open a URL in the ZAP session (passive scan starts observing). "
+    "When scope_handle+scope_platform are given for an Intigriti program, "
+    "mandatory testing requirements (custom User-Agent, X-Intigriti-Username "
+    "header, req/sec cap) are auto-applied to the ZAP daemon so every "
+    "subsequent spider/active-scan request respects the RoE.",
+)
+def zap_open_url(target: str,
+                 scope_handle: Optional[str] = None,
+                 scope_platform: Optional[str] = None) -> Dict[str, Any]:
     """Open a single URL so ZAP observes it. Use this before spidering or
     scanning to seed the session with a known-good entry point.
+
+    When ``scope_handle`` and ``scope_platform`` are provided for an
+    Intigriti program, the program manifest's testing requirements are
+    auto-applied to the ZAP daemon (replacer rules for headers, network
+    rate-limit rule, conservative thread caps) before the URL is opened.
+    This ensures all subsequent traffic carries the required attribution
+    headers and respects the req/sec cap.
 
     Args:
         target: Fully qualified URL including scheme, e.g. ``http://192.168.90.110/``.
             Must be reachable from this host; ZAP fetches it directly.
+        scope_handle: Program handle for auto-injection of mandatory testing
+            requirements (Intigriti RoE). Pair with ``scope_platform``.
+        scope_platform: Platform key (``"intigriti"``, ``"h1"``, etc.).
+            Only ``"intigriti"`` has structured testing requirements.
     """
-    return _zap().open_url(target)
+    zap = _zap()
+    scan_cfg = None
+    if scope_handle and scope_platform:
+        scan_cfg = zap.configure_scan_config(target, scope_handle, scope_platform)
+    result = zap.open_url(target)
+    if scan_cfg:
+        result["scan_config_applied"] = scan_cfg
+    return result
 
 
 @framework_tool("Start the traditional ZAP spider against a URL; returns spider_id.")

@@ -12,6 +12,8 @@ Covers:
 
 import json
 import os
+import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -616,6 +618,117 @@ def test_inti_check_scope_no_match(inti_manifest):
     assert "no matching asset" in r["reason"]
 
 
+def test_inti_check_scope_scan_config_required(inti_manifest):
+    """HIGH fix: positive check_scope verdict on an intigriti program
+    carries mandatory testing requirements inline so the scan tool that
+    calls check_scope right before firing can self-configure (custom UA,
+    request header, req/sec cap)."""
+    r = ps.check_scope("api.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is True
+    assert "scan_config_required" in r
+    sc = r["scan_config_required"]
+    assert sc["platform"] == "intigriti"
+    assert sc["headers"]["User-Agent"] == "researcher-intigriti"
+    assert sc["headers"]["X-Intigriti"] == "true"
+    assert sc["max_requests_per_second"] == 10
+
+
+def test_inti_check_scope_no_scan_config_when_none_required(monkeypatch, tmp_path):
+    """scan_config_required is absent when the program mandates no custom
+    UA/header (so clean programs don't carry noise)."""
+    monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat-token")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    # Reuse the SAP detail but blank out testingRequirements UA/header.
+    detail = json.loads(json.dumps(MOCK_INTI_DETAIL))
+    detail["rulesOfEngagement"]["content"]["testingRequirements"] = {
+        "intigritiMe": False, "automatedTooling": None,
+        "userAgent": None, "requestHeader": None}
+    def _mock(path, *, params=None, **kw):
+        if path == "/v1/programs":
+            return (200, MOCK_INTI_PROGRAMS)
+        return (200, detail)
+    with mock.patch.object(ps, "_inti_get", side_effect=_mock):
+        ps.load_program_scope("sap", refresh=True, platform="intigriti")
+    r = ps.check_scope("api.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is True
+    assert "scan_config_required" not in r
+
+
+def test_inti_check_scope_oos_has_no_scan_config(inti_manifest):
+    """scan_config_required is only on positive verdicts — an OOS match
+    means 'do not scan', so the config is irrelevant."""
+    r = ps.check_scope("help.sap.com", handle="sap", platform="intigriti")
+    assert r["in_scope"] is False
+    assert "scan_config_required" not in r
+
+
+# --- Intigriti .scope file written (platform-generic write, intigriti path) --
+
+def test_inti_scope_file_written(inti_manifest):
+    """LOW fix: the .scope sibling file is written on the intigriti path
+    (the H1 tests cover it; this makes it certain for intigriti)."""
+    m, tmp_path = inti_manifest
+    scope_file = tmp_path / "intigriti_sap.scope"
+    assert scope_file.is_file()
+    text = scope_file.read_text()
+    # WILDCARD asset becomes a pattern; Android app id does NOT.
+    assert "*.sap.com" in text
+    # URL asset host is now extracted (was previously dropped because
+    # _hostlike was applied to the raw https://... identifier before host
+    # extraction — the scheme broke the regex).
+    assert "store.sap.com" in text
+    # CIDR is not hostlike, so excluded from the amass filter
+    assert "155.56.0.0/16" not in text
+    # Android app id is not a domain pattern
+    assert "com.sap.mobile" not in text
+    # OOS host becomes a deny line
+    assert "!help.sap.com" in text
+    # amass's own loader consumes it correctly
+    from auxiliaries.amass import _load_scope, _in_scope
+    scope = _load_scope("intigriti", "sap")
+    assert scope is not None
+    in_p, out_p = scope
+    assert _in_scope("api.sap.com", in_p, out_p) is True
+    assert _in_scope("store.sap.com", in_p, out_p) is True
+    assert _in_scope("help.sap.com", in_p, out_p) is False   # via !deny
+
+
+def test_scope_file_url_only_no_wildcard_parent(monkeypatch, tmp_path):
+    """Regression: a URL-only asset (https://specific.example.com/path) with
+    NO wildcard parent must still contribute its host to the .scope file.
+    Previously _hostlike rejected the raw ``https://...`` identifier before
+    host extraction, silently dropping the host from the amass filter."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    manifest = {
+        "handle": "urlonly", "platform": "h1",
+        "fetched_at": time.time(),
+        "in_scope": [
+            {"asset_type": "URL", "asset_identifier": "https://specific.example.com/app"},
+            {"asset_type": "DOMAIN", "asset_identifier": "other.example.org"},
+        ],
+        "out_of_scope_assets": [
+            {"asset_type": "URL", "asset_identifier": "https://blocked.example.com/admin"},
+        ],
+    }
+    scope_path = ps._write_scope_file(manifest)
+    assert scope_path is not None
+    text = Path(scope_path).read_text()
+    # URL host extracted and present as a standalone line
+    assert "specific.example.com" in text
+    assert "other.example.org" in text
+    # OOS URL host becomes a deny line
+    assert "!blocked.example.com" in text
+    # The raw https://... must NOT appear (only the extracted host)
+    assert "https://" not in text
+    # amass loader round-trip
+    scope = _load_scope("h1", "urlonly")
+    assert scope is not None
+    in_p, out_p = scope
+    assert _in_scope("specific.example.com", in_p, out_p) is True
+    assert _in_scope("sub.specific.example.com", in_p, out_p) is True
+    assert _in_scope("blocked.example.com", in_p, out_p) is False
+
+
 # --- Intigriti check_reportable (unsupported envelope) ----------------------
 
 def test_inti_check_reportable_unsupported(inti_manifest):
@@ -645,6 +758,21 @@ def test_inti_handle_not_found(monkeypatch, tmp_path):
     assert "not found" in err
 
 
+def test_inti_handle_not_found_schema_drift_diagnostic(monkeypatch, tmp_path):
+    """MED fix: not-found error includes first record's available keys so a
+    renamed/omitted ``handle`` field is self-diagnosing."""
+    monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    def _drift(path, *, params=None, **kw):
+        # records exist but ``handle`` was renamed to ``slug``
+        return (200, {"maxCount": 1, "records": [
+            {"id": "guid-1", "slug": "sap", "name": "SAP SE"}]})
+    with mock.patch.object(ps, "_inti_get", side_effect=_drift):
+        _, err = ps._inti_build_manifest("sap")
+    assert "not found" in err
+    assert "slug" in err  # the available key is surfaced for diagnosis
+
+
 def test_inti_403_terms_not_accepted(monkeypatch, tmp_path):
     monkeypatch.setenv("INTIGRITI_API_TOKEN", "fake-pat")
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
@@ -656,3 +784,139 @@ def test_inti_403_terms_not_accepted(monkeypatch, tmp_path):
         _, err = ps._inti_build_manifest("sap")
     assert "403" in err
     assert "terms" in err.lower()
+
+
+# ============================================================================
+# get_scan_config — shared resolver for auto-injection of testing requirements
+# ============================================================================
+
+def test_get_scan_config_resolves_adobe_template(monkeypatch, tmp_path):
+    """get_scan_config substitutes {Username} and <standard browser/tool UA>
+    from the real Adobe manifest, producing concrete injectable headers."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("INTIGRITI_USERNAME", "surzvtr5h")
+    # Copy the real Adobe manifest into the cache location
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy("scope/intigriti_adobepublic.json", cache_dir / "intigriti_adobepublic.json")
+    cfg = ps.get_scan_config("adobepublic", "intigriti")
+    assert cfg is not None
+    assert cfg["platform"] == "intigriti"
+    assert cfg["handle"] == "adobepublic"
+    headers = cfg["headers"]
+    # User-Agent: {Username} resolved, <standard browser/tool user agent> replaced
+    assert "User-Agent" in headers
+    assert "surzvtr5h" in headers["User-Agent"]
+    assert "{Username}" not in headers["User-Agent"]
+    assert "<standard browser/tool user agent>" not in headers["User-Agent"]
+    # Mozilla UA is present as the base
+    assert "Mozilla/5.0" in headers["User-Agent"]
+    # X-Intigriti-Username header resolved
+    assert "X-Intigriti-Username" in headers
+    assert headers["X-Intigriti-Username"] == "surzvtr5h"
+    # Rate cap
+    assert cfg["max_requests_per_second"] == 20
+
+
+def test_get_scan_config_resolves_sap_mock(inti_manifest, monkeypatch):
+    """get_scan_config works with the SAP mock fixture (simple UA/header)."""
+    m, tmp_path = inti_manifest
+    monkeypatch.setenv("INTIGRITI_USERNAME", "testuser")
+    cfg = ps.get_scan_config("sap", "intigriti")
+    assert cfg is not None
+    assert cfg["headers"]["User-Agent"] == "researcher-intigriti"
+    assert cfg["headers"]["X-Intigriti"] == "true"
+    assert cfg["max_requests_per_second"] == 10
+
+
+def test_get_scan_config_h1_default_identification_header(monkeypatch, tmp_path):
+    """H1 has no structured testing reqs, but get_scan_config always
+    injects the H1-recommended X-HackerOne-Research identification header
+    from H1_API_USERNAME, so traffic is attributable even on programs
+    with no explicit requirements."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("H1_API_USERNAME", "surzvtr5h")
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "crypto.json").write_text(json.dumps({
+        "handle": "crypto", "platform": "h1",
+        "policy": "", "in_scope": [], "out_of_scope_assets": [],
+    }))
+    cfg = ps.get_scan_config("crypto", "h1")
+    assert cfg is not None
+    assert cfg["platform"] == "h1"
+    assert cfg["headers"]["X-HackerOne-Research"] == "surzvtr5h"
+    assert cfg["max_requests_per_second"] is None
+    assert "platform-default" in cfg["source"]
+
+
+def test_get_scan_config_h1_prose_rate_limit(monkeypatch, tmp_path):
+    """When an H1 program's policy text mentions a rate limit, it is
+    extracted and surfaced alongside the default identification header."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("H1_API_USERNAME", "surzvtr5h")
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "crypto.json").write_text(json.dumps({
+        "handle": "crypto", "platform": "h1",
+        "policy": "Please limit automated tools to 10 requests per second. "
+                  "Include X-HackerOne-Research: your_username in all requests.",
+        "in_scope": [], "out_of_scope_assets": [],
+    }))
+    cfg = ps.get_scan_config("crypto", "h1")
+    assert cfg is not None
+    assert cfg["max_requests_per_second"] == 10
+    assert "prose" in cfg["source"]
+    # Default identification header still present
+    assert cfg["headers"]["X-HackerOne-Research"] == "surzvtr5h"
+
+
+def test_get_scan_config_bugcrowd_default_ua_suffix(monkeypatch, tmp_path):
+    """Bugcrowd has no platform-wide identification header; get_scan_config
+    appends a researcher-identifying suffix to the User-Agent."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("H1_API_USERNAME", "surzvtr5h")
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "bugcrowd_tesla.json").write_text(json.dumps({
+        "handle": "tesla", "platform": "bugcrowd",
+        "policy": "", "in_scope": [], "out_of_scope_assets": [],
+    }))
+    cfg = ps.get_scan_config("tesla", "bugcrowd")
+    assert cfg is not None
+    assert cfg["platform"] == "bugcrowd"
+    assert "Bugcrowd:surzvtr5h" in cfg["headers"]["User-Agent"]
+    assert "Mozilla/5.0" in cfg["headers"]["User-Agent"]
+    assert cfg["max_requests_per_second"] is None
+
+
+def test_get_scan_config_none_when_no_manifest(monkeypatch, tmp_path):
+    """Returns None when no manifest is cached for the handle."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("INTIGRITI_USERNAME", "testuser")
+    assert ps.get_scan_config("nonexistent", "intigriti") is None
+
+
+def test_get_scan_config_username_placeholder_unresolved(monkeypatch, tmp_path):
+    """When INTIGRITI_USERNAME is not set, {Username} stays as-is (the scan
+    tool can detect it and warn the user)."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.delenv("INTIGRITI_USERNAME", raising=False)
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_test.json").write_text(json.dumps({
+        "platform": "intigriti", "handle": "test",
+        "testing_requirements": {
+            "user_agent": "User-Agent: <standard browser/tool user agent> <intigriti:{Username}>",
+            "request_header": "X-Intigriti-Username: {Username}",
+            "max_requests_per_second": 20,
+        },
+    }))
+    cfg = ps.get_scan_config("test", "intigriti")
+    assert cfg is not None
+    # {Username} NOT resolved because env var is unset
+    assert "{Username}" in cfg["headers"]["User-Agent"]
+    assert "{Username}" in cfg["headers"]["X-Intigriti-Username"]
+    # But <standard browser/tool user agent> IS still replaced
+    assert "Mozilla/5.0" in cfg["headers"]["User-Agent"]

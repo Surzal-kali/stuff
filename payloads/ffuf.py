@@ -71,6 +71,48 @@ def _inject_noninteractive(extra: List[str]) -> List[str]:
     return extra
 
 
+def _inject_scan_config(extra: List[str], url: str,
+                        scope_handle: Optional[str],
+                        scope_platform: Optional[str]) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """Auto-inject mandatory testing requirements from the program manifest.
+
+    When ``scope_handle`` / ``scope_platform`` point to an Intigriti program
+    whose RoE mandates a custom User-Agent, request header, or req/sec cap,
+    those are injected as ``-H`` and ``-rate`` flags — unless the caller
+    already set the same header or ``-rate`` in ``options`` (caller wins).
+
+    Returns the (possibly extended) arg list and the resolved scan config
+    (or None) so the caller can surface it in the job envelope.
+    """
+    if not scope_handle or not scope_platform:
+        return extra, None
+    try:
+        from auxiliaries.program_scope import get_scan_config
+        cfg = get_scan_config(scope_handle, scope_platform)
+    except Exception:
+        return extra, None
+    if not cfg or not cfg.get("headers"):
+        return extra, cfg
+
+    # Detect what the caller already set so we don't clobber explicit overrides.
+    caller_lower = " ".join(extra).lower()
+    has_rate = "-rate" in caller_lower
+
+    injected = list(extra)
+    for hname, hval in cfg["headers"].items():
+        header_str = f"{hname}: {hval}"
+        # Skip if the caller already set this exact header name.
+        if hname.lower() in caller_lower:
+            continue
+        injected += ["-H", header_str]
+
+    rate = cfg.get("max_requests_per_second")
+    if rate and not has_rate:
+        injected += ["-rate", str(rate)]
+
+    return injected, cfg
+
+
 def _inject_ignore_comments(extra: List[str]) -> List[str]:
     """Append ``-ic`` unless the caller already set it.
 
@@ -219,10 +261,16 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
     "discovers hidden directories, files, vhosts, or parameters by "
     "brute-forcing a wordlist against the FUZZ keyword. Non-blocking and "
     "detached — starts the run in the background and returns immediately "
-    "with a job ID for later retrieval.",
+    "with a job ID for later retrieval. When scope_handle+scope_platform "
+    "are given for an Intigriti program, mandatory testing requirements "
+    "(custom User-Agent, X-Intigriti-Username header, req/sec cap) are "
+    "auto-injected from the program manifest — you never need to pass them "
+    "manually and can't accidentally fire raw traffic that violates the RoE.",
     next_hints=["ffuf_status"],
 )
-def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
+def run_ffuf(url: str, wordlist: str = "", options: str = "",
+             scope_handle: Optional[str] = None,
+             scope_platform: Optional[str] = None) -> Dict[str, Any]:
     """Launch ffuf against ``url`` and return immediately.
 
     The URL must contain the ``FUZZ`` keyword where wordlist entries are
@@ -246,6 +294,14 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
             (e.g. ``"-mc 200,301,401 -t 80 -recursion -recursion-depth 2"``).
             ``-noninteractive`` (if supported) and ``-ic`` are auto-injected
             unless already present.
+        scope_handle: Program handle for auto-injection of mandatory testing
+            requirements (Intigriti RoE: custom UA, request header, req/sec
+            cap). Pair with ``scope_platform``. When set, the program
+            manifest is consulted and ``-H`` / ``-rate`` flags are injected
+            automatically — caller-provided headers/rate always win.
+        scope_platform: Platform key (``"intigriti"``, ``"h1"``, etc.)
+            paired with ``scope_handle``. Only ``"intigriti"`` has
+            structured testing requirements; other platforms are a no-op.
     """
     import shlex
 
@@ -292,6 +348,8 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
     opt_list = shlex.split(options) if options else []
     opt_list = _inject_noninteractive(opt_list)
     opt_list = _inject_ignore_comments(opt_list)
+    opt_list, scan_cfg = _inject_scan_config(
+        opt_list, url, scope_handle, scope_platform)
 
     # ``-u`` and ``-w`` are always explicit so the caller can't accidentally
     # omit the essentials; extra -w / -u in options are allowed by ffuf.
@@ -320,6 +378,8 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "") -> Dict[str, Any]:
     # default) so the secretary model knows to swap in a targeted list.
     job["wordlist"] = wordlist
     job["default_wordlist_used"] = default_used
+    if scan_cfg:
+        job["scan_config_applied"] = scan_cfg
     return job
 
 

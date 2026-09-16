@@ -264,6 +264,144 @@ def test_run_ffuf_errors_when_no_default_available(monkeypatch, tmp_path):
     assert "list_wordlists" in r["error"]
 
 
+# --- scan-config auto-injection (Intigriti RoE) -------------------------------
+
+def test_inject_scan_config_adds_headers_and_rate(monkeypatch, tmp_path):
+    """When scope_handle+scope_platform point to an intigriti program with
+    mandated UA/header/rate, _inject_scan_config adds -H and -rate flags."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("INTIGRITI_USERNAME", "surzvtr5h")
+    import json as _json
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_test.json").write_text(_json.dumps({
+        "platform": "intigriti", "handle": "test",
+        "testing_requirements": {
+            "user_agent": "User-Agent: <standard browser/tool user agent> <intigriti:{Username}>",
+            "request_header": "X-Intigriti-Username: {Username}",
+            "max_requests_per_second": 20,
+        },
+    }))
+    from payloads.ffuf import _inject_scan_config
+    extra, cfg = _inject_scan_config([], "http://test.com/FUZZ", "test", "intigriti")
+    assert cfg is not None
+    assert "-H" in extra
+    # User-Agent header injected
+    ua_flags = [extra[i+1] for i, a in enumerate(extra) if a == "-H" and "User-Agent" in extra[i+1]]
+    assert len(ua_flags) == 1
+    assert "surzvtr5h" in ua_flags[0]
+    assert "Mozilla" in ua_flags[0]
+    # X-Intigriti-Username header injected
+    inti_flags = [extra[i+1] for i, a in enumerate(extra) if a == "-H" and "Intigriti" in extra[i+1]]
+    assert len(inti_flags) == 1
+    assert "surzvtr5h" in inti_flags[0]
+    # Rate cap injected
+    assert "-rate" in extra
+    assert "20" in extra
+
+
+def test_inject_scan_config_caller_header_wins(monkeypatch, tmp_path):
+    """If the caller already set a header in options, it is NOT overridden."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("INTIGRITI_USERNAME", "surzvtr5h")
+    import json as _json
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_test.json").write_text(_json.dumps({
+        "platform": "intigriti", "handle": "test",
+        "testing_requirements": {
+            "user_agent": "researcher-intigriti",
+            "request_header": "X-Intigriti: true",
+            "max_requests_per_second": 20,
+        },
+    }))
+    from payloads.ffuf import _inject_scan_config
+    # Caller already set User-Agent and -rate
+    extra, cfg = _inject_scan_config(
+        ["-H", "User-Agent: my-custom-ua", "-rate", "5"],
+        "http://test.com/FUZZ", "test", "intigriti")
+    # Only the X-Intigriti header should be added (UA and rate already present)
+    ua_count = sum(1 for a in extra if "User-Agent" in a)
+    assert ua_count == 1  # only the caller's
+    assert "-rate" in extra
+    rate_idx = extra.index("-rate")
+    assert extra[rate_idx + 1] == "5"  # caller's rate wins
+    # X-Intigriti header was still injected
+    assert any("X-Intigriti" in a for a in extra)
+
+
+def test_inject_scan_config_h1_default_header(monkeypatch, tmp_path):
+    """H1 programs get the X-HackerOne-Research identification header
+    auto-injected (H1's recommended traffic-identification mechanism)."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("H1_API_USERNAME", "surzvtr5h")
+    import json as _json
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "crypto.json").write_text(_json.dumps({
+        "handle": "crypto", "platform": "h1",
+        "policy": "", "in_scope": [], "out_of_scope_assets": [],
+    }))
+    from payloads.ffuf import _inject_scan_config
+    extra, cfg = _inject_scan_config([], "http://test.com/FUZZ", "crypto", "h1")
+    assert cfg is not None
+    assert cfg["headers"]["X-HackerOne-Research"] == "surzvtr5h"
+    # The header is injected as -H
+    assert "-H" in extra
+    assert any("X-HackerOne-Research" in a and "surzvtr5h" in a for a in extra)
+
+
+def test_inject_scan_config_none_without_scope():
+    """No scope_handle → no injection."""
+    from payloads.ffuf import _inject_scan_config
+    extra, cfg = _inject_scan_config([], "http://test.com/FUZZ", None, None)
+    assert cfg is None
+    assert extra == []
+
+
+def test_run_ffuf_surfaces_scan_config_applied(monkeypatch, tmp_path):
+    """run_ffuf includes scan_config_applied in the job envelope when scope
+    params are provided and the manifest has testing requirements."""
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("INTIGRITI_USERNAME", "surzvtr5h")
+    import json as _json
+    cache_dir = tmp_path / "scope"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "intigriti_test.json").write_text(_json.dumps({
+        "platform": "intigriti", "handle": "test",
+        "testing_requirements": {
+            "user_agent": "researcher-ua",
+            "request_header": "X-Intigriti-Username: {Username}",
+            "max_requests_per_second": 10,
+        },
+    }))
+
+    captured = {}
+
+    def fake_launch(cmd, *, tool_name, timeout, verdict_parser):
+        captured["cmd"] = cmd
+        return {"job_id": "fake", "tool": "ffuf", "status": "launched"}
+
+    monkeypatch.setattr("payloads.ffuf.launch_job", fake_launch)
+    monkeypatch.setattr("payloads.ffuf.resolve_default_wordlist", lambda _: None)
+    monkeypatch.setattr("payloads.ffuf.resolve_wordlist", lambda w: w if "test.txt" in w else None)
+
+    import payloads.ffuf as ffuf_mod
+    r = ffuf_mod.run_ffuf(
+        url="http://test.com/FUZZ", wordlist="/usr/share/wordlists/test.txt",
+        scope_handle="test", scope_platform="intigriti")
+    assert r["status"] == "launched"
+    assert "scan_config_applied" in r
+    assert r["scan_config_applied"]["max_requests_per_second"] == 10
+    # Verify the command actually includes the injected headers
+    cmd = captured["cmd"]
+    assert "-H" in cmd
+    assert any("researcher-ua" in c for c in cmd)
+    assert any("surzvtr5h" in c for c in cmd)
+    assert "-rate" in cmd
+    assert "10" in cmd
+
+
 # --- default credential fallback (hydra) --------------------------------------
 
 def test_hydra_injects_default_credentials_when_absent(monkeypatch):
