@@ -790,16 +790,27 @@ def test_inti_403_terms_not_accepted(monkeypatch, tmp_path):
 # get_scan_config — shared resolver for auto-injection of testing requirements
 # ============================================================================
 
+# Minimal Adobe/Intigriti manifest fixture — only the fields get_scan_config
+# exercises.  Written into the isolated tmp workspace so the test never reads
+# from or writes to the real ./scope directory.
+ADOBE_FIXTURE_JSON = json.dumps({
+    "handle": "adobepublic",
+    "platform": "intigriti",
+    "testing_requirements": {
+        "max_requests_per_second": 20,
+        "user_agent": "User-Agent: <standard browser/tool user agent> <intigriti:{Username}>",
+        "request_header": "X-Intigriti-Username: {Username}",
+    },
+})
+
 def test_get_scan_config_resolves_adobe_template(monkeypatch, tmp_path):
     """get_scan_config substitutes {Username} and <standard browser/tool UA>
-    from the real Adobe manifest, producing concrete injectable headers."""
+    from a fixture manifest, producing concrete injectable headers."""
     monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("INTIGRITI_USERNAME", "surzvtr5h")
-    # Copy the real Adobe manifest into the cache location
-    cache_dir = tmp_path / "scope"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    import shutil
-    shutil.copy("scope/intigriti_adobepublic.json", cache_dir / "intigriti_adobepublic.json")
+    # Build the manifest inside the isolated workspace and point the loader at it
+    (tmp_path / "scope").mkdir()
+    (tmp_path / "scope" / "intigriti_adobepublic.json").write_text(ADOBE_FIXTURE_JSON)
     cfg = ps.get_scan_config("adobepublic", "intigriti")
     assert cfg is not None
     assert cfg["platform"] == "intigriti"
