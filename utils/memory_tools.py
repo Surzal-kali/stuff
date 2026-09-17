@@ -79,6 +79,19 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "",
     running model so concurrent agents keep disjoint memory banks. ``important``
     marks the entry as protected — ``forget`` will refuse to delete it and
     counts any attempt as a strike against the caller.
+
+    Args:
+        text: The fact/finding to store. Write it self-contained (ids, hosts,
+            severity, dates) — it is stored verbatim as the document.
+        namespace: Flat namespace to store under (default 'engagement').
+            Must already exist or it is silently AUTO-CREATED on write —
+            verify with list_text_namespaces first when unsure.
+        memory_id: Optional stable id (e.g. 'eng_crtsh_recon_recipe'). A
+            unique generated id is used when empty; reusing an id UPSERTS.
+        agent_id: Optional owner tag (the running model/agent). Empty =
+            shared pool, recallable by every agent.
+        important: Mark protected: forget refuses to delete it and counts
+            any deletion attempt as a strike (3 strikes = lockout).
     """
     if not memory_id:
         memory_id = f"mem-{int(time.time())}-{uuid4().hex[:6]}"
@@ -103,7 +116,17 @@ def remember_text(text: str, namespace: str = "engagement", memory_id: str = "",
     "Returns the closest stored matches by vector similarity."
 )
 def recall_text(query: str, namespace: str = "engagement", limit: int = 5, agent_id: str = ""):
-    """Recall stored memories by semantic similarity to the query text."""
+    """Recall stored memories by semantic similarity to the query text.
+
+    Args:
+        query: Natural-language phrase describing what you want back; it is
+            embedded (nomic-embed-text) and matched by cosine similarity.
+        namespace: Flat namespace to recall from (default 'engagement').
+        limit: Max hits to return (default 5).
+        agent_id: Optional owner filter. Leave EMPTY to search the shared
+            pool across all agents (recommended — most entries are untagged
+            or written by other sessions).
+    """
     query_embedding = _embed(query)
     return _svc.recall(
         namespace=namespace,
@@ -111,4 +134,16 @@ def recall_text(query: str, namespace: str = "engagement", limit: int = 5, agent
         limit=limit,
         agent_id=(agent_id or None),
     )
+
+
+@framework_tool(
+    "List every memory namespace that currently has a stored collection. "
+    "Namespaces auto-create on first write, so a typo'd namespace silently "
+    "returns [] from recall_text and pollutes the store — verify a namespace "
+    "exists here before using it. Returns sorted plain names (flat scheme, "
+    "e.g. 'engagement', 'ops'); no prefix, no path separators."
+)
+def list_text_namespaces() -> List[str]:
+    """List all memory namespaces that exist in the vector store."""
+    return _svc.list_namespaces()
 

@@ -2,11 +2,13 @@
 title: Framework Bridge (daharness gateway)
 author: framework
 description: Search + execute the framework's gated tool registry via the API gateway, with per-chat session isolation and framework memory access. Bug-bounty chat surface for Open Web UI.
-version: 0.1.0
+version: 0.3.2
 """
 
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 
@@ -39,16 +41,70 @@ class Tools:
         self.valves = self.Valves()
         if not self.valves.api_key and os.getenv("GATEWAY_API_KEY"):
             self.valves.api_key = os.getenv("GATEWAY_API_KEY")
+        # Memory-namespace enumeration cache: (fetched_at, names|None).
+        self._ns_cache: tuple = (0.0, None)
 
     # ------------------------------------------------------------------ helpers
 
-    def _chat_agent_id(self) -> str:
-        """Per-chat session isolation: Open WebUI injects __metadata__ with the
-        chat_id. The gateway treats agent_id as the Brain session id, so each
-        chat gets its own isolated tool state on the sidecar."""
-        md = getattr(self, "__metadata__", None) or {}
+    def _resolve_model_id(self, __model__: dict | None = None, md: dict | None = None) -> str:
+        """Running-model id for agent naming, sanitized for use as an id.
+        Sources, in order: the __model__ special param (dict with 'id'),
+        then __metadata__ 'model_id' / 'model'. Empty when unavailable."""
+        if md is None:
+            md = getattr(self, "__metadata__", None) or {}
+        model_id = ""
+        if isinstance(__model__, dict):
+            model_id = str(__model__.get("id") or "").strip()
+        if not model_id:
+            raw = md.get("model_id") or md.get("model")
+            if isinstance(raw, dict):
+                model_id = str(raw.get("id") or "").strip()
+            else:
+                model_id = str(raw or "").strip()
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", model_id)[:48]
+
+    def _chat_agent_id(self, __model__: dict | None = None, __metadata__: dict | None = None) -> str:
+        """Agent id for Brain session isolation. Mirrors the running model id
+        (user convention: agent identity = the running model) plus the chat id,
+        so parallel chats of the same model still get isolated tool state.
+        Open WebUI only injects special params that are DECLARED — __model__
+        carries the model, __metadata__ carries chat_id; both fall back
+        (attribute read, then chat-only 'owui-<chat>' naming)."""
+        md = __metadata__ or getattr(self, "__metadata__", None) or {}
         chat_id = md.get("chat_id") or md.get("id") or "0"
+        model_id = self._resolve_model_id(__model__, md)
+        if model_id:
+            return f"owui-{model_id}-{chat_id}"
         return f"owui-{chat_id}"
+
+    def _known_namespaces(self) -> list | None:
+        """Best-effort enumeration of existing memory namespaces (cached 5 min).
+
+        Returns None when enumeration is unavailable (list_text_namespaces not
+        indexed yet, gateway hiccup) — callers must treat None as 'cannot
+        verify' and proceed normally."""
+        stamp, names = self._ns_cache
+        now = time.time()
+        if names is not None and now - stamp < 300:
+            return names
+        try:
+            raw = self._post(
+                "/tools/execute",
+                {"tool_id": "utils.memory_tools.list_text_namespaces", "arguments": {}},
+                timeout=15,
+            )
+            data = json.loads(raw)
+            res = data.get("result", data) if isinstance(data, dict) else data
+            inner = res.get("result", res) if isinstance(res, dict) else res
+            if isinstance(inner, str):
+                inner = json.loads(inner)
+            if isinstance(inner, list):
+                names = [str(n) for n in inner]
+                self._ns_cache = (now, names)
+                return names
+        except Exception:
+            pass
+        return None
 
     def _request(self, method: str, path: str, payload: dict, timeout: int | None = None) -> str:
         url = self.valves.gateway_url.rstrip("/") + path
@@ -98,7 +154,7 @@ class Tools:
         payload["top_k"] = top_k if top_k and top_k > 0 else self.valves.default_top_k
         return self._post("/tools/search", payload)
 
-    def framework_run_tool(self, tool_id: str, arguments: str = "{}", agent_id: str = "") -> str:
+    def framework_run_tool(self, tool_id: str, arguments: str = "{}", agent_id: str = "", __model__: dict | None = None, __metadata__: dict | None = None) -> str:
         """Execute a framework tool by exact tool_id (from framework_search_tools).
 
         :param tool_id: Exact tool_id from the search menu, e.g. 'auxiliaries.nmap.nmap_scan'.
@@ -106,10 +162,11 @@ class Tools:
             parameters schema from the search menu. Unknown keys are rejected by
             the gateway with a 422 listing accepted keys. Example:
             '{"target": "10.0.0.5", "ports": "1-1000"}'
-        :param agent_id: Optional explicit Brain session id. Leave empty to get
-            an isolated per-chat session (recommended so parallel bug-bounty
-            chats never share tool state). Reuse the same explicit value across
-            chats to deliberately share state.
+        :param agent_id: Optional explicit Brain session id. Leave empty to
+            get an isolated per-chat session, auto-named from the running
+            model id + chat id (owui-<model>-<chat>), so parallel bug-bounty
+            chats never share tool state. Reuse the same explicit value
+            across chats to deliberately share state.
         """
         try:
             args = json.loads(arguments or "{}")
@@ -118,29 +175,87 @@ class Tools:
         except json.JSONDecodeError as e:
             return f"ERROR: 'arguments' is not valid JSON ({e}). Pass a JSON object string."
         payload = {"tool_id": tool_id, "arguments": args}
-        payload["agent_id"] = agent_id or self._chat_agent_id()
+        payload["agent_id"] = agent_id or self._chat_agent_id(__model__, __metadata__)
         return self._post("/tools/execute", payload)
 
     def framework_memory_search(self, query_text: str, namespace: str, agent_id: str = "") -> str:
-        """Semantic search over the framework's memory service (findings, notes,
-        prior program knowledge). Use it to recall what the framework already
-        knows about a program/surface before re-running work.
+        """Semantic (vector) search over the framework's memory service. Your
+        query is embedded (nomic-embed-text) and matched by vector similarity,
+        searching the shared pool across all agents by default.
+
+        Use it to recall what the framework already knows about a
+        program/surface before re-running work.
 
         :param query_text: What to look for, e.g. 'grindr certificate pinning phase 0 results'.
         :param namespace: Memory namespace to search — REQUIRED, non-empty
-            (e.g. 'findings', 'program_knowledge'). The REST API rejects an
-            empty namespace with 500; "" is not a valid value.
-        :param agent_id: Optional agent/session filter; defaults to this chat's session.
+            (e.g. 'engagement', 'ops', 'findings'). Empty namespaces are
+            rejected with an error; "" is not a valid value.
+        :param agent_id: Optional agent/session filter. Leave EMPTY (default) to
+            search the shared pool across all agents — this is the recommended
+            behavior, since most memories are written untagged or by other
+            sessions. Pass an explicit value to scope results to one session.
         """
         if not str(namespace).strip():
             return ("ERROR: 'namespace' is required and must be non-empty "
                     "(gateway rejects empty namespaces with 500). "
-                    "Try e.g. 'findings' or 'program_knowledge'.")
-        payload = {"query_text": query_text, "namespace": namespace}
-        payload["agent_id"] = agent_id or self._chat_agent_id()
-        return self._post("/memory/search", payload)
+                    "Try e.g. 'engagement', 'ops' or 'findings'.")
+        # Typo guard: the store auto-creates unknown namespaces on write, so a
+        # typo would silently return [] forever. Refuse loudly when enumeration
+        # is available; proceed (degraded) when it is not.
+        known = self._known_namespaces()
+        if known is not None and namespace not in known:
+            return (
+                f"ERROR: namespace '{namespace}' does not exist. Unknown "
+                "namespaces auto-create silently on write and search as []. "
+                f"Known namespaces: {', '.join(known) if known else '(none)'}. "
+                "Use one of those, or confirm with the user before creating "
+                "a new one."
+            )
+        arguments = {"query": query_text, "namespace": namespace}
+        if agent_id:
+            arguments["agent_id"] = agent_id  # only filter when explicitly asked
+        # Route through the sidecar's recall_text memory tool: /memory/search
+        # is a keyword-substring filter, NOT semantic. recall_text embeds the
+        # query and does true vector recall, sharing the pool across agents
+        # when agent_id is omitted. The /tools/execute payload agent_id is the
+        # Brain *session* id (tool-state isolation) and is intentionally NOT
+        # set here — memory scoping is driven solely by the tool argument.
+        return self._post("/tools/execute", {
+            "tool_id": "utils.memory_tools.recall_text",
+            "arguments": arguments,
+        })
 
-    def framework_health(self) -> str:
-        """Check that the framework gateway is reachable and authenticated.
-        No-op call: run this first if any framework_ tool errors."""
-        return self._get("/health", timeout=10)
+    def framework_health(self, __model__: dict | None = None, __metadata__: dict | None = None) -> str:
+        """Check that the framework gateway is reachable, and report this
+        chat's derived agent id (self-serve diagnostic).
+
+        No-op call: run this first if any framework_ tool errors.
+
+        NOTE: /health is UNAUTHENTICATED by design — it answers 'is the stack
+        up' fast and unambiguously (framework may be down at any time), but
+        it does NOT validate the API key. A stale key passes health and then
+        401s on the data tools; treat green-health + 401s as a key/config
+        problem, not an outage.
+
+        The response always includes this chat's agent_id (the
+        ``owui-<model>-<chat>`` id framework_run_tool derives for Brain
+        session isolation when agent_id is left empty), so the naming can be
+        verified from chat, or the id reused as an explicit agent_id.
+        """
+        md = __metadata__ or getattr(self, "__metadata__", None) or {}
+        chat_id = md.get("chat_id") or md.get("id") or "0"
+        model_id = self._resolve_model_id(__model__, md)
+        agent_id = f"owui-{model_id}-{chat_id}" if model_id else f"owui-{chat_id}"
+        try:
+            md_keys = sorted(str(k) for k in md.keys())
+        except Exception:
+            md_keys = []
+        report = {
+            "gateway": self._get("/health", timeout=10),
+            "agent_id": agent_id,
+            "chat_id": chat_id,
+            "model_id": model_id or None,
+            "model_param_received": isinstance(__model__, dict),
+            "metadata_keys": md_keys,
+        }
+        return json.dumps(report, indent=2, default=str)
