@@ -44,6 +44,15 @@ MSF_RPC_PORT = int(os.getenv("MSF_RPC_PORT", "55553"))
 ZAP_HOST = os.getenv("ZAP_HOST", "127.0.0.1")
 ZAP_PORT = int(os.getenv("ZAP_PORT", "8090"))
 ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")
+# Browser-proxy lane: when set (e.g. "0.0.0.0" or a LAN IP), the ZAP
+# *listener* binds this address so off-box browsers can proxy through it.
+# The API ACL (api.addrs.addr.name) stays pinned to ZAP_HOST regardless,
+# so the JSON API keeps its loopback-only defence-in-depth.
+ZAP_PROXY_BIND = os.getenv("ZAP_PROXY_BIND", "0.0.0.0")
+# Daemon JVM max heap. 512m is the historical default but OOM-kills on
+# oversized history entries (single 1.37MB response + regex scan). Raise
+# via shell export before restart, e.g.  export ZAP_XMX=2g
+ZAP_XMX = os.getenv("ZAP_XMX", "512m")
 
 # --- Async Background Runner ---
 class AsyncBackgroundRunner:
@@ -293,24 +302,28 @@ class FrameworkLoader:
             logger.error("[!] ZAP launcher not found at %s", zap_bin)
             return
 
-        # Daemon JVM heap; 512m is enough for the framework's typical scans.
-        # -daemon forks the JVM (no GUI). Logs go to a /tmp log so failures
-        # are inspectable after a crash. Opened via _open_child_log so a
-        # poisoned/immutable /tmp/zap.log can never kill the launch.
+        # Daemon JVM heap — sized by $ZAP_XMX (default 512m, bump for large
+        # history windows). -daemon forks the JVM (no GUI). Logs go to a
+        # /tmp log so failures are inspectable after a crash. Opened via
+        # _open_child_log so a poisoned/immutable /tmp/zap.log can never
+        # kill the launch.
         log_fd, log_path = _open_child_log("zap")
         
         # Force 127.0.0.1 to avoid UnresolvedAddressException (IPv6/localhost issues)
         host = host or "127.0.0.1"
+        # Listener bind may be widened for the browser-proxy lane, but the
+        # API ACL below ALWAYS stays on ZAP_HOST (loopback default).
+        bind_addr = ZAP_PROXY_BIND or host
         
         cmd = [
             zap_bin, "-daemon",
             "-port", str(port),
-            "-host", host,
+            "-host", bind_addr,
             "-config", f"api.addrs.addr.name={host}",
             "-config", "api.addrs.addr.regex=true",
             "-config", "api.disablekey=true",
             "-config", f"network.localServers.mainProxy.address={host}",
-            "-Xmx512m",
+            f"-Xmx{ZAP_XMX}",
         ]
         # Pin the home dir using -dir argument; ZAP often ignores ZAP_HOME env var.
         zap_home = self.framework_root / ".zap_home"
