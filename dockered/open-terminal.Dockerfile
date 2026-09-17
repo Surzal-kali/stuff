@@ -3,10 +3,16 @@
 #
 # Gated agent runtime: CLI tools + Python venv are baked in, but the framework
 # source is NOT — it is bind-mounted at runtime (.. -> /opt/framework) via
-# docker-compose.yaml so host edits are live with no rebuild. The entrypoint
-# applies an iptables lockdown (loopback + Docker subnet + Ollama only) so the
-# agent must reach the outside world through the framework's API routes, not by
-# shelling out directly. Open WebUI and JupyterLab are separate open services.
+# docker-compose.yaml so host edits are live with no rebuild.
+#
+# NETWORK POSTURE (2026-09-17, user decision "C"): no iptables lockdown. The
+# framework is the scope-lined gateway to the outside world; scope enforcement
+# is in-process (check_scope / .scope / RoE headers). The old LOCKDOWN_NETWORK
+# entrypoint cage was removed because it collided with the workbench topology
+# (gateway+brain run INSIDE this container, so the cage blocked the
+# framework's own target lanes too) and only ever restricted the secretary
+# chat loop. Root is used only for first-boot volume chores, then everything
+# drops to `user` — no NET_ADMIN capability required.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -83,10 +89,12 @@ COPY --from=builder /opt/framework-venv /opt/framework-venv
 # NOTE: framework source is NOT copied here — it is bind-mounted at runtime
 # from the host (.. -> /opt/framework) in docker-compose.yaml for live edits.
 
-COPY dockered/entrypoint.sh /app/custom-entrypoint.sh
-RUN chmod +x /app/custom-entrypoint.sh
+# Minimal service bootstrap: starts the Brain sidecar + API gateway, then
+# execs the open-terminal server as `user`. NO firewall, NO NET_ADMIN.
+COPY dockered/open-terminal-start.sh /app/open-terminal-start.sh
+RUN chmod +x /app/open-terminal-start.sh
 
 WORKDIR /app
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/app/custom-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/open-terminal-start.sh"]
 CMD ["run"]

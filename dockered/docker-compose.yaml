@@ -1,21 +1,26 @@
 # =============================================================================
-# Framework workbench: Open Terminal (gated) + Open WebUI (open) + JupyterLab (gated nursery) + ChromaDB
+# Framework workbench: Open Terminal + Open WebUI + JupyterLab (nursery) + ChromaDB
 #
-# open-terminal is the gated agent runtime: it bind-mounts the live production
-# tree (no COPY) AND keeps the iptables network lockdown (loopback + Docker
-# subnet + Ollama only). The firewall is the network backstop behind the
-# framework's scope layer — it forces the agent to reach the outside world only
-# through the framework's API routes (gateway on loopback), not by shelling out
-# directly.
+# NETWORK POSTURE (2026-09-17, user decision "C"): the iptables lockdown is
+# GONE — no NET_ADMIN caps, no cage, on any service. Rationale: the framework
+# is the scope-lined gateway to the outside world (check_scope / .scope files /
+# RoE headers enforce program scope in-process), and the only consumer the
+# cage ever actually restricted was the secretary chat loop. The cage also
+# collided with the workbench topology: the gateway+brain run INSIDE the
+# open-terminal container, so LOCKDOWN_NETWORK caged the framework's own
+# target lanes (inspect_host, amass, ZAP, nmap vs real hosts) along with the
+# shell. Scope discipline is now purely the in-process layer + operator RoE.
 #
-# JupyterLab (the tool nursery) is firewalled the same way: it shares the live
-# framework tree but its only egress is the gateway on the subnet, so nursery
-# work tests tools through the gated path and the agent cannot pivot through
-# Jupyter to bypass open-terminal's firewall. JUPYTER_TOKEN is required from env.
+# open-terminal bind-mounts the live production tree (no COPY) and hosts the
+# framework gateway (:6000) + Brain sidecar; its shell is the agent runtime.
 #
-# Open WebUI is the open chat frontend: it does its own web search and calls the
-# framework's (gated) API routes for tool/code execution, so its own container
-# stays open without creating an unscoped execution path.
+# JupyterLab (the tool nursery) shares the live framework tree and reaches the
+# gateway on the workbench subnet; with the cage gone it can also be proxied
+# for remote access. Still localhost-only at the port level (127.0.0.1:8888)
+# and JUPYTER_TOKEN-gated.
+#
+# Open WebUI is the open chat frontend: it does its own web search and calls
+# the framework's API routes for tool/code execution.
 #
 # ChromaDB is defined below as the `chroma` service — it mirrors the previous
 # standalone `chroma` container (same image, same config.yaml, same `chroma-data`
@@ -80,8 +85,6 @@ services:
     networks:
       workbench:
         ipv4_address: 172.28.0.20
-    cap_add:
-      - NET_ADMIN       # needed for the entrypoint iptables lockdown (only used when LOCKDOWN_NETWORK=1)
     env_file:
       - framework.env
     environment:
@@ -94,13 +97,6 @@ services:
       # /opt/framework matches WORKSPACE_ROOT in framework.env, so the browser,
       # the terminal CWD, and the framework all agree on one workspace root.
       - OPEN_TERMINAL_FILE_BROWSER_ROOT=/opt/framework
-      # Network lockdown ON by default: outbound limited to loopback + Docker
-      # subnet + Ollama only. This does NOT affect the Open WebUI integration —
-      # Open WebUI reaches open-terminal on inbound :8000 (INPUT is open) and
-      # replies match ESTABLISHED,RELATED / the subnet rule, so the file browser
-      # and terminal work through the firewall. The cage only stops open-terminal
-      # from reaching the wider internet itself. Set LOCKDOWN_NETWORK=0 to disable.
-      - LOCKDOWN_NETWORK=${LOCKDOWN_NETWORK:-1}
     volumes:
       - terminal-workspace:/home/user        # agent workspace (ephemeral files)
       - ..:/opt/framework                     # live production code (bind mount, replaces COPY)
@@ -134,22 +130,17 @@ services:
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────────────
-  # JupyterLab — tool nursery, localhost-only, gated like open-terminal.
-  # Shares the live framework tree so notebooks import/extend the framework,
-  # but firewalled (loopback + Docker subnet + Ollama only) so its only egress
-  # is the gateway on the subnet — nursery work tests the gated path and the
-  # agent cannot pivot through Jupyter to bypass open-terminal's firewall.
-  # Deps baked once via dockered/jupyter.Dockerfile; lockdown runs in
-  # dockered/jupyter-entrypoint.sh. JUPYTER_TOKEN is required from env.
+  # JupyterLab — tool nursery, localhost-only, token-gated.
+  # Shares the live framework tree so notebooks import/extend the framework and
+  # reach the gateway on the workbench subnet. With the cage removed
+  # (2026-09-17, decision "C") it runs as jovyan with the stock notebook
+  # entrypoint - no custom entrypoint, no NET_ADMIN - and can be proxied for
+  # remote access. JUPYTER_TOKEN is required from env.
   # ─────────────────────────────────────────────────────────────────────────
   jupyter:
     build:
       context: ..
       dockerfile: dockered/jupyter.Dockerfile
-    user: root                       # entrypoint applies iptables as root, then drops to jovyan
-    cap_add:
-      - NET_ADMIN                    # needed only for the entrypoint iptables lockdown
-    command: ["/usr/local/bin/jupyter-entrypoint.sh"]
     ports:
       - "127.0.0.1:8888:8888"
     networks:
@@ -164,7 +155,6 @@ services:
       - CHROMA_PORT=8000
       - OLLAMA_HOST=10.0.0.245
       - OLLAMA_PORT=11434
-      - DOCKER_SUBNET=172.28.0.0/16
     restart: unless-stopped
 
 networks:

@@ -1,11 +1,17 @@
 # =============================================================================
-# JupyterLab workbench image — gated tool nursery over the framework.
+# JupyterLab workbench image — tool nursery over the framework.
 #
 # Extends jupyter/minimal-notebook (jovyan, UID 1000 — matches host surzal so
 # the bind-mounted ../framework tree is writable). Bakes native build deps
-# (libpcap/libxslt/libssl + gcc) and the framework requirements once, plus
-# iptables for the entrypoint network lockdown. Stays root at runtime so the
-# entrypoint can apply iptables, then drops to jovyan (no CAP_NET_ADMIN).
+# (libpcap/libxslt/libssl + gcc) and the framework requirements once.
+#
+# NETWORK POSTURE (2026-09-17, user decision "C"): no iptables lockdown and
+# no root entrypoint — the container runs as jovyan with the stock notebook
+# entrypoint. The old firewall mirrored open-terminal's cage; it was removed
+# with the cage itself (scope stays in-process; the nursery can now be
+# proxied and reach the framework gateway on the subnet like any other
+# service). The nursery is localhost-only at the port level (compose binds
+# 127.0.0.1:8888), JUPYTER_TOKEN still gates access.
 # =============================================================================
 
 FROM jupyter/minimal-notebook:latest
@@ -15,16 +21,13 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential gcc g++ \
         libffi-dev libssl-dev libxml2-dev libxslt1-dev libpcap-dev \
-        iptables gosu \
         git \
     && apt-get clean
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY dockered/jupyter-entrypoint.sh /usr/local/bin/jupyter-entrypoint.sh
-RUN chmod +x /usr/local/bin/jupyter-entrypoint.sh
+# Stock notebook entrypoint as jovyan — no custom entrypoint, no lockdown.
+USER ${NB_UID:-1000}
 
-# Runtime stays root so the entrypoint can apply iptables; it drops to jovyan
-# before launching the notebook server.
 WORKDIR /home/jovyan/framework
