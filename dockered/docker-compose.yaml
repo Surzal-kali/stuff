@@ -1,15 +1,27 @@
 # =============================================================================
-# Framework workbench: Open Terminal (network-isolated) + existing ChromaDB
+# Framework workbench: Open Terminal (gated) + Open WebUI (open) + JupyterLab (gated nursery) + ChromaDB
 #
-# The open-terminal container has the full framework baked in but can only
-# reach ChromaDB (Docker-internal) and Ollama (10.0.0.245:11434). All other
-# outbound traffic is blocked by iptables in the entrypoint.
+# open-terminal is the gated agent runtime: it bind-mounts the live production
+# tree (no COPY) AND keeps the iptables network lockdown (loopback + Docker
+# subnet + Ollama only). The firewall is the network backstop behind the
+# framework's scope layer — it forces the agent to reach the outside world only
+# through the framework's API routes (gateway on loopback), not by shelling out
+# directly.
 #
-# ChromaDB is now defined below as the `chroma` service — it mirrors the
-# previous standalone `chroma` container (same image, same config.yaml,
-# same `chroma-data` bind mount, host port 9000).  open-terminal reaches it
-# by DNS name `chroma` on the workbench network.  See the note above the
-# service block about removing the standalone container first.
+# JupyterLab (the tool nursery) is firewalled the same way: it shares the live
+# framework tree but its only egress is the gateway on the subnet, so nursery
+# work tests tools through the gated path and the agent cannot pivot through
+# Jupyter to bypass open-terminal's firewall. JUPYTER_TOKEN is required from env.
+#
+# Open WebUI is the open chat frontend: it does its own web search and calls the
+# framework's (gated) API routes for tool/code execution, so its own container
+# stays open without creating an unscoped execution path.
+#
+# ChromaDB is defined below as the `chroma` service — it mirrors the previous
+# standalone `chroma` container (same image, same config.yaml, same `chroma-data`
+# bind mount, host port 9000).  open-terminal reaches it by DNS name `chroma`
+# on the workbench network.  See the note above the service block about removing
+# the standalone container first.
 #
 # Usage:
 #   cd dockered
@@ -21,10 +33,18 @@
 #
 # Open Terminal API:  http://localhost:8000   (connect Open WebUI here)
 # Framework gateway:  http://localhost:6000   (REST + MCP, from host)
+# Open WebUI:         http://localhost:3000   (chat front end)
+# JupyterLab:         http://localhost:8888   (dev/automation IDE, localhost-only)
 #
-# Override API keys via shell env or a dockered/.env file:
+# open-terminal now bind-mounts the live production tree (..) at /opt/framework
+# instead of baking a COPY, so code edits on the host are picked up with no
+# rebuild. Note: .dockerignore does NOT apply to bind mounts — .git/ and any
+# non-ignored host files become visible inside the container.
+#
+# Override API keys / tokens via shell env or a dockered/.env file:
 #   OPEN_TERMINAL_API_KEY=your-key
 #   GATEWAY_API_KEY=your-key
+#   JUPYTER_TOKEN=your-token
 # =============================================================================
 
 services:
@@ -61,15 +81,90 @@ services:
       workbench:
         ipv4_address: 172.28.0.20
     cap_add:
-      - NET_ADMIN       # needed only for entrypoint iptables setup
+      - NET_ADMIN       # needed for the entrypoint iptables lockdown (only used when LOCKDOWN_NETWORK=1)
     env_file:
       - framework.env
     environment:
-      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY:-changeme-terminal-key}
-      - GATEWAY_API_KEY=${GATEWAY_API_KEY:-changeme-gateway-key}
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+      # Point Open WebUI's file browser at the live production code bind mount
+      # (..:/opt/framework) instead of the default `home` (/home/user). The
+      # default root seeds the named volume with the open-terminal package's
+      # home dir, so Open WebUI only ever saw the package — never the framework.
+      # /opt/framework matches WORKSPACE_ROOT in framework.env, so the browser,
+      # the terminal CWD, and the framework all agree on one workspace root.
+      - OPEN_TERMINAL_FILE_BROWSER_ROOT=/opt/framework
+      # Network lockdown ON by default: outbound limited to loopback + Docker
+      # subnet + Ollama only. This does NOT affect the Open WebUI integration —
+      # Open WebUI reaches open-terminal on inbound :8000 (INPUT is open) and
+      # replies match ESTABLISHED,RELATED / the subnet rule, so the file browser
+      # and terminal work through the firewall. The cage only stops open-terminal
+      # from reaching the wider internet itself. Set LOCKDOWN_NETWORK=0 to disable.
+      - LOCKDOWN_NETWORK=${LOCKDOWN_NETWORK:-1}
     volumes:
       - terminal-workspace:/home/user        # agent workspace (ephemeral files)
-      - framework-memory:/opt/framework/.memory  # persistent vector memory
+      - ..:/opt/framework                     # live production code (bind mount, replaces COPY)
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Open WebUI — chat front end layered over the framework.
+  # Reaches open-terminal at open-terminal:8000 (tools) and Ollama directly at
+  # 10.0.0.245:11434 (LLM). Not behind the open-terminal firewall — this is the
+  # open dev surface, not the gated agent surface.
+  # ─────────────────────────────────────────────────────────────────────────
+  open-webui:
+    # NOTE: pinned to :dev (not :main) because the interactive terminal shell
+    # is broken in the current stable release v0.11.3. Open WebUI's WebSocket
+    # proxy omits the X-User-Id / X-Session-Id headers that open-terminal's
+    # attach handler checks, so every interactive PTY attach is closed with
+    # 4004 "Session not found" (REST/file-browser/AI tool calls still work).
+    # Fixed in dev: see open-webui/open-webui#29787. Switch back to :main once
+    # a stable release newer than v0.11.3 ships (0.11.4+).
+    image: ghcr.io/open-webui/open-webui:dev
+    ports:
+      - "3000:8080"
+    networks:
+      workbench:
+        ipv4_address: 172.28.0.30
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://10.0.0.245:11434
+      - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JupyterLab — tool nursery, localhost-only, gated like open-terminal.
+  # Shares the live framework tree so notebooks import/extend the framework,
+  # but firewalled (loopback + Docker subnet + Ollama only) so its only egress
+  # is the gateway on the subnet — nursery work tests the gated path and the
+  # agent cannot pivot through Jupyter to bypass open-terminal's firewall.
+  # Deps baked once via dockered/jupyter.Dockerfile; lockdown runs in
+  # dockered/jupyter-entrypoint.sh. JUPYTER_TOKEN is required from env.
+  # ─────────────────────────────────────────────────────────────────────────
+  jupyter:
+    build:
+      context: ..
+      dockerfile: dockered/jupyter.Dockerfile
+    user: root                       # entrypoint applies iptables as root, then drops to jovyan
+    cap_add:
+      - NET_ADMIN                    # needed only for the entrypoint iptables lockdown
+    command: ["/usr/local/bin/jupyter-entrypoint.sh"]
+    ports:
+      - "127.0.0.1:8888:8888"
+    networks:
+      workbench:
+        ipv4_address: 172.28.0.40
+    volumes:
+      - ..:/home/jovyan/framework
+    working_dir: /home/jovyan/framework
+    environment:
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - OLLAMA_HOST=10.0.0.245
+      - OLLAMA_PORT=11434
+      - DOCKER_SUBNET=172.28.0.0/16
     restart: unless-stopped
 
 networks:
@@ -82,4 +177,4 @@ networks:
 
 volumes:
   terminal-workspace:
-  framework-memory:
+  open-webui-data:

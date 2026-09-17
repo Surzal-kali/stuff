@@ -37,9 +37,11 @@ fix_home() {
 }
 
 # --- Network lockdown via iptables ---
-# Allows ONLY: loopback, Docker subnet (ChromaDB + compose services),
-# and the Ollama embedding server. Everything else is dropped.
-# IPv6 is fully blocked except loopback + established.
+# Forces the agent to reach the outside world only through the framework's API
+# routes (gateway on loopback) instead of shelling out directly. Allowed:
+# loopback, the Docker subnet (ChromaDB + compose services), and Ollama.
+# Everything else is dropped. This is the network backstop behind the scope
+# layer — keep it on open-terminal (the gated agent runtime).
 setup_firewall() {
     if ! command -v iptables >/dev/null 2>&1; then
         echo "WARNING: iptables not found — NO network isolation!" >&2
@@ -78,8 +80,16 @@ fix_home
 export HOME="/home/user"
 export PATH="/home/user/.local/bin:/opt/framework-venv/bin:${PATH}"
 
-# Lock down the network (as root, before dropping privileges)
-setup_firewall || true
+# Lock down the network (as root, before dropping privileges).
+# Gated by LOCKDOWN_NETWORK so the same image can run an open "regular
+# terminal" instance (LOCKDOWN_NETWORK=0, no NET_ADMIN) alongside the
+# gated agent runtime. Default is on to preserve the security backstop.
+if [ "${LOCKDOWN_NETWORK:-1}" = "1" ]; then
+    setup_firewall || true
+else
+    echo "=== Network lockdown DISABLED (LOCKDOWN_NETWORK=0) ===" >&2
+    echo "  This instance is an OPEN terminal — full outbound network." >&2
+fi
 
 # Start framework services in the background (as user, after firewall is up)
 FRAMEWORK_ROOT="/opt/framework"

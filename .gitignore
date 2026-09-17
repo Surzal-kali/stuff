@@ -34,3 +34,7 @@ findings_md/
 *.scope
 scope/
 framework.env
+bugcheck_ledger.md
+briefs/*
+ledger_archive/*
+

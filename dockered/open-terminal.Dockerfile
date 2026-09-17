@@ -1,10 +1,12 @@
 # =============================================================================
 # Open Terminal + Framework Workbench Image
 #
-# Network-isolated workbench: framework code and all CLI tools are baked in,
-# but the entrypoint iptables firewall blocks all outbound except loopback,
-# the Docker subnet (ChromaDB), and Ollama.  The agent cannot bypass the
-# framework scope layer by shelling out to nmap/masscan/amass directly.
+# Gated agent runtime: CLI tools + Python venv are baked in, but the framework
+# source is NOT — it is bind-mounted at runtime (.. -> /opt/framework) via
+# docker-compose.yaml so host edits are live with no rebuild. The entrypoint
+# applies an iptables lockdown (loopback + Docker subnet + Ollama only) so the
+# agent must reach the outside world through the framework's API routes, not by
+# shelling out directly. Open WebUI and JupyterLab are separate open services.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -78,8 +80,8 @@ RUN ldconfig 2>/dev/null || true
 
 COPY --from=builder /opt/framework-venv /opt/framework-venv
 
-COPY . /opt/framework/
-RUN chown -R user:user /opt/framework
+# NOTE: framework source is NOT copied here — it is bind-mounted at runtime
+# from the host (.. -> /opt/framework) in docker-compose.yaml for live edits.
 
 COPY dockered/entrypoint.sh /app/custom-entrypoint.sh
 RUN chmod +x /app/custom-entrypoint.sh
