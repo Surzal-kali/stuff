@@ -247,6 +247,14 @@ Framework tools:
 - **`program_hacktivity`** — fetch the program's hacktivity feed for
   duplicate-checking. Works without credentials (public feed); includes a
   behavioral guard against silent filter-ignoring.
+- **`search_programs`** — keyword search ACROSS the boards' program listings
+  (HackerOne authed index, Intigriti PAT list; Bugcrowd exact-handle probe —
+  that lane has no public listing API). Rows carry platform/handle/name and
+  bounty-relevant flags (`offers_bounties`, per-asset eligibility, tiers);
+  `with_assets=True` pulls each match's manifest for a compact asset + bounty
+  summary. Also exposed operator-side as `scope search <kw>` in the Tool
+  REPL. Dollar bounty tables are not structured on any lane — they live in
+  each program's policy prose.
 
 **Authentication:** The structured-scope endpoints require a platform API
 token. HackerOne uses Basic auth — set `H1_API_USERNAME` and `H1_API_TOKEN`

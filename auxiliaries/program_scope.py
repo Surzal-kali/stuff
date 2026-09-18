@@ -1139,6 +1139,254 @@ def load_program_scope(handle: str = "crypto", refresh: bool = False,
     return manifest
 
 
+# --- board-wide program search ----------------------------------------------
+#
+# Keyword discovery ACROSS a board's program listing — recon of the boards
+# themselves, not verdicts about a target.  What the researcher APIs actually
+# expose, honestly:
+#   * H1:        GET /hackers/programs — paged index of programs available to
+#                the credentialed researcher (attributes include handle, name,
+#                submission_state, offers_bounties).  No structured DOLLAR
+#                bounty table: per-asset bounty eligibility + max_severity
+#                come from structured_scopes; dollar figures live in policy
+#                prose.
+#   * Intigriti: GET /v1/programs — paged list of accessible programs
+#                (handle + GUID + name + status/type enums).  Bounty shape is
+#                tiers, not dollars (see _inti_map_domain).
+#   * Bugcrowd:  no public program-list API in this lane — anonymous access is
+#                per-engagement-page only, so the lane accepts an exact handle
+#                probe.  Reward info is per-group rewardRange inside the brief
+#                (see _bc_target_entry / _bc_build_manifest).
+# Fetch lane only: queries the board APIs, never touches a target, and has
+# nothing to do with the traffic-sending scope gate.
+
+def _enumval(v: Any) -> Any:
+    """Intigriti-style enum (``{'value': x}``) → ``x``; passthrough otherwise."""
+    return v.get("value") if isinstance(v, dict) else v
+
+
+def _h1_search_programs(query: str, limit: int) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """Client-side keyword match over the H1 program index (10 pages × 100).
+
+    Returns ``(rows, error, truncated)``.  Matching is substring on name+handle
+    — the researchers' index exposes no server-side search param, so we page
+    and filter ourselves.
+    """
+    auth, has_auth = _h1_auth()
+    if not has_auth:
+        return [], ("auth_required: set H1_API_USERNAME and H1_API_TOKEN "
+                    "(generate at hackerone.com → Settings → API Tokens)"), False
+    kw = query.lower()
+    rows: List[Dict[str, Any]] = []
+    truncated = False
+    for page in range(1, 11):
+        params: Dict[str, Any] = {"page[size]": 100, "page[number]": page}
+        status, body = _get("/hackers/programs", params=params)
+        if status != 200 or not isinstance(body, dict):
+            err = None
+            if isinstance(body, dict) and body.get("errors"):
+                err = str(body["errors"])
+            return [], err or f"program index: HTTP {status}", truncated
+        for it in (body.get("data") or []):
+            a = (it.get("attributes") or {}) if isinstance(it, dict) else {}
+            hay = f"{a.get('name', '')} {a.get('handle', '')}".lower()
+            if kw in hay:
+                rows.append({
+                    "platform": "h1",
+                    "handle": a.get("handle"),
+                    "name": a.get("name"),
+                    "bounty": bool(a.get("offers_bounties")),
+                    "state": _enumval(a.get("submission_state")),
+                })
+                if len(rows) >= limit:
+                    return rows, None, truncated
+        if not (body.get("links") or {}).get("next"):
+            break
+        if page == 10:
+            truncated = True
+    return rows, None, truncated
+
+
+def _inti_search_programs(query: str, limit: int) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """Client-side keyword match over the Intigriti program list (10 × 500).
+
+    Returns ``(rows, error, truncated)``.  Requires ``INTIGRITI_API_TOKEN``.
+    """
+    if not _inti_auth():
+        return [], ("auth_required: set INTIGRITI_API_TOKEN "
+                    "(generate at app.intigriti.com → Settings → "
+                    "Personal access tokens)"), False
+    kw = query.lower()
+    rows: List[Dict[str, Any]] = []
+    truncated = False
+    offset = 0
+    for _ in range(10):
+        status, body = _inti_get("/v1/programs", params={"limit": 500, "offset": offset})
+        if status != 200 or not isinstance(body, dict):
+            return [], f"program listing: HTTP {status}", truncated
+        records = body.get("records") or []
+        for rec in records:
+            hay = f"{rec.get('name') or ''} {rec.get('handle') or ''}".lower()
+            if kw in hay:
+                rows.append({
+                    "platform": "intigriti",
+                    "handle": rec.get("handle"),
+                    "id": rec.get("id"),
+                    "name": rec.get("name"),
+                    "state": _enumval(rec.get("status")),
+                    "type": _enumval(rec.get("type")),
+                })
+                if len(rows) >= limit:
+                    return rows, None, truncated
+        offset += len(records)
+        if not records or offset >= int(body.get("maxCount") or 0):
+            break
+        if offset >= 10 * 500:
+            truncated = True
+    return rows, None, truncated
+
+
+def _bc_probe_program(handle: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Anonymous exact-handle probe of a Bugcrowd engagement page.
+
+    This lane has no public program-list API, so 'search' degenerates to an
+    exact-handle existence check (same page fetch _bc_build_manifest uses).
+    """
+    st, page = _bc_fetch_engagement_page(handle)
+    if st != 200:
+        return None, f"engagement page: HTTP {st} (handle may not exist or program is private)"
+    m = re.search(r"<title>([^<]+)</title>", page or "", re.S)
+    name = _html.unescape(m.group(1)).strip() if m else handle
+    return {
+        "platform": "bugcrowd", "handle": handle, "name": name,
+        "bounty": "per-group rewardRange — fetch the brief (load_program_scope platform=bugcrowd)",
+        "state": None, "type": None,
+    }, None
+
+
+def _summarize_manifest_assets(manifest: Dict[str, Any], cap: int = 100) -> Dict[str, Any]:
+    """Compact bounty-relevant summary of a manifest (search_programs --assets)."""
+    in_assets = manifest.get("in_scope") or []
+    bounty_elig = sum(1 for a in in_assets if a.get("eligible_for_bounty"))
+    detail_hist: Dict[str, int] = {}
+    rows = []
+    for a in in_assets[:cap]:
+        detail = a.get("max_severity") or a.get("inti_tier") or a.get("reference") or ""
+        if detail:
+            detail_hist[str(detail)] = detail_hist.get(str(detail), 0) + 1
+        rows.append({
+            "asset_identifier": a.get("asset_identifier"),
+            "asset_type": a.get("asset_type"),
+            "eligible_for_bounty": bool(a.get("eligible_for_bounty")),
+            "detail": detail or None,
+        })
+    return {
+        "program_name": manifest.get("program_name") or manifest.get("handle"),
+        "counts": {
+            "in_scope": len(in_assets),
+            "out_of_scope_assets": len(manifest.get("out_of_scope_assets") or []),
+        },
+        "bounty_stats": {
+            "bounty_eligible_in_scope": bounty_elig,
+            "no_bounty_in_scope": len(in_assets) - bounty_elig,
+            "detail_histogram": detail_hist,
+        },
+        "assets": rows,
+        "assets_truncated": len(in_assets) > cap,
+        "_warning": manifest.get("_warning"),
+    }
+
+
+@framework_tool(
+    "Search bug-bounty boards for programs matching a keyword: HackerOne "
+    "(authed program index) and Intigriti (PAT program list) support keyword "
+    "discovery; Bugcrowd has no public listing API — pass --handle for an "
+    "exact anonymous probe. Rows carry platform/handle/name and "
+    "bounty-relevant flags. with_assets=True additionally loads each match's "
+    "manifest (cache-first; may write the scope cache) and summarises "
+    "in-scope assets with bounty-relevant fields. Platform fetch lane only — "
+    "never touches a target. Structured DOLLAR bounty tables are not exposed "
+    "by the researcher APIs (H1: offers_bounties + per-asset eligibility + "
+    "max_severity; Bugcrowd: per-group rewardRange; Intigriti: tiers) — "
+    "dollar figures live in each program's policy prose.",
+    next_hints=["load_program_scope", "check_scope"],
+)
+def search_programs(query: str = "", platform: str = "all", limit: int = 10,
+                    with_assets: bool = False, handle: str = "",
+                    refresh: bool = False) -> Dict[str, Any]:
+    """Search board program listings by keyword (discovery, not verdicts).
+
+    Args:
+        query: Keyword, case-insensitive substring match on program name/handle.
+        platform: ``all`` (default), ``h1``, ``intigriti``, or ``bugcrowd``.
+            Bugcrowd supports an exact-handle probe only (no public listing API).
+        limit: Max matches per lane.
+        with_assets: Also load each match's manifest (cache-first) and attach a
+            compact asset/bounty summary (first 3 matches, capped asset rows).
+        handle: Exact handle for the bugcrowd probe lane.
+        refresh: With with_assets, force a fresh manifest fetch (rewrites cache).
+    """
+    platform = (platform or "all").strip().lower()
+    if platform not in ("all", "h1", "intigriti", "bugcrowd"):
+        return {"ok": False, "error": f"unknown platform {platform!r} (all|h1|intigriti|bugcrowd)"}
+    if platform == "bugcrowd" and not (handle or "").strip():
+        return {"ok": False, "error": ("bugcrowd lane has no public program-list API; "
+                                        "pass an exact --handle for the anonymous probe")}
+    if platform in ("h1", "intigriti") and not (query or "").strip():
+        return {"ok": False, "error": f"query is required for the {platform} lane"}
+
+    rows: List[Dict[str, Any]] = []
+    lane_errors: Dict[str, str] = {}
+    lane_truncated: Dict[str, bool] = {}
+    if platform == "bugcrowd":
+        probe, err = _bc_probe_program(handle.strip())
+        if err:
+            lane_errors["bugcrowd"] = err
+        else:
+            rows.append(probe)
+    else:
+        lanes = ["h1", "intigriti"] if platform == "all" else [platform]
+        for lane in lanes:
+            if lane == "h1":
+                lane_rows, err, tr = _h1_search_programs(query, limit)
+            else:
+                lane_rows, err, tr = _inti_search_programs(query, limit)
+            if err:
+                lane_errors[lane] = err
+            else:
+                rows.extend(lane_rows)
+                lane_truncated[lane] = tr
+
+    res: Dict[str, Any] = {
+        "ok": bool(rows) or not lane_errors,
+        "query": query,
+        "platform": platform,
+        "rows": rows,
+        "lane_errors": lane_errors,
+        "lane_truncated": {k: v for k, v in lane_truncated.items() if v},
+        "note": ("negative result from a live index pull is real data; dollar "
+                 "bounty tables are not structured on any lane — see the "
+                 "program's policy prose"),
+    }
+    if not rows and lane_errors:
+        res["ok"] = False
+    if with_assets and rows:
+        assets: Dict[str, Any] = {}
+        for row in rows[:3]:
+            key = f"{row['platform']}/{row.get('handle')}"
+            if not row.get("handle"):
+                assets[key] = {"error": "row has no handle to load"}
+                continue
+            m = load_program_scope(row["handle"], refresh=refresh, platform=row["platform"])
+            if not isinstance(m, dict) or m.get("status") == "error":
+                assets[key] = {"error": (m or {}).get("error", "manifest unavailable")
+                               if isinstance(m, dict) else str(m)}
+                continue
+            assets[key] = _summarize_manifest_assets(m)
+        res["assets"] = assets
+    return res
+
+
 @framework_tool(
     "Check whether a target (host, URL, IP/CIDR, or mobile app package id) "
     "is inside a program's authorised scope (platform: 'h1' default, "

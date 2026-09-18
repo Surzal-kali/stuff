@@ -29,6 +29,7 @@ import os
 import scapy.all as scapy
 from scapy.layers.dhcp import DHCP, BOOTP
 from scapy.layers.inet import IP, TCP, UDP, ICMP
+from scapy.layers.inet6 import IPv6  # NOT re-exported by scapy.layers.inet
 from scapy.layers.l2 import Ether, ARP, Dot1Q
 from scapy.layers.http import HTTPRequest, HTTPResponse
 from scapy.layers.dns import DNS, DNSQR, DNSRR
@@ -96,31 +97,45 @@ def _packet_from_hex(hex_string: str) -> scapy.Packet:
 
     A bare L3 craft output (``IP()/…``, first byte ``0x45``) mis-parses
     under ``Ether`` with a garbage EtherType, so none of the recognised
-    layers appear and we fall through to the ``IP`` parse.  An L2 frame
-    carrying IP/ARP/DHCP/VLAN parses cleanly under ``Ether`` and is returned
+    layers appear and we fall through to the ``IP`` parse (version nibble 6
+    routes to ``IPv6`` — a bare IPv6 packet fed to ``IP()`` silently misparses
+    as garbage IPv4).  An L2 frame carrying IP/IPv6/ARP/DHCP/VLAN parses
+    cleanly under ``Ether`` and is returned
     as-is.  This keeps the round-trip consistent with
     :meth:`PacketUtils.import_packet_hex`, which delegates here.
     """
     raw = bytes.fromhex(hex_string.strip())
     try:
         frame = Ether(raw)
-        if IP in frame or ARP in frame or DHCP in frame or Dot1Q in frame:
+        if IP in frame or IPv6 in frame or ARP in frame or DHCP in frame or Dot1Q in frame:
             return frame
     except Exception:
         pass
+    # Bare L3: an IPv6 header always starts with version nibble 6 — after the
+    # Ether attempt failed to recognise a layer, route on the version nibble.
+    # This is safe where the old MAC-nibble test was not: the ambiguous
+    # dst-MAC-OUI-vs-version collision only matters for distinguishing L2
+    # frames, and the Ether parse has already been tried and rejected.  A bare
+    # IPv6 packet fed to IP() silently misparses as garbage IPv4 (e.g. v6/TCP
+    # → '0.0.0.0 > 0.0.0.0 hopopt frag:1600') whose unspecified-ish dst would
+    # bypass the scope gate — so the v6 check must come first.
+    if raw and (raw[0] >> 4) == 6:
+        return IPv6(raw)
     return IP(raw)
 
 
 def _packet_dst(packet: scapy.Packet) -> "str | None":
     """Extract the routable destination a send is directed at, for the scope
-    gate.  Returns the destination IP for IP packets, the target protocol
-    address (``pdst``) for ARP, or ``None`` for frames that carry no directed
-    host IP (pure L2).  ``None`` and non-routable (broadcast/multicast/...)
+    gate.  Returns the destination IP for IPv4/IPv6 packets, the target
+    protocol address (``pdst``) for ARP, or ``None`` for frames that carry no
+    directed host IP (pure L2).  ``None`` and non-routable (broadcast/multicast/...)
     destinations are never gated — only routable unicast IPs directed at a
     real host are.  See :func:`utils.scope_gate.check_send`.
     """
     if IP in packet:
         return packet[IP].dst
+    if IPv6 in packet:
+        return packet[IPv6].dst
     if ARP in packet:
         return packet[ARP].pdst
     return None
@@ -308,7 +323,7 @@ class PacketCraft:
     def send_packet(self, packet: scapy.Packet, count: int = 1, interval: float = 0.1):
         """Send a packet multiple times with a specified interval.
 
-        Uses :func:`send` for L3 packets (``IP()/…``) so scapy wraps the L2
+        Uses :func:`send` for L3 packets (``IP()/IPv6()/…``) so scapy wraps the L2
         header, and :func:`sendp` for L2 frames that already carry an
         Ethernet header.  Feeding a bare IP packet to ``sendp`` silently
         emits a frame whose Ethernet header is the first 14 bytes of the
@@ -321,7 +336,7 @@ class PacketCraft:
         _ok, _reason = check_send(_packet_dst(packet))
         if not _ok:
             raise ScopeGateError(f"scope gate: {_reason}")
-        send_fn = send if isinstance(packet, IP) else sendp
+        send_fn = send if isinstance(packet, (IP, IPv6)) else sendp
         for _ in range(count):
             send_fn(packet, iface=self.interface, verbose=False)
             time.sleep(interval)
@@ -661,7 +676,7 @@ def send_packet(hex: str, count: int = 1, interval: float = 0.1, interface: str 
         # whose "Ethernet header" is the first 14 bytes of the IP header
         # (dst MAC 45:00:00:00:00:00) — the switch floods it, no host
         # accepts it, and the tool still reports "Sent N packet(s)".
-        send_fn = send if isinstance(pkt, IP) else sendp
+        send_fn = send if isinstance(pkt, (IP, IPv6)) else sendp
         for _ in range(int(count)):
             send_fn(pkt, iface=iface, verbose=False)
             time.sleep(float(interval))

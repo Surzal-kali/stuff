@@ -101,7 +101,7 @@ def scope(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(g, "_load_manifest", lambda h, p: manifest)
     monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: [])
-    monkeypatch.setattr(g, "_STATE_PATH", tmp_path / ".armed_scope.json")
+    monkeypatch.setattr(g, "_state_path", lambda: tmp_path / ".armed_scope.json")
     g.disarm()
     g._CACHE["mtime"] = None
     g._CACHE["state"] = None
@@ -176,6 +176,21 @@ class TestGateLogic:
         ok, reason = g.check_scan("10.0.0.1-50")
         assert not ok and "range" in reason.lower()
 
+    def test_hostname_with_year_is_not_a_range(self, scope):
+        """F-4: digit-hyphen-digit HOSTNAMES must fall through to hostname
+        matching instead of being broadly refused as nmap ranges."""
+        assert not g._is_hyphen_range("wordpress-2024.example.com")
+        assert not g._is_hyphen_range("s3-2024.example.com")
+        assert not g._is_hyphen_range("co-uk")
+        # real numeric nmap ranges still classify as ranges
+        assert g._is_hyphen_range("10.0.0.1-50")
+        assert g._is_hyphen_range("10.0.0.1-10.0.0.25")
+        assert g._is_hyphen_range("1-50")
+        # end-to-end: an in-scope hostname that merely contains a year now
+        # resolves via the wildcard (was: refused as uncheckable range).
+        _arm()
+        assert g.check_scan("s3-2024.tesla.com")[0]
+
     def test_list_one_oos_refuses_whole(self, scope):
         _arm()
         assert not g.check_scan("www.tesla.com feedback.tesla.com")[0]
@@ -192,11 +207,43 @@ class TestGateLogic:
 
     def test_reverse_dns_in_scope_allows(self, scope, monkeypatch):
         monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: ["www.tesla.com"])
+        # F-5: tier-3 now forward-confirms — stub the A lookup so the test
+        # stays offline and deterministic.
+        monkeypatch.setattr(g.socket, "gethostbyname", lambda host: "1.2.3.4")
         _arm()
         assert g.check_scan("1.2.3.4")[0]
 
     def test_reverse_dns_oos_wins(self, scope, monkeypatch):
         monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: ["feedback.tesla.com"])
+        _arm()
+        assert not g.check_scan("1.2.3.4")[0]
+
+    def test_reverse_dns_in_scope_forward_confirmed_allows(self, scope, monkeypatch):
+        """F-5: tier-3 auto-allow requires the PTR name to resolve back to
+        the scanned IP (forward-confirmation)."""
+        monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: ["www.tesla.com"])
+        monkeypatch.setattr(g.socket, "gethostbyname", lambda host: "1.2.3.4")
+        _arm()
+        assert g.check_scan("1.2.3.4")[0]
+
+    def test_reverse_dns_unconfirmed_ptr_refuses(self, scope, monkeypatch):
+        """F-5: an in-scope PTR name that does NOT forward-confirm must not
+        auto-allow — attacker-settable attribution falls through to the
+        strict refuse."""
+        monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: ["www.tesla.com"])
+
+        def _no_resolver(host):
+            raise OSError("stub: resolver unavailable")
+
+        monkeypatch.setattr(g.socket, "gethostbyname", _no_resolver)
+        _arm()
+        ok, reason = g.check_scan("1.2.3.4")
+        assert not ok
+
+    def test_reverse_dns_wrong_forward_ip_refuses(self, scope, monkeypatch):
+        """F-5: PTR name resolves, but to a different IP — no auto-allow."""
+        monkeypatch.setattr(g, "_reverse_dns", lambda ip, timeout=2.0: ["www.tesla.com"])
+        monkeypatch.setattr(g.socket, "gethostbyname", lambda host: "203.0.113.99")
         _arm()
         assert not g.check_scan("1.2.3.4")[0]
 
@@ -224,6 +271,36 @@ class TestGateLogic:
         assert not g.check_scan("evil.example.com")[0]
         g.disarm()
         assert g.check_scan("evil.example.com")[0]
+
+
+# --- IPv6 gap (F-3): crafted v6 packets must yield a real, gated dst -------
+
+class TestIPv6Gap:
+    """An IPv6 destination must reach the gate instead of silently passing
+    as an ungated (None/garbage) destination."""
+
+    def test_v6_dst_extracted(self, scope):
+        pytest.importorskip("scapy")
+        import utils.packetcraft as p
+        pkt = p.IPv6(dst="2001:db8::1") / p.TCP(sport=1, dport=80, flags="S")
+        assert p._packet_dst(pkt) == "2001:db8::1"
+
+    def test_v6_hex_roundtrip(self, scope):
+        """Bare IPv6 hex must not garbage-misparse as IPv4 (old path returned
+        a bogus '0.0.0.0' dst that the gate treated as non-routable)."""
+        pytest.importorskip("scapy")
+        import utils.packetcraft as p
+        pkt = p.IPv6(dst="2001:db8::1") / p.TCP(sport=1, dport=80, flags="S")
+        pkt2 = p._packet_from_hex(p._packet_to_hex(pkt))
+        assert p._packet_dst(pkt2) == "2001:db8::1"
+
+    def test_v6_target_gated_when_armed(self, scope):
+        """Armed + unconfirmed v6 destination -> refused (strict)."""
+        pytest.importorskip("scapy")
+        import utils.packetcraft as p
+        _arm()
+        ok, reason = g.check_send("2001:db8::1")
+        assert not ok
 
 
 # --- enforcement: tools raise ScopeGateError on block ----------------------
@@ -268,7 +345,12 @@ def tools(scope, monkeypatch):
     import auxiliaries.smb_scanner as smb
     import utils.paramiko_client as pc
     import utils.packetcraft as p
-    import listeners.raw_scan as rs
+    # F-2: self-contained load — same isolation pattern ffuf/hydra use.  A
+    # box missing the frameit build artifact now SKIPS the enforcement tests
+    # instead of erroring the whole fixture at import time.
+    rs = _load_isolated("listeners/raw_scan.py", "listeners.raw_scan")
+    if rs is None:
+        pytest.skip("raw_scan unavailable (frameit.so build artifact missing)")
     monkeypatch.setattr(nmap, "launch_job", _fake_launch)
     monkeypatch.setattr(masscan, "launch_job", _fake_launch)
     monkeypatch.setattr(imp, "SMBConnection", _BoomConn)

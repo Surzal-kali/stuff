@@ -58,6 +58,8 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
       1. First word  → REPL commands (run, list, info, …)
       2. After a tool-accepting command → discovered tool IDs (from manifests)
       3. After a tool_id in ``run`` → ``--flag`` names from the tool's schema
+      4. After ``scope`` → gate subcommands, then their ``--flags``
+         (schema mirrors ``_scope_command()`` / ``search_programs``)
 
     Ghost text (grayed inline suggestion) is shown for single prefix-match
     completions; Tab opens the multi-match dropdown.
@@ -69,6 +71,31 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
     ]
     # Commands whose first argument is a tool_id.
     TOOL_COMMANDS = {"run", "info", "resolve", "safe-args"}
+
+    # ``scope`` subcommand schema — keep in sync with _scope_command().
+    # Values double as the tooltip (display_meta) in the completion dropdown.
+    SCOPE_SUBCOMMANDS = {
+        "on": "arm the gate: on <handle> [--platform P] [--no-strict]",
+        "off": "disarm — lab mode, tools unrestricted",
+        "status": "armed state, asset counts, manifest_age_s",
+        "add-ip": "add-ip <ip> [<hostname>] — bless a resolved in-scope IP",
+        "rm-ip": "rm-ip <ip> — remove a blessed IP",
+        "list-ips": "show the operator allowlist",
+        "search": "query boards: <kw> [--platform P] [--assets] [--handle H] [--refresh] [--limit N] [--json]",
+    }
+    # Flags per subcommand (empty dict = no flag completion for it).
+    SCOPE_SEARCH_FLAGS = {
+        "--platform": "all|h1|intigriti|bugcrowd (default all)",
+        "--assets": "load manifests: asset + bounty summary (top 3)",
+        "--handle": "exact handle — required for the bugcrowd probe lane",
+        "--refresh": "force fresh manifest fetch (with --assets)",
+        "--limit": "max matches per lane (default 10)",
+        "--json": "print the raw result dict",
+    }
+    SCOPE_ON_FLAGS = {
+        "--platform": "h1|bugcrowd|intigriti (default h1)",
+        "--no-strict": "unconfirmed targets warn instead of refuse",
+    }
 
     def __init__(self, manifests: List[ToolManifest]):
         self.manifests = manifests
@@ -102,6 +129,41 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
                             display_meta=m.transport.value,
                         )
                 return
+
+        # ── Tier 2.5: ``scope`` subcommands + their flags ─────────────────
+        # The operator-only gate surface gets the same schema-aware
+        # completion the tool layer has — subcommand word, then --flags.
+        if cmd == "scope":
+            if len(parts) == 1 or (len(parts) == 2 and not ends_space):
+                word = parts[1] if len(parts) > 1 else ""
+                for sub in sorted(self.SCOPE_SUBCOMMANDS):
+                    if sub.startswith(word):
+                        yield Completion(
+                            sub, start_position=-len(word),
+                            display_meta=self.SCOPE_SUBCOMMANDS[sub],
+                        )
+                return
+            sub = parts[1].lower()
+            current = "" if ends_space else parts[-1]
+            flags = (self.SCOPE_SEARCH_FLAGS if sub == "search"
+                     else self.SCOPE_ON_FLAGS if sub == "on" else {})
+            if flags and current.startswith("--"):
+                # Auto-complete flag name as the user types --
+                flag_word = current[2:]
+                for flag in sorted(flags):
+                    if flag[2:].startswith(flag_word):
+                        yield Completion(
+                            flag, start_position=-len(current),
+                            display_meta=flags[flag],
+                        )
+                return
+            if flags and ends_space and complete_event.completion_requested:
+                # Tab after a space → show all flags for this subcommand
+                for flag in sorted(flags):
+                    yield Completion(flag, start_position=0,
+                                     display_meta=flags[flag])
+                return
+            return
 
         # ── Tier 3: --flag names after a tool_id in ``run`` ────────────────
         if cmd == "run" and len(parts) >= 2:
@@ -410,7 +472,7 @@ Tool REPL commands:
                          Arm the packet-scope gate (send_packet refuses
                          out-of-scope destinations; operator-only, not exposed
                          to the agent). 'scope off' disarms (lab mode).
-  scope status|off|add-ip <ip> [<hostname>]|rm-ip <ip>|list-ips
+  scope status|off|add-ip <ip> [<hostname>]|rm-ip <ip>|list-ips|search <kw> [--assets]
   help                   This message
   quit / exit            Leave the REPL
 
@@ -462,6 +524,7 @@ def _scope_command(rest: str):
         print("    scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]")
         print("    scope off")
         print("    scope status")
+        print("    scope search <kw> [--assets]  (query the boards: matching programs + bounty-relevant stats)")
         print("    scope add-ip <ip> [<hostname>]   (bless a resolved in-scope IP)")
         print("    scope rm-ip <ip>")
         print("    scope list-ips")
@@ -504,6 +567,98 @@ def _scope_command(rest: str):
 
     elif sub == "status":
         res = scope_gate.status()
+
+    elif sub == "search":
+        # Board-wide program search (discovery): keyword over the H1/Intigriti
+        # program indexes, exact-handle probe for Bugcrowd.  NOT a search of
+        # the armed manifest — that's what check_scope is for.
+        query = ""
+        handle = ""
+        platform = "all"
+        limit = 10
+        with_assets = False
+        refresh = False
+        as_json = False
+        # Positional-tolerant parse: the keyword may come before or after the
+        # flags (Tab-complete inserts --flags mid-line), extra positional
+        # tokens join the keyword (multi-word program names).
+        tokens = parts[1:]
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--assets":
+                with_assets = True
+            elif tok == "--refresh":
+                refresh = True
+            elif tok == "--json":
+                as_json = True
+            elif tok.startswith("--limit="):
+                limit = int(tok.split("=", 1)[1])
+            elif tok == "--limit" and i + 1 < len(tokens):
+                i += 1
+                limit = int(tokens[i])
+            elif tok.startswith("--handle="):
+                handle = tok.split("=", 1)[1]
+            elif tok == "--handle" and i + 1 < len(tokens):
+                i += 1
+                handle = tokens[i]
+            elif tok.startswith("--platform="):
+                platform = tok.split("=", 1)[1]
+            elif tok == "--platform" and i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                platform = tokens[i]
+            elif tok.startswith("--"):
+                print(f"  Ignoring unknown flag: {tok}")
+            elif not query:
+                query = tok
+            else:
+                query = f"{query} {tok}"  # multi-word keyword
+            i += 1
+        if not query and not handle:
+            print("  Usage: scope search <query> [--platform all|h1|intigriti|bugcrowd] [--assets]")
+            print("                            [--handle <h>] [--refresh] [--limit N] [--json]")
+            return
+        from auxiliaries import program_scope
+        res = program_scope.search_programs(query=query, platform=platform, limit=limit,
+                                            with_assets=with_assets, handle=handle,
+                                            refresh=refresh)
+        if as_json:
+            print("  " + json.dumps(res, indent=2, default=str))
+            return
+        if not res.get("rows"):
+            err = res.get("error") or res.get("lane_errors") or "no match"
+            print("  scope search: " + (err if isinstance(err, str) else json.dumps(err)))
+            return
+        for r in res["rows"]:
+            bounty = r.get("bounty")
+            btxt = (("bounties=yes" if bounty else "bounties=no")
+                    if isinstance(bounty, bool) else str(bounty or ""))
+            state = f" state={r['state']}" if r.get("state") else ""
+            name = r.get("name") or "?"
+            print(f"  {r['platform']:<9} | {str(r.get('handle') or '?'):<24} | {name} | {btxt}{state}")
+        for lane, err in (res.get("lane_errors") or {}).items():
+            print(f"  [{lane}] {err}")
+        if res.get("lane_truncated"):
+            print("  (index truncated at the page cap — refine the query)")
+        for key, a in (res.get("assets") or {}).items():
+            if not isinstance(a, dict) or a.get("error"):
+                print(f"  == {key}: {a.get('error') if isinstance(a, dict) else a}")
+                continue
+            counts = a.get("counts") or {}
+            bs = a.get("bounty_stats") or {}
+            print(f"  == {key} — {a.get('program_name') or ''}: "
+                  f"{counts.get('in_scope', 0)} in-scope, "
+                  f"{counts.get('out_of_scope_assets', 0)} OOS, "
+                  f"bounty-eligible {bs.get('bounty_eligible_in_scope', 0)} / "
+                  f"no-bounty {bs.get('no_bounty_in_scope', 0)}")
+            for row in a.get("assets") or []:
+                flag = "bounty" if row.get("eligible_for_bounty") else "no-bounty"
+                print(f"     {str(row.get('asset_type') or '?'):<9} "
+                      f"{str(row.get('asset_identifier') or ''):<44} {flag:<9} "
+                      f"{row.get('detail') or ''}")
+            if a.get("assets_truncated"):
+                print("     ... (asset rows truncated)")
+        return
 
     elif sub in ("add-ip", "add_ip", "add"):
         if len(parts) < 2:

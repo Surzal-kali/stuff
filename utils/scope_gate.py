@@ -46,15 +46,26 @@ wins (out-of-scope always wins over an in-scope wildcard, mirroring
 2. **Manifest match** — :func:`auxiliaries.program_scope._find_match` against
    in-scope assets (DOMAIN/WILDCARD/URL for a hostname, CIDR/IP for an IP).
 3. **Reverse-DNS attribution** (IPs only) — PTR-lookup and match the
-   resulting hostname(s) against the manifest.  CDN-hosted assets commonly
-   PTR to the CDN, not the program domain, so this can false-negative; the
-   operator falls back to tier 1 (``scope add-ip``) for those.
+   resulting hostname(s) against the manifest.  Tier 3 (PTR) is unverified,
+   attacker-settable attribution; acceptance requires forward-confirmation
+   (the PTR name must resolve back to the same IP).  CDN-hosted assets
+   commonly PTR to the CDN, not the program domain, so this can
+   false-negative; the operator falls back to tier 1 (``scope add-ip``) for
+   those.
 
 Broad ranges (CIDR wider than /32, hyphen-ranges) can't be reliably
 attributed host-by-host, so when armed they are allowed ONLY if the network
 is a subnet of an explicit in-scope CIDR asset; otherwise they are refused
 (broad subnet scanning is not a bug-bounty pattern — disarm for lab /
 internal-network work).
+
+Known limits
+------------
+The gate sees the REQUESTED target only — redirect-following (``ffuf -r``,
+ZAP spider) and DNS-resolver traffic are out of its view.  amass /
+subdomain_enum are program_scope-gated separately.  PTR tier-3 is
+unverified, attacker-settable attribution; acceptance requires
+forward-confirmation (the PTR name must resolve back to the same IP).
 
 If no tier confirms in-scope and ``strict`` is True (default), the action
 is REFUSED with guidance ("nada").  ``strict=False`` allows with a warning.
@@ -73,7 +84,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-_STATE_PATH = Path(os.getenv("WORKSPACE_ROOT", ".")) / "scope" / ".armed_packet_scope.json"
+def _state_path() -> Path:
+    """Resolve the armed-state file path at CALL time, not import time
+    (matches program_scope's call-time ``os.getenv`` convention): a
+    ``WORKSPACE_ROOT`` set after import still takes effect, and tests can
+    redirect the state file per-call."""
+    return Path(os.getenv("WORKSPACE_ROOT", ".")) / "scope" / ".armed_packet_scope.json"
 
 
 class ScopeGateError(Exception):
@@ -101,9 +117,15 @@ _CACHE: Dict[str, Any] = {"mtime": None, "state": None}
 # --------------------------------------------------------------------------- #
 
 def _write_state(state: Dict[str, Any]) -> None:
-    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _STATE_PATH.write_text(json.dumps(state, indent=2))
-    _CACHE["mtime"] = _STATE_PATH.stat().st_mtime
+    """Atomic state write: stage to a ``.tmp`` sibling then ``os.replace``,
+    so a crash mid-write can never leave a truncated / half-armed state file
+    (a torn state file would parse as disarmed — fail-open)."""
+    p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, p)
+    _CACHE["mtime"] = p.stat().st_mtime
     _CACHE["state"] = state
 
 
@@ -113,18 +135,19 @@ def _load_state() -> Optional[Dict[str, Any]]:
     Mtime-checked so a REPL write is picked up by a separate process (Brain)
     on the very next call without a stale in-memory copy.
     """
-    if not _STATE_PATH.is_file():
+    p = _state_path()
+    if not p.is_file():
         _CACHE["mtime"] = None
         _CACHE["state"] = None
         return None
     try:
-        mtime = _STATE_PATH.stat().st_mtime
+        mtime = p.stat().st_mtime
     except OSError:
         return None
     if _CACHE["mtime"] == mtime and _CACHE["state"] is not None:
         return _CACHE["state"]
     try:
-        state = json.loads(_STATE_PATH.read_text())
+        state = json.loads(p.read_text())
     except (OSError, json.JSONDecodeError):
         return None
     _CACHE["mtime"] = mtime
@@ -161,19 +184,22 @@ def _is_cidr(s: str) -> bool:
         return False
 
 
-def _is_hyphen_range(s: str) -> bool:
-    """nmap/masscan 'a.b.c.d-50' or 'a.b.c.d-a.b.c.e' style ranges."""
-    if "-" not in s or "/" in s or "://" in s:
+def _is_hyphen_range(text: str) -> bool:
+    """nmap/masscan numeric ranges only — both sides of the last dash must
+    be numeric-shaped ('10.0.0.1-50', '10.0.0.1-10.0.0.25', '1-50').  Real
+    nmap ranges are numeric on both sides, so hostnames with digit-hyphen-
+    digit shapes ('co-uk', 's3-2024.example.com', 'wordpress-2024.example.com')
+    stop false-matching and fall through to hostname matching.  Octet-range
+    forms ('10.0.0-255.1-254') also fall through → unmatched → refused
+    (strict) — same end state as the previous broad-refuse, while hostname
+    misrefusals are fixed."""
+    if "-" not in text:
         return False
-    # Must look numeric-ish on both sides of the (last) dash; reject obvious
-    # hostnames like 'co-uk' by requiring digits around the dash.
-    parts = s.rsplit("-", 1)
-    if len(parts) != 2:
-        return False
-    left, right = parts
-    return bool(re.search(r"\d", left)) and (
-        right.isdigit() or re.search(r"\d", right)
-    )
+    left, _, right = text.rpartition("-")
+    left_v4  = left.count(".") == 3 and all(p.isdigit() for p in left.split("."))
+    right_v4 = right.count(".") == 3 and all(p.isdigit() for p in right.split("."))
+    return (left_v4 and right_v4) or (left_v4 and right.isdigit()) \
+        or (left.isdigit() and right.isdigit())
 
 
 def _reverse_dns(ip: str, timeout: float = 2.0) -> List[str]:
@@ -188,6 +214,22 @@ def _reverse_dns(ip: str, timeout: float = 2.0) -> List[str]:
         return [n for n in names if n]
     except Exception:
         return []
+
+
+def _forward_confirm(host: str, ip: str, timeout: float = 2.0) -> bool:
+    """Forward-confirm a PTR hostname back to ``ip`` (tier-3 acceptance).
+
+    PTR records are attacker-settable, so an in-scope PTR name may only
+    auto-allow when its A record resolves to the same IP that was scanned.
+    Capped at ``timeout`` like :func:`_reverse_dns` so a slow/broken resolver
+    never pins a scan; any failure → False (no auto-allow, fail-closed).
+    """
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(socket.gethostbyname, host)
+            return fut.result(timeout=timeout) == ip
+    except Exception:
+        return False
 
 
 def _is_gated_target(ip: str) -> bool:
@@ -260,13 +302,22 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
     if _find_match(checkable, in_assets):
         return True, f"{checkable} matches an in-scope asset"
 
-    # Tier 3: reverse-DNS attribution (IPs only).
+    # Tier 3: reverse-DNS attribution (IPs only).  PTR records are unverified,
+    # attacker-settable data: an in-scope PTR name is accepted only after it
+    # forward-confirms back to the same IP.  An out-of-scope PTR match still
+    # refuses (fail-closed).
     if _is_ip(checkable):
         for host in _reverse_dns(checkable):
             if _find_match(host, out_assets):
                 return False, f"reverse-DNS {host} (for {checkable}) matches an out-of-scope asset; refused"
             if _find_match(host, in_assets):
-                return True, f"reverse-DNS {host} (for {checkable}) matches an in-scope asset"
+                if _forward_confirm(host, checkable):
+                    return True, (
+                        f"reverse-DNS {host} (for {checkable}) matches an "
+                        f"in-scope asset (forward-confirmed)"
+                    )
+                # PTR does not confirm — treat as no tier-3 match; falls
+                # through to the normal verdict (refuse in strict mode).
 
     # Unconfirmed.
     if strict:
@@ -437,11 +488,12 @@ def arm(handle: str, platform: str = "h1", strict: bool = True) -> Dict[str, Any
     if not handle:
         return {"ok": False, "error": "handle is required: scope on <handle> [--platform ...]"}
 
-    from auxiliaries.program_scope import _load_cache, load_program_scope
-
-    manifest = _load_cache(handle, platform)
+    manifest = _load_manifest(handle, platform)   # test-overridable seam
     if manifest is None:
-        manifest = load_program_scope(handle, refresh=False, platform=platform)
+        from auxiliaries.program_scope import _load_cache, load_program_scope
+        manifest = _load_cache(handle, platform)
+        if manifest is None:
+            manifest = load_program_scope(handle, refresh=False, platform=platform)
     if not manifest or (
         isinstance(manifest, dict)
         and manifest.get("status") == "error"
@@ -481,9 +533,10 @@ def arm(handle: str, platform: str = "h1", strict: bool = True) -> Dict[str, Any
 
 def disarm() -> Dict[str, Any]:
     """Disarm the gate (lab mode — tools unrestricted)."""
-    if _STATE_PATH.exists():
+    p = _state_path()
+    if p.exists():
         try:
-            _STATE_PATH.unlink()
+            p.unlink()
         except OSError:
             pass
     _CACHE["mtime"] = None
@@ -554,6 +607,16 @@ def status() -> Dict[str, Any]:
     if manifest:
         out["in_scope_assets"] = len(manifest.get("in_scope", []))
         out["out_of_scope_assets"] = len(manifest.get("out_of_scope_assets", []))
+        # Manifest age: how stale the cached scope data behind this verdict
+        # is (same cache file _load_cache reads for this handle/platform).
+        try:
+            from auxiliaries.program_scope import _scope_cache_path
+            mp = _scope_cache_path(state.get("handle", ""), state.get("platform", "h1"))
+            out["manifest_age_s"] = (
+                int(time.time() - mp.stat().st_mtime) if mp.exists() else None
+            )
+        except OSError:
+            out["manifest_age_s"] = None
     return out
 
 

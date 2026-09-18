@@ -965,3 +965,124 @@ def test_get_scan_config_username_placeholder_unresolved(monkeypatch, tmp_path):
     assert "{Username}" in cfg["headers"]["X-Intigriti-Username"]
     # But <standard browser/tool user agent> IS still replaced
     assert "Mozilla/5.0" in cfg["headers"]["User-Agent"]
+
+
+# --- search_programs (board-wide program discovery) -------------------------
+
+def _h1_index_page(progs):
+    """Shape an H1 /hackers/programs index page from (handle, name, bounties)."""
+    return {"data": [{"id": str(i), "type": "program",
+                      "attributes": {"handle": h, "name": n,
+                                     "offers_bounties": b,
+                                     "submission_state": "open"}}
+                     for i, (h, n, b) in enumerate(progs)],
+            "links": {}}
+
+
+def test_search_programs_h1_client_side_match(monkeypatch):
+    """Keyword match is client-side over the paged index; rows shape cleanly."""
+    pages = {1: _h1_index_page([("acme", "Acme Corp", True),
+                                 ("other", "Other Inc", False)])}
+
+    def fake_get(path, params=None, auth=...):
+        assert path == "/hackers/programs"
+        return 200, pages[params["page[number]"]]
+
+    monkeypatch.setattr(ps, "_h1_auth", lambda: (("u", "t"), True))
+    monkeypatch.setattr(ps, "_get", fake_get)
+    res = ps.search_programs("acme", platform="h1")
+    assert res["ok"] and len(res["rows"]) == 1
+    row = res["rows"][0]
+    assert (row["platform"], row["handle"], row["bounty"], row["state"]) == \
+        ("h1", "acme", True, "open")
+
+
+def test_search_programs_h1_requires_auth(monkeypatch):
+    monkeypatch.setattr(ps, "_h1_auth", lambda: (None, False))
+    res = ps.search_programs("x", platform="h1")
+    assert not res["ok"] and "auth_required" in res["lane_errors"]["h1"]
+
+
+def test_search_programs_intigriti_requires_pat(monkeypatch):
+    monkeypatch.setattr(ps, "_inti_auth", lambda: None)
+    res = ps.search_programs("x", platform="intigriti")
+    assert not res["ok"] and "auth_required" in res["lane_errors"]["intigriti"]
+
+
+def test_search_programs_intigriti_matches(monkeypatch):
+    monkeypatch.setattr(ps, "_inti_auth", lambda: "pat")
+
+    def fake_inti(path, *, params=None):
+        assert path == "/v1/programs"
+        return 200, {"records": [
+            {"handle": "adobe", "id": "guid-1", "name": "Adobe",
+             "status": {"value": "published"}},
+            {"handle": "zzz", "id": "guid-2", "name": "Zeta",
+             "status": {"value": "published"}},
+        ], "maxCount": 2}
+
+    monkeypatch.setattr(ps, "_inti_get", fake_inti)
+    res = ps.search_programs("adobe", platform="intigriti")
+    assert res["ok"] and res["rows"][0]["handle"] == "adobe"
+    assert res["rows"][0]["state"] == "published"
+
+
+def test_search_programs_bugcrowd_needs_exact_handle():
+    res = ps.search_programs("x", platform="bugcrowd")
+    assert not res["ok"] and "no public program-list" in res["error"]
+
+
+def test_search_programs_bugcrowd_probe(monkeypatch):
+    monkeypatch.setattr(ps, "_bc_fetch_engagement_page",
+                        lambda h: (200, "<html><title>Acme Public — Bugcrowd</title></html>"))
+    res = ps.search_programs(query="", platform="bugcrowd", handle="acme")
+    assert res["ok"] and res["rows"][0]["platform"] == "bugcrowd"
+    assert "Acme" in res["rows"][0]["name"]
+
+
+def test_search_programs_all_merges_lanes_and_survives_lane_errors(monkeypatch):
+    """platform=all merges live lanes; one lane's auth error is non-fatal."""
+    monkeypatch.setattr(ps, "_h1_auth", lambda: (None, False))  # h1 lane errors
+    monkeypatch.setattr(ps, "_inti_auth", lambda: "pat")
+    monkeypatch.setattr(ps, "_inti_get", lambda path, *, params=None: (
+        200, {"records": [{"handle": "acme", "id": "g1", "name": "Acme"}],
+              "maxCount": 1}))
+    res = ps.search_programs("acme", platform="all")
+    assert res["ok"] and len(res["rows"]) == 1
+    assert "h1" in res["lane_errors"]
+    assert res["rows"][0]["platform"] == "intigriti"
+
+
+def test_search_programs_with_assets_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(ps, "_h1_auth", lambda: (("u", "t"), True))
+    monkeypatch.setattr(ps, "_get", lambda path, params=None, auth=...: (
+        200, _h1_index_page([("acme", "Acme Corp", True)])))
+    monkeypatch.setattr(ps, "_inti_auth", lambda: None)  # lane error, non-fatal
+
+    def fake_load(handle, refresh=False, platform="h1"):
+        assert (handle, platform) == ("acme", "h1")
+        return {"handle": handle, "platform": platform, "status": "ok",
+                "program_name": "Acme",
+                "in_scope": [
+                    {"asset_type": "WILDCARD", "asset_identifier": "*.acme.com",
+                     "eligible_for_bounty": True, "max_severity": "critical"},
+                    {"asset_type": "DOMAIN", "asset_identifier": "acme.com",
+                     "eligible_for_bounty": False, "max_severity": None},
+                ],
+                "out_of_scope_assets": []}
+
+    monkeypatch.setattr(ps, "load_program_scope", fake_load)
+    res = ps.search_programs("acme", platform="all", with_assets=True)
+    assert res["ok"]
+    a = res["assets"]["h1/acme"]
+    assert a["counts"]["in_scope"] == 2
+    assert a["bounty_stats"]["bounty_eligible_in_scope"] == 1
+    assert a["bounty_stats"]["detail_histogram"]["critical"] == 1
+    assert a["assets"][0]["asset_identifier"] == "*.acme.com"
+    assert res["lane_errors"]["intigriti"].startswith("auth_required")
+
+
+def test_search_programs_unknown_platform():
+    res = ps.search_programs("x", platform="nope")
+    assert not res["ok"] and "unknown platform" in res["error"]
