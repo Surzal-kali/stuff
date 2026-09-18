@@ -41,3 +41,4 @@ WIP_*.*
 # version-controlled and future drift shows up in git diffs.
 *.txt
 !requirements.txt
+todo.md
