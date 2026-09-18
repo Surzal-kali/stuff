@@ -34,6 +34,109 @@ from constants import TransportType
 from daharness.models import ToolManifest
 from daharness.registry import ToolRegistry
 
+# ── Rich input (prompt_toolkit) — ghost text + context-aware autocomplete ───
+# Falls back to plain input() when prompt_toolkit isn't installed. Ghost text
+# (grayed inline suggestion) appears for single prefix-match completions; Tab
+# opens the full dropdown.  IPython's own Jedi completions are wired in via
+# the ``ipython`` command (full Python introspection shell with preloaded
+# manifests / registry).
+_PROMPT_TOOLKIT = False
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import FileHistory
+    _PROMPT_TOOLKIT = True
+except ImportError:
+    pass
+
+
+class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
+    """Context-aware completer for the tool REPL.
+
+    Completion tiers:
+      1. First word  → REPL commands (run, list, info, …)
+      2. After a tool-accepting command → discovered tool IDs (from manifests)
+      3. After a tool_id in ``run`` → ``--flag`` names from the tool's schema
+
+    Ghost text (grayed inline suggestion) is shown for single prefix-match
+    completions; Tab opens the multi-match dropdown.
+    """
+
+    COMMANDS = [
+        "list", "run", "info", "resolve", "sweep", "search",
+        "safe-args", "reindex", "help", "quit", "exit", "ipython",
+    ]
+    # Commands whose first argument is a tool_id.
+    TOOL_COMMANDS = {"run", "info", "resolve", "safe-args"}
+
+    def __init__(self, manifests: List[ToolManifest]):
+        self.manifests = manifests
+
+    def refresh(self, manifests: List[ToolManifest]) -> None:
+        self.manifests = manifests
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        parts = text.split()
+        ends_space = text.endswith(" ")
+
+        # ── Tier 1: command name ──────────────────────────────────────────
+        if not parts or (len(parts) == 1 and not ends_space):
+            word = parts[0] if parts else ""
+            for c in sorted(self.COMMANDS):
+                if c.startswith(word):
+                    yield Completion(c, start_position=-len(word))
+            return
+
+        cmd = parts[0].lower()
+
+        # ── Tier 2: tool_id after a tool-accepting command ─────────────────
+        if cmd in self.TOOL_COMMANDS:
+            if len(parts) == 1 or (len(parts) == 2 and not ends_space):
+                word = parts[1] if len(parts) > 1 else ""
+                for m in sorted(self.manifests, key=lambda m: m.module_id):
+                    if word.lower() in m.module_id.lower():
+                        yield Completion(
+                            m.module_id, start_position=-len(word),
+                            display_meta=m.transport.value,
+                        )
+                return
+
+        # ── Tier 3: --flag names after a tool_id in ``run`` ────────────────
+        if cmd == "run" and len(parts) >= 2:
+            tool_id = parts[1]
+            manifest = next(
+                (m for m in self.manifests if m.module_id == tool_id), None
+            )
+            if not manifest or not manifest.parameters:
+                return
+            props = manifest.parameters.get("properties", {})
+            current = "" if ends_space else parts[-1]
+
+            if current.startswith("--"):
+                # Auto-complete flag name as user types --
+                flag_word = current[2:]
+                no_mode = flag_word.startswith("no-")
+                check = flag_word[3:] if no_mode else flag_word
+                for pname in sorted(props):
+                    if not check or pname.startswith(check):
+                        ptype = props[pname].get("type", "string")
+                        pdesc = (props[pname].get("description") or "")[:60]
+                        label = f"--no-{pname}" if no_mode else f"--{pname}"
+                        yield Completion(
+                            label, start_position=-len(current),
+                            display_meta=f"{ptype}  {pdesc}",
+                        )
+            elif ends_space and complete_event.completion_requested:
+                # Tab after a space → show all available flags for this tool
+                for pname in sorted(props):
+                    ptype = props[pname].get("type", "string")
+                    pdesc = (props[pname].get("description") or "")[:60]
+                    yield Completion(
+                        f"--{pname}", start_position=0,
+                        display_meta=f"{ptype}  {pdesc}",
+                    )
+
 
 # ── Safe defaults for sweep mode ────────────────────────────────────────────
 # These are TEST VALUES, not schema — the schema lives in the manifests.
@@ -300,6 +403,7 @@ Tool REPL commands:
   sweep [--safe|--force] Run all tools with safe defaults
   safe-args [tool_id]    Show safe-sweep args for a tool (or all)
   reindex                Re-discover tools
+  ipython                Drop into IPython with tools preloaded (Jedi completions)
   help                   This message
   quit / exit            Leave the REPL
 
@@ -334,9 +438,27 @@ def _find_manifest(tool_id: str, manifests: List[ToolManifest]) -> Optional[Tool
 async def repl_loop(manifests: List[ToolManifest]):
     """Interactive REPL loop."""
     repl_help()
+
+    # Rich input: ghost text + context-aware autocomplete via prompt_toolkit.
+    # Falls back to plain input() when the library isn't available.
+    session = None
+    completer = None
+    if _PROMPT_TOOLKIT:
+        completer = ToolReplCompleter(manifests)
+        session = PromptSession(
+            completer=completer,
+            complete_while_typing=True,
+            history=FileHistory(str(Path.home() / ".tool_repl_history")),
+        )
+
+    async def _read_line() -> str:
+        if session is not None:
+            return await session.prompt_async("\nrepl> ")
+        return input("\nrepl> ")
+
     while True:
         try:
-            line = input("\nrepl> ").strip()
+            line = (await _read_line()).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -479,7 +601,30 @@ async def repl_loop(manifests: List[ToolManifest]):
 
         elif cmd == "reindex":
             manifests = discover_tools()
+            if completer is not None:
+                completer.refresh(manifests)
             print(f"  Re-discovered {len(manifests)} tools.")
+
+        elif cmd == "ipython":
+            try:
+                from IPython import embed
+                user_ns = {
+                    "manifests": manifests,
+                    "registry": _make_executor(),
+                    "run_tool": run_tool,
+                    "discover_tools": discover_tools,
+                    "resolve_callable": resolve_callable,
+                    "ToolManifest": ToolManifest,
+                    "ToolRegistry": ToolRegistry,
+                }
+                print("  Dropping into IPython (Jedi completions + rich display).")
+                print("  Available: manifests, registry, run_tool, discover_tools,")
+                print("             resolve_callable, ToolManifest, ToolRegistry")
+                print("  run_tool is async:  await run_tool(id, args, manifests)")
+                print("  Ctrl+D / exit() to return.\n")
+                embed(user_ns=user_ns, header="")
+            except ImportError:
+                print("  IPython not installed. Install with: pip install ipython")
 
         else:
             print(f"  Unknown command: {cmd}. Type 'help' for commands.")
