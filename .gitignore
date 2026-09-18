@@ -1,41 +1,43 @@
-*/__pycache__/
+# --- bytecode / build artifacts ---
 __pycache__/
-__pycache__/*
-*.so
-WIP_*.*
-ids.db
-*.pem
-*.cpython-*-
-*.so
-__pycache__/*.pyc
-__pycache__/*.pyo
 *.pyc
 *.pyo
-__pycache__/*
-/listeners/__pycache__/*
+*.so
 *.exe
-__pycache__/webserver.cpython-313.pyc
-__pycache__/webserver.cpython-313.pyc
-.env
+
+# --- runtime state / local data (deliberately untracked) ---
+ids.db
 *.sqlite3
 *.memory/
-tests/__pycache__/*
-*.txt
 chroma-data/
-payloads/__pycache__/
-listeners/__pycache__/
-daharness/__pycache__/
 .zap_home/
 findings_md/
+scope/
+*.scope
 /binaries/*
 !/binaries/.gitkeep
 !/binaries/README.md
-*.scope
-scope/
-framework.env
 bugcheck_ledger.md
-briefs/*
 ledger_archive/*
-
+briefs/*
 docs/*
+
+# --- secrets / env ---
+.env
+framework.env
+*.pem
 dockered/.webui_secret_key
+
+# --- local scratch ---
+WIP_*.*
+
+# --- editor droppings ---
+*.swp
+.*.swp
+
+# --- dependency lockfiles ---
+# requirements.md is the tracked canonical freeze; requirements.txt is a
+# synced byte-identical mirror. The exception un-ignores it so the mirror is
+# version-controlled and future drift shows up in git diffs.
+*.txt
+!requirements.txt
