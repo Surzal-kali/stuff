@@ -1,4 +1,4 @@
-# TODO — Framework Next Steps (updated Sept 15, 2026)
+# TODO — Framework Next Steps (updated Sept 18, 2026)
 
 > After adding ANY new tool: re-run bootstrap/reindex so the registry embeds it —
 > undiscovered tools are invisible to the secretary (see memory_tools lesson).

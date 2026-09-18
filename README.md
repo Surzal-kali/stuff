@@ -156,7 +156,8 @@ is in your `PATH`.
 
 ### OWASP ZAP
 
-1. Install ZAP (e.g. `sudo apt install zap` or download from the official
+1. Install ZAP (`sudo apt install zaproxy` on Debian/Ubuntu/Kali — the plain
+   `zap` package name does not resolve — or download from the official
    site).
 2. Ensure the `zap` binary is in your PATH or at `/usr/share/zap/zap.sh`.
 3. The framework launches ZAP in `-daemon` mode (loopback-only API) and
@@ -447,6 +448,7 @@ daharness/              Tool secretary agent + semantic registry (core package)
   executor.py           Standalone execution helpers
   findings.py           SQLite-backed findings store (FindingStore)
   models.py             ToolManifest + Finding pydantic models
+  _param_docs.py        Parameter-docstring introspection for tool manifests
   core.py               Backwards-compat shim / CLI entry point
 constants.py            @framework_tool decorator + TransportType enum
 bootstrap.py            Daemon entry point; launches all sidecars (Brain, ZAP, MSF MCP, API)

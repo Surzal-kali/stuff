@@ -42,6 +42,9 @@ The `daharness/` package splits imports across focused modules:
 - `daharness.executor` — standalone execution helpers (no ChromaDB client)
 - `daharness.registry` — `ToolRegistry`, `OllamaEmbeddingFunction`, discovery
 - `daharness.models` — `ToolManifest`
+- `daharness._param_docs` — parameter introspection for `@framework_tool`
+  discovery (Google/NumPy-style docstring `Args:` sections + type annotations
+  feed the manifest's parameter schema)
 
 ### Tool Discovery (`daharness/registry.py:discover_local_tools`)
 

@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any
 import socket
 import time
+
+# --- Python version guard ----------------------------------------------------
+# Refuse to boot on unsupported interpreters with a clear message instead of a
+# mid-import syntax/dependency error.
+MIN_PYTHON = (3, 12)
+if sys.version_info < MIN_PYTHON:
+    sys.stderr.write(
+        f"[bootstrap] Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required "
+        f"(found {sys.version.split()[0]}). Exiting.\n"
+    )
+    sys.exit(1)
+
 from daharness import _chat, ToolRegistry, OllamaEmbeddingFunction
 
 # --- .env loading (sudo-safe) ------------------------------------------------
