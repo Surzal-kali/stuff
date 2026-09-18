@@ -126,8 +126,7 @@ pybase64==1.5.0
 pycparser==3.0
 pycryptodomex==3.23.0
 pydantic==2.13.4
-pydantic-ai==2.35.0
-pydantic-ai-slim==2.35.0
+pydantic-ai-slim[openai]==2.35.0
 pydantic-evals==2.35.0
 pydantic-graph==2.35.0
 pydantic-settings==2.15.0
