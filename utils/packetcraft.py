@@ -17,8 +17,11 @@ Design notes
 * ``send``/``sniff`` need root (raw sockets); craft/dissect do not.  Craft and
   dissection tools are therefore safe to call unprivileged and are the common
   path; send/sniff will simply error if the Brain worker isn't root.
-* The capture interface defaults to ``PACKETCRAFT_INTERFACE`` (env) or
-  ``enp92s0`` and can be overridden per-call on the send/sniff tools.
+* The capture/send interface defaults to ``PACKET_CRAFT`` (env, loaded via
+  loaddotenv) or ``enp92s0``, resolved per-call (not at import) so .env edits
+  take effect without re-import.  Every packet tool takes an ``interface``
+  parameter; craft tools accept it for schema uniformity but ignore it
+  (crafting never touches the wire).
 """
 
 import os
@@ -37,7 +40,20 @@ from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
 
 from constants import framework_tool
 
-TARGET_INTERFACE = os.getenv("PACKETCRAFT_INTERFACE", "enp92s0")
+# Default capture/send interface for the packet tools.  Env name is
+# PACKET_CRAFT (set in .env; loaded by loaddotenv at stack boot).  Resolved
+# at call time via _default_interface() so .env edits apply without re-import.
+PACKET_INTERFACE_ENV = "PACKET_CRAFT"
+DEFAULT_INTERFACE = "enp92s0"
+
+
+def _default_interface() -> str:
+    """Resolve the default packet interface at call time.
+
+    Precedence: ``PACKET_CRAFT`` (env, set in .env) -> ``DEFAULT_INTERFACE``.
+    Read per-call instead of at import so loaddotenv/.env edits take effect.
+    """
+    return os.getenv(PACKET_INTERFACE_ENV) or DEFAULT_INTERFACE
 #[ ]TODO:  Needs to take advantage of poor cryptography, it's just sitting there {muy importante now that its on mcp}
 
 
@@ -48,11 +64,14 @@ TARGET_INTERFACE = os.getenv("PACKETCRAFT_INTERFACE", "enp92s0")
 _craft_instance: "PacketCraft | None" = None
 
 
-def _craft(interface: str | None = None) -> "PacketCraft":
-    """Return the shared PacketCraft engine, bound to ``interface`` if given."""
+def _craft(interface: str = "") -> "PacketCraft":
+    """Return the shared PacketCraft engine, bound to ``interface`` if given
+    (empty string = the ``PACKET_CRAFT``/``DEFAULT_INTERFACE`` default).
+    Rebinds only when the requested interface differs from the bound one."""
     global _craft_instance
-    if _craft_instance is None or interface is not None:
-        _craft_instance = PacketCraft(interface or TARGET_INTERFACE)
+    iface = interface or _default_interface()
+    if _craft_instance is None or _craft_instance.interface != iface:
+        _craft_instance = PacketCraft(iface)
     return _craft_instance
 
 
@@ -125,14 +144,19 @@ class PacketUtils:
         raw_bytes = bytes.fromhex(hex_string)
         return Ether(raw_bytes) if raw_bytes.startswith(b'\x00\x00') else IP(raw_bytes)
 
-    def wait_for_packet(self, filter: str = "", timeout: int = 30) -> scapy.Packet | None:
-        """Wait for a packet matching the filter."""
-        packets = sniff(iface=TARGET_INTERFACE, filter=filter, count=1, timeout=timeout)
+    def wait_for_packet(self, filter: str = "", timeout: int = 30, interface: str = "") -> scapy.Packet | None:
+        """Wait for a packet matching the filter.
+
+        ``interface`` (empty = PACKET_CRAFT env / DEFAULT_INTERFACE) was
+        previously ignored here — this method sniffed the module-global
+        default no matter what the caller passed.  Now honoured.
+        """
+        packets = sniff(iface=interface or _default_interface(), filter=filter, count=1, timeout=timeout)
         return packets[0] if packets else None
 
 class PacketCraft:
-    def __init__(self, interface: str = TARGET_INTERFACE):
-        self.interface = interface
+    def __init__(self, interface: str = ""):
+        self.interface = interface or _default_interface()
         self.utils = PacketUtils()
 
     def icmp_echo_request(self, src_ip: str, dst_ip: str, payload: bytes = b"") -> scapy.Packet:
@@ -284,13 +308,14 @@ class PacketCraft:
     "to send_packet, dissect_packet, or modify_packet.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_icmp_echo(src_ip: str, dst_ip: str, payload: str = ""):
+def craft_icmp_echo(src_ip: str, dst_ip: str, payload: str = "", interface: str = ""):
     """Craft an ICMP Echo Request (type 8) packet.
 
     Args:
         src_ip: Source IP address.
         dst_ip: Destination IP address.
         payload: Optional payload text (encoded to bytes).
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().icmp_echo_request(src_ip, dst_ip, _payload_bytes(payload))
     return _craft_result(pkt)
@@ -301,13 +326,14 @@ def craft_icmp_echo(src_ip: str, dst_ip: str, payload: str = ""):
     "Returns the packet hex.",
     next_hints=["send_packet with the returned hex", "modify_packet to set ICMP type/code"],
 )
-def craft_icmp_packet(src_ip: str, dst_ip: str, payload: str = ""):
+def craft_icmp_packet(src_ip: str, dst_ip: str, payload: str = "", interface: str = ""):
     """Craft a generic ICMP packet (type/code left at scapy defaults).
 
     Args:
         src_ip: Source IP address.
         dst_ip: Destination IP address.
         payload: Optional payload text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_icmp_packet(src_ip, dst_ip, _payload_bytes(payload))
     return _craft_result(pkt)
@@ -320,7 +346,7 @@ def craft_icmp_packet(src_ip: str, dst_ip: str, payload: str = ""):
     "'R' RST, 'PA' PSH-ACK). Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, flags: str = "S", payload: str = ""):
+def craft_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, flags: str = "S", payload: str = "", interface: str = ""):
     """Craft a TCP/IP packet.
 
     Args:
@@ -330,6 +356,7 @@ def craft_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, fla
         dst_port: Destination TCP port.
         flags: TCP flag string (S, A, F, R, P, PA, SA, ...).
         payload: Optional payload text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_tcp_packet(src_ip, dst_ip, int(src_port), int(dst_port), flags, _payload_bytes(payload))
     return _craft_result(pkt)
@@ -339,7 +366,7 @@ def craft_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, fla
     "Craft a raw UDP packet. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_udp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, payload: str = ""):
+def craft_udp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, payload: str = "", interface: str = ""):
     """Craft a UDP/IP packet.
 
     Args:
@@ -348,6 +375,7 @@ def craft_udp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, pay
         src_port: Source UDP port.
         dst_port: Destination UDP port.
         payload: Optional payload text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_udp_packet(src_ip, dst_ip, int(src_port), int(dst_port), _payload_bytes(payload))
     return _craft_result(pkt)
@@ -360,13 +388,14 @@ def craft_udp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, pay
     "the packet hex (an L2/Ether frame — send with send_packet).",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_arp_request(src_mac: str, src_ip: str, target_ip: str):
+def craft_arp_request(src_mac: str, src_ip: str, target_ip: str, interface: str = ""):
     """Craft a broadcast ARP request.
 
     Args:
         src_mac: Source MAC address (e.g. 'aa:bb:cc:dd:ee:ff').
         src_ip: Source IP (sender protocol address).
         target_ip: IP whose MAC you want to resolve.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_arp_request(src_mac, src_ip, target_ip)
     return _craft_result(pkt)
@@ -377,7 +406,7 @@ def craft_arp_request(src_mac: str, src_ip: str, target_ip: str):
     "Returns the packet hex.",
     next_hints=["send_packet with the returned hex", "modify_packet to set ARP op"],
 )
-def craft_arp_packet(src_mac: str, dst_mac: str, src_ip: str, dst_ip: str):
+def craft_arp_packet(src_mac: str, dst_mac: str, src_ip: str, dst_ip: str, interface: str = ""):
     """Craft a directed ARP packet between two MAC/IP pairs.
 
     Args:
@@ -385,6 +414,7 @@ def craft_arp_packet(src_mac: str, dst_mac: str, src_ip: str, dst_ip: str):
         dst_mac: Target MAC.
         src_ip: Sender IP.
         dst_ip: Target IP.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_arp_packet(src_mac, dst_mac, src_ip, dst_ip)
     return _craft_result(pkt)
@@ -394,7 +424,7 @@ def craft_arp_packet(src_mac: str, dst_mac: str, src_ip: str, dst_ip: str):
     "Craft an 802.1Q VLAN-tagged Ethernet frame. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_vlan_frame(src_mac: str, dst_mac: str, vlan_id: int, payload: str = ""):
+def craft_vlan_frame(src_mac: str, dst_mac: str, vlan_id: int, payload: str = "", interface: str = ""):
     """Craft a VLAN-tagged frame.
 
     Args:
@@ -402,6 +432,7 @@ def craft_vlan_frame(src_mac: str, dst_mac: str, vlan_id: int, payload: str = ""
         dst_mac: Destination MAC.
         vlan_id: 802.1Q VLAN tag (0-4095).
         payload: Optional payload text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().vlan_frame(src_mac, dst_mac, int(vlan_id), _payload_bytes(payload))
     return _craft_result(pkt)
@@ -411,11 +442,12 @@ def craft_vlan_frame(src_mac: str, dst_mac: str, vlan_id: int, payload: str = ""
     "Craft a DHCP Discover packet (L2 broadcast). Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_dhcp_discover(src_mac: str):
+def craft_dhcp_discover(src_mac: str, interface: str = ""):
     """Craft a DHCP DISCOVER.
 
     Args:
         src_mac: Client MAC address.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().dhcp_discover(src_mac)
     return _craft_result(pkt)
@@ -427,13 +459,14 @@ def craft_dhcp_discover(src_mac: str):
     "Craft a DNS request packet (UDP/53) for a domain name. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_dns_query(src_ip: str, dst_ip: str, query_name: str):
+def craft_dns_query(src_ip: str, dst_ip: str, query_name: str, interface: str = ""):
     """Craft a DNS query.
 
     Args:
         src_ip: Source IP.
         dst_ip: DNS server IP.
         query_name: Name to resolve (e.g. 'example.com').
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_dns_query(src_ip, dst_ip, query_name)
     return _craft_result(pkt)
@@ -444,7 +477,7 @@ def craft_dns_query(src_ip: str, dst_ip: str, query_name: str):
     "DNS spoofing / cache-poisoning demos. Returns the packet hex.",
     next_hints=["send_packet with the returned hex", "report_finding"],
 )
-def craft_dns_response(src_ip: str, dst_ip: str, query_name: str, answer_ip: str):
+def craft_dns_response(src_ip: str, dst_ip: str, query_name: str, answer_ip: str, interface: str = ""):
     """Craft a forged DNS response with one answer record.
 
     Args:
@@ -452,6 +485,7 @@ def craft_dns_response(src_ip: str, dst_ip: str, query_name: str, answer_ip: str
         dst_ip: Victim IP.
         query_name: Query name to answer.
         answer_ip: IP to put in the answer record.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_dns_response(src_ip, dst_ip, query_name, answer_ip)
     return _craft_result(pkt)
@@ -462,7 +496,7 @@ def craft_dns_response(src_ip: str, dst_ip: str, query_name: str, answer_ip: str
     "rotating spoof). Returns the packet hex.",
     next_hints=["send_packet with the returned hex", "report_finding"],
 )
-def craft_dns_response_multi(src_ip: str, dst_ip: str, query_name: str, answer_ips: list):
+def craft_dns_response_multi(src_ip: str, dst_ip: str, query_name: str, answer_ips: list, interface: str = ""):
     """Craft a forged DNS response with several answer records.
 
     Args:
@@ -470,6 +504,7 @@ def craft_dns_response_multi(src_ip: str, dst_ip: str, query_name: str, answer_i
         dst_ip: Victim IP.
         query_name: Query name to answer.
         answer_ips: List of IPs to put in the answer records.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     ips = [str(ip) for ip in answer_ips]
     pkt = _craft().craft_dns_response_multi(src_ip, dst_ip, query_name, ips)
@@ -480,13 +515,14 @@ def craft_dns_response_multi(src_ip: str, dst_ip: str, query_name: str, answer_i
     "Craft an mDNS request packet (UDP/5353) for a domain name. Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_mdns_query(src_ip: str, dst_ip: str, query_name: str):
+def craft_mdns_query(src_ip: str, dst_ip: str, query_name: str, interface: str = ""):
     """Craft an mDNS query.
 
     Args:
         src_ip: Source IP.
         dst_ip: mDNS target (usually 224.0.0.251).
         query_name: Name to query (e.g. '_http._tcp.local').
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     pkt = _craft().craft_mDNS_query(src_ip, dst_ip, query_name)
     return _craft_result(pkt)
@@ -498,7 +534,7 @@ def craft_mdns_query(src_ip: str, dst_ip: str, query_name: str):
     "Craft an HTTP request packet (TCP/80). Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_http_request(src_ip: str, dst_ip: str, method: str = "GET", path: str = "/", host: str = "", user_agent: str = "", payload: str = ""):
+def craft_http_request(src_ip: str, dst_ip: str, method: str = "GET", path: str = "/", host: str = "", user_agent: str = "", payload: str = "", interface: str = ""):
     """Craft an HTTP request packet.
 
     Args:
@@ -509,6 +545,7 @@ def craft_http_request(src_ip: str, dst_ip: str, method: str = "GET", path: str 
         host: Host header value.
         user_agent: User-Agent header value.
         payload: Optional body text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     headers = [("Host", host), ("User-Agent", user_agent)]
     pkt = _craft().craft_http_request(
@@ -521,7 +558,7 @@ def craft_http_request(src_ip: str, dst_ip: str, method: str = "GET", path: str 
     "Craft an HTTP response packet (TCP/80). Returns the packet hex.",
     next_hints=["send_packet with the returned hex"],
 )
-def craft_http_response(src_ip: str, dst_ip: str, status_code: int = 200, reason: str = "OK", content_type: str = "text/html", payload: str = ""):
+def craft_http_response(src_ip: str, dst_ip: str, status_code: int = 200, reason: str = "OK", content_type: str = "text/html", payload: str = "", interface: str = ""):
     """Craft an HTTP response packet.
 
     Args:
@@ -531,6 +568,7 @@ def craft_http_response(src_ip: str, dst_ip: str, status_code: int = 200, reason
         reason: Reason phrase.
         content_type: Content-Type header value.
         payload: Optional body text.
+        interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
     """
     body = _payload_bytes(payload)
     pkt = _craft().craft_http_response(
@@ -554,11 +592,11 @@ def send_packet(hex: str, count: int = 1, interval: float = 0.1, interface: str 
         hex: Packet hex string from a craft_* tool.
         count: Number of times to send.
         interval: Seconds between sends.
-        interface: Override the default capture interface.
+        interface: Interface to transmit on; defaults to PACKET_CRAFT env (fallback enp92s0).
     """
     try:
         pkt = _packet_from_hex(hex)
-        iface = interface or TARGET_INTERFACE
+        iface = interface or _default_interface()
         for _ in range(int(count)):
             sendp(pkt, iface=iface, verbose=False)
             time.sleep(float(interval))
@@ -586,10 +624,10 @@ def sniff_packets(filter: str = "", count: int = 10, timeout: int = 30, interfac
         filter: BPF filter string (e.g. 'tcp port 80', 'icmp').
         count: Number of packets to capture.
         timeout: Capture timeout in seconds.
-        interface: Override the default capture interface.
+        interface: Interface to capture on; defaults to PACKET_CRAFT env (fallback enp92s0).
     """
     try:
-        iface = interface or TARGET_INTERFACE
+        iface = interface or _default_interface()
         pkts = _craft(iface).sniff_packets(filter=filter, count=int(count), timeout=int(timeout))
         if not pkts:
             return f"No packets captured on {iface} (filter={filter!r})."
@@ -714,11 +752,11 @@ def wait_for_packet(filter: str = "", timeout: int = 30, interface: str = ""):
     Args:
         filter: BPF filter string.
         timeout: Seconds to wait.
-        interface: Override the default capture interface.
+        interface: Interface to capture on; defaults to PACKET_CRAFT env (fallback enp92s0).
     """
     try:
-        iface = interface or TARGET_INTERFACE
-        pkt = _craft(iface).utils.wait_for_packet(filter=filter, timeout=int(timeout))
+        iface = interface or _default_interface()
+        pkt = _craft(iface).utils.wait_for_packet(filter=filter, timeout=int(timeout), interface=iface)
         if pkt is None:
             return f"No packet matched filter={filter!r} within {timeout}s on {iface}."
         return _craft_result(pkt)

@@ -23,7 +23,9 @@ Design decisions baked into the wrapper (see the schema hand-off notes):
   wrapper pins ``--adapter-ip`` explicitly: from ``$MASSCAN_ADAPTER_IP``
   if set, otherwise auto-detected via the default-route UDP-connect trick
   and logged so the chosen source is visible.  ``$MASSCAN_ADAPTER`` pins
-  the interface name (``-e``).
+  the interface name (``-e``); without it, ``$PACKET_CRAFT`` (the shared
+  packet-tools default read by ``utils/packetcraft.py``) is honoured next,
+  then masscan auto-picks.
 * **Self-exclude by default** — the wrapper's own host IP is added to
   ``--exclude`` by default (overridable) so a broad CIDR sweep never scans
   the scanning box itself, matching the rule already used for nmap.
@@ -174,6 +176,23 @@ def _get_iface_ip(iface: str) -> Optional[str]:
         if p == "inet" and i + 1 < len(parts):
             return parts[i + 1].split("/")[0]
     return None
+
+
+def _resolve_adapter(adapter: Optional[str]) -> Optional[str]:
+    """Resolve the masscan adapter/interface (``-e``) at call time.
+
+    Precedence: ``adapter`` parameter > ``$MASSCAN_ADAPTER`` (masscan-
+    specific) > ``$PACKET_CRAFT`` (shared packet-tools default, same var
+    ``utils/packetcraft.py`` reads) > ``None`` (masscan auto-picks the
+    first iface with a default gateway).  Read per-call so loaddotenv
+    /.env edits apply without re-import.
+    """
+    return (
+        adapter
+        or os.getenv("MASSCAN_ADAPTER")
+        or os.getenv("PACKET_CRAFT")
+        or None
+    )
 
 
 def _default_self_exclude() -> Optional[str]:
@@ -329,8 +348,9 @@ def _parse_masscan_verdict(out_path: str):
     "JSON is tolerated). Default rate is masscan's safe 100 pps; pass a "
     "higher rate only when appropriate. The scanner's own IP is excluded by "
     "default. Pass adapter='eth0' (or tun0, etc.) to pin the source "
-    "interface — this overrides $MASSCAN_ADAPTER and prevents masscan's "
-    "default auto-pick from selecting the wrong NIC on multi-interface hosts.",
+    "interface — this overrides $MASSCAN_ADAPTER and $PACKET_CRAFT and "
+    "prevents masscan's default auto-pick from selecting the wrong NIC on "
+    "multi-interface hosts.",
     next_hints=["masscan_status", "run_nmap"],
 )
 def run_masscan(
@@ -359,10 +379,12 @@ def run_masscan(
             masscan uses its binary default of 100 pps (safe for shared
             networks).  Clamped by ``$MASSCAN_MAX_RATE`` if set.
         adapter: Source network interface name (e.g. ``"eth0"``, ``"tun0"``).
-            Overrides ``$MASSCAN_ADAPTER``.  When neither this parameter nor
-            the env var is set, masscan auto-picks the first interface with a
-            default gateway — which can break scans on multi-interface hosts.
-            Pass this explicitly whenever the host has more than one NIC.
+            Overrides ``$MASSCAN_ADAPTER`` and the shared ``$PACKET_CRAFT``
+            default (same var ``utils/packetcraft.py`` reads).  When none of
+            parameter / ``$MASSCAN_ADAPTER`` / ``$PACKET_CRAFT`` is set,
+            masscan auto-picks the first interface with a default gateway —
+            which can break scans on multi-interface hosts.  Pass this
+            explicitly whenever the host has more than one NIC.
         flags: Free-form extra masscan flags as a single string
             (e.g. ``"--banners --open-only"``).  Owned/dangerous flags are
             stripped (see module docstring).
@@ -414,8 +436,9 @@ def run_masscan(
     exclude = (exclude or "").strip()
 
     # --- adapter pinning -------------------------------------------------
-    # Parameter overrides env var; env var is the fallback.
-    adapter_iface = adapter or os.getenv("MASSCAN_ADAPTER") or None
+    # See _resolve_adapter: parameter > $MASSCAN_ADAPTER > $PACKET_CRAFT >
+    # None (masscan auto-pick).
+    adapter_iface = _resolve_adapter(adapter)
 
     # Resolve --adapter-ip from the SPECIFIED interface when possible, so
     # the source IP matches the pinned NIC.  Fall back to $MASSCAN_ADAPTER_IP,
@@ -448,9 +471,9 @@ def run_masscan(
     if not adapter_iface:
         adapter_warn = (
             (adapter_warn + "; " if adapter_warn else "")
-            + "no adapter/interface specified (parameter or MASSCAN_ADAPTER); "
-            "masscan will auto-pick the first iface with a default gateway — "
-            "pass adapter='eth0' to pin explicitly"
+            + "no adapter/interface specified (parameter, MASSCAN_ADAPTER, "
+            "or PACKET_CRAFT); masscan will auto-pick the first iface with "
+            "a default gateway — pass adapter='eth0' to pin explicitly"
         )
 
     # --- assemble free-form flags + options (denylist-filtered) ----------

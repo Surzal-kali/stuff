@@ -12,7 +12,8 @@ Modes:
   run <id> --json '{...}'     — one-shot: run a tool with JSON args (fallback)
   sweep [--safe]              — run every discoverable tool with safe/no-op args
   info <id>                   — show a tool's manifest without running it
-  search <query>              — semantic search (needs ChromaDB + Ollama)
+  search <query>              — semantic search (needs ChromaDB + Ollama);
+                                best match prints LAST, nearest the prompt
 
 Argument parsing uses the tool's own parameter schema (from the manifest
 discovered at startup) for type coercion — no hardcoded type maps.
@@ -394,7 +395,8 @@ def repl_help():
     print("""
 Tool REPL commands:
   list [filter]          List all tools (optional substring filter)
-  search <query>         Semantic search via ChromaDB (needs Ollama + ChromaDB)
+  search <query>         Semantic search via ChromaDB (needs Ollama + ChromaDB);
+                         results render worst-first so rank #1 sits right above the prompt
   info <tool_id>         Show full manifest for a tool
   resolve <tool_id>      Resolve a tool_id to its Python callable (dry run)
   run <tool_id> [--flag value ...]   Run a tool with flag args (schema-aware)
@@ -592,10 +594,16 @@ async def repl_loop(manifests: List[ToolManifest]):
                 results = await real_reg.find_tools(rest)
                 if not results:
                     print("  No results.")
-                for m in results:
+                # find_tools returns best-first (T-002: array position == rank,
+                # and the secretary/agents read array position — do NOT change
+                # that ordering).  The terminal renders top-down, so the REPL
+                # prints the list in reverse: worst match lands highest on
+                # screen, rank #1 prints LAST, right above the prompt instead
+                # of scrolling off into scrollback.
+                for rank, m in reversed(list(enumerate(results, 1))):
                     dist = f"  dist={m.distance}" if m.distance is not None else ""
                     print_manifest(m, verbose=True)
-                    print(f"    {dist}")
+                    print(f"    #{rank}{dist}")
             except Exception as e:
                 print(f"  Search failed (needs ChromaDB + Ollama): {e}")
 
