@@ -608,21 +608,37 @@ async def repl_loop(manifests: List[ToolManifest]):
         elif cmd == "ipython":
             try:
                 from IPython import embed
+
+                async def quick_run(tool_id: str, **kwargs):
+                    """Convenience wrapper: await quick_run("aux.nmap.run_nmap", target="127.0.0.1")"""
+                    return await run_tool(tool_id, kwargs, manifests)
+
                 user_ns = {
                     "manifests": manifests,
                     "registry": _make_executor(),
                     "run_tool": run_tool,
+                    "quick_run": quick_run,
                     "discover_tools": discover_tools,
                     "resolve_callable": resolve_callable,
                     "ToolManifest": ToolManifest,
                     "ToolRegistry": ToolRegistry,
                 }
                 print("  Dropping into IPython (Jedi completions + rich display).")
-                print("  Available: manifests, registry, run_tool, discover_tools,")
-                print("             resolve_callable, ToolManifest, ToolRegistry")
-                print("  run_tool is async:  await run_tool(id, args, manifests)")
+                print("  Available: manifests, registry, run_tool, quick_run,")
+                print("             discover_tools, resolve_callable, ToolManifest, ToolRegistry")
+                print("  quick_run:  await quick_run(id, target=x, port=y)")
+                print("  run_tool:   await run_tool(id, args_dict, manifests)")
                 print("  Ctrl+D / exit() to return.\n")
-                embed(user_ns=user_ns, header="")
+
+                # IPython.embed() → prompt_toolkit → asyncio.run() crashes with
+                # "cannot be called from a running event loop" when we're inside
+                # asyncio.run(repl_loop(...)).  Run embed() in a separate thread
+                # so it gets a clean event-loop context.  asyncio.to_thread()
+                # blocks this coroutine until the user exits IPython.
+                def _embed():
+                    embed(user_ns=user_ns, header="")
+
+                await asyncio.to_thread(_embed)
             except ImportError:
                 print("  IPython not installed. Install with: pip install ipython")
 
