@@ -62,7 +62,7 @@ SECRETARY_MAX_TOP_K = 10
 # refuses to run anything whose semantic match is not this close.
 # Distance is chromadb L2 on nomic-embed-text normalized vectors
 # (0 = identical). 1.1 calibrated live: good matches ~0.3-0.9.
-ROUTER_MAX_DISTANCE = 1.1
+ROUTER_MAX_DISTANCE = float(os.getenv("ROUTER_MAX_DISTANCE", "1.1"))
 SECRETARY_MAX_APPROVAL_ROUNDS = int(os.getenv("SECRETARY_MAX_APPROVAL_ROUNDS", "5"))
 SECRETARY_TURN_TIMEOUT = float(os.getenv("SECRETARY_TURN_TIMEOUT", "600"))  # 10 min wall-clock
 ALLOWED_TOOL_ROOTS = [

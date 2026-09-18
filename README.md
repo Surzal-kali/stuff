@@ -330,7 +330,7 @@ values; see `.env.example` for the full key list):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_BASE_URL` | code fallback `10.0.0.245:11434/v1` | Ollama API endpoint (set explicitly) |
+| `OLLAMA_BASE_URL` | LAN fallback (`10.0.0.x`) | Ollama API endpoint — set explicitly in `.env` |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
 | `SECRETARY_MODEL` | `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M` | LLM model for the tool secretary (non-thinking chat model recommended) |
@@ -355,6 +355,7 @@ values; see `.env.example` for the full key list):
 | `SECRETARY_MAX_APPROVAL_ROUNDS` | `5` | Max approval rounds per secretary turn |
 | `SECRETARY_TURN_TIMEOUT` | `600` | Secretary turn wall-clock cap (seconds) |
 | `SQLMAP_TIMEOUT` | `1800` | sqlmap scan wall-clock cap (seconds) |
+| `ROUTER_MAX_DISTANCE` | `1.1` | API-path semantic-match refusal threshold (ChromaDB L2; lower = stricter) |
 | `ZAP_PROXY_BIND` | `0.0.0.0` | ZAP browser-proxy bind address (daemon API ACL stays loopback) |
 | `ZAP_XMX` | `512m` | ZAP daemon JVM heap size |
 | `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |

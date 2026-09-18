@@ -731,7 +731,7 @@ async def run(loader, host="127.0.0.1", port=5000):
         embedding_function = OllamaEmbeddingFunction(model_name="nomic-embed-text")
         tool_registry = ToolRegistry(
             embedding_model=embedding_function,
-            rpc_servers={"metasploit": os.getenv("MCP_ENDPOINT", "http://localhost:55552")},
+            rpc_servers={"metasploit": os.getenv("MCP_ENDPOINT", "http://127.0.0.1:55553")},
         )
 
     # Initialize MemoryService
