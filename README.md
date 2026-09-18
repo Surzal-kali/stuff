@@ -439,6 +439,47 @@ searchable from the secretary chat loop, and then executed with human approval.
   prevent hanging the conversation loop. Long-running CLI tools use the
   background job pattern so the secretary turn is never held open.
 
+### Legal Addendum — Local Models Only for Pentesting
+
+> **WARNING — DATA EGRESS RISK.** This framework orchestrates offensive
+> security tools (port scanners, web spiders, active scanners, exploit
+> frameworks) against live targets. The tool secretary is an LLM that
+> reads target responses, HTTP bodies, command output, and findings to
+> reason about next steps. **If the secretary model is hosted on a
+> third-party cloud API (OpenAI, Anthropic, Google, or any provider
+> outside your own infrastructure), every tool output it processes is
+> transmitted to that provider's servers.** This includes response bodies
+> from scanned targets, extracted credentials, session tokens, internal
+> IP addresses, error messages, and any other data the tools surface.
+>
+> Sending this data to a third party constitutes **unauthorized data
+> egress** from the target's environment and may violate:
+>
+> - The target organisation's acceptable-use / data-handling policies.
+> - Bug bounty program rules of engagement (many programs explicitly
+>   prohibit sending target data to third-party services).
+> - Data protection regulations (GDPR, CCPA, HIPAA, and equivalents)
+>   when the target handles personal, financial, or health data.
+> - Non-disclosure agreements, engagement letters, or ROE scope terms.
+>
+> **You MUST use a locally-hosted model** (e.g. via Ollama, llama.cpp, or
+> a self-managed vLLM instance on infrastructure you control) as the
+> secretary. Set `OLLAMA_BASE_URL` to a loopback or LAN address. Do not
+> point the framework at a cloud-hosted LLM API for any engagement
+> involving live third-party targets.
+>
+> The framework's default `SECRETARY_MODEL` points to a locally-served
+> GGUF model. Do not override it with a cloud model for pentesting work.
+> If you are testing against your own infrastructure in an isolated lab
+> with no real user data, the egress risk is your own to assess — but
+> the default configuration assumes local models precisely to keep
+> target data on-box.
+>
+> **Using a cloud-hosted LLM with this framework against a target you do
+> not own is a data-handling decision you are solely responsible for.
+> The framework authors assume no liability for data egress caused by
+> misconfigured model endpoints.**
+
 ## Project Layout
 
 ```
@@ -503,7 +544,6 @@ schema.md               SQLite database schema
 AGENTS.md               AI agent development guide
 docs/                   Target dossiers (local-only, gitignored)
 ledger_archive/         Rotated-out ledger snapshots (local-only, gitignored)
-openwebui_tools/        Open WebUI integration (framework_bridge.py)
 dockered/               Docker workbench: compose, Dockerfiles, start_gateway.py
 .env.example            Configuration template (copy to .env; .env is not tracked)
 ```
