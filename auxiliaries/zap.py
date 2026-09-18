@@ -738,6 +738,12 @@ def zap_open_url(target: str,
         scope_platform: Platform key (``"intigriti"``, ``"h1"``, etc.).
             Only ``"intigriti"`` has structured testing requirements.
     """
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     zap = _zap()
     scan_cfg = None
     if scope_handle and scope_platform:
@@ -759,6 +765,10 @@ def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[st
         recurse: Follow links recursively (default True). Set False for a
             single-page fetch.
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     return {"spider_id": _zap().spider(target, max_depth=max_depth, recurse=recurse)}
 
 
@@ -775,6 +785,10 @@ def zap_ajax_spider(target: str) -> Dict[str, str]:
     """Args:
         target: Fully qualified URL to start the headless-browser crawl from.
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     return {"ajax_spider_id": _zap().ajax_spider(target)}
 
 
@@ -793,6 +807,10 @@ def zap_active_scan(target: str, policy: Optional[str] = None) -> Dict[str, str]
             linked from it that's in scope.
         policy: Optional scan policy name. ``None`` uses the default policy.
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     return {"ascan_id": _zap().active_scan(target, policy=policy)}
 
 
@@ -932,6 +950,35 @@ def zap_report(report_format: str = "html",
         report_title=report_title,
     )
 
+def _host_from_raw_request(raw_request: str) -> "Optional[str]":
+    """Extract the target host from a raw HTTP request for scope gating.
+
+    Checks the ``Host:`` header first (the common case for vhost-gated
+    targets), falling back to an absolute-form request target
+    (``GET http://host/path HTTP/1.1``).  Strips a trailing ``:port`` for
+    IPv4/domain hosts; leaves IPv6 literals (bracketed) intact.  Returns
+    ``None`` if no host can be determined.
+    """
+    lines = (raw_request or "").lstrip().splitlines()
+    host = None
+    for ln in lines:
+        if ln.lower().startswith("host:"):
+            host = ln.split(":", 1)[1].strip()
+            break
+    if not host and lines:
+        from urllib.parse import urlparse
+        first = lines[0].split()
+        if len(first) >= 2 and "://" in first[1]:
+            host = urlparse(first[1]).hostname
+    if not host:
+        return None
+    if host.startswith("[") and "]" in host:
+        return host[1:host.index("]")]
+    if host.count(":") == 1:  # IPv4/domain :port
+        return host.rsplit(":", 1)[0]
+    return host
+
+
 @framework_tool(
     "Send a raw HTTP request with full control over method, path, headers "
     "(Host, Cookie, User-Agent, Referer, any custom header) and body, "
@@ -961,6 +1008,11 @@ def zap_send_raw(raw_request: str,
         raise ValueError(
             "raw_request must start with 'METHOD /path HTTP/1.1'"
         )
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(_host_from_raw_request(raw_request))
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     # Model-written requests use \n; the wire needs \r\n. Normalize.
     wire = raw_request.replace("\r\n", "\n").replace("\n", "\r\n")
     env = _zap().send_raw(wire, follow_redirects=follow_redirects)

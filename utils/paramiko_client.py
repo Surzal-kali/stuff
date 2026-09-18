@@ -64,6 +64,10 @@ def ssh_connect(hostname: str, username: str, password: str, port: int = 22):
         password: SSH password.
         port: SSH port (default 22).
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(hostname)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -110,6 +114,13 @@ def ssh_exec(handle: str, command: str):
             f"SSH session {handle} not found. Call ssh_connect first, "
             "or use list_sessions to see active sessions."
         )
+    # Re-check the session's target against the (possibly just-armed) scope
+    # so a session opened in lab mode can't exec commands on an out-of-scope
+    # host after the operator arms a bounty scope.
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(session.metadata.get("hostname", ""))
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     try:
         stdin, stdout, stderr = session.client.exec_command(command)
         output = stdout.read().decode("utf-8", errors="replace")
@@ -148,6 +159,11 @@ def ssh_shell(handle: str, command: str, timeout: float = 10.0):
     session = _sm.get(sid)
     if session is None:
         return f"SSH session {handle} not found. Call ssh_connect first."
+
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(session.metadata.get("hostname", ""))
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
 
     try:
         channel = session.client.get_transport().open_session()
@@ -272,6 +288,10 @@ def paramiko_client(hostname: str, username: str, password: str, command: str):
         password: SSH password.
         command: The shell command to execute.
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(hostname)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())

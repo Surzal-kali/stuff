@@ -85,6 +85,12 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     """
     import shlex
 
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     # -Pn by default: hosts that drop ping probes would otherwise report
     # "Host seems down" even when their ports are reachable.
     opt_list = shlex.split(options) if options else []

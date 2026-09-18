@@ -308,6 +308,12 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
     """
     import shlex
 
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(url)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     wordlist = (wordlist or "").strip()
     default_used = False
     if not wordlist:

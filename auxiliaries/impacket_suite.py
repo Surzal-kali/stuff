@@ -111,6 +111,11 @@ def smb_enum_shares(target, username="", password="", domain=""):
         password: SMB password; empty for null session.
         domain: Windows domain (ignored by most Samba setups).
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     try:
         conn = SMBConnection(target, target, remoteByName=False, timeout=10)
         if username:
@@ -152,6 +157,11 @@ def smb_read_file(target, share, path, username="", password="", domain="", max_
         domain: Windows domain.
         max_bytes: Cap on bytes read so a huge file can't drown the chat.
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     try:
         conn = SMBConnection(target, target, remoteName=False, timeout=10)
         if username:
@@ -206,6 +216,10 @@ def secretsdump(target, username="", password="", domain="", extra_options=""):
         domain: Windows domain.
         extra_options: Extra secretsdump flags, e.g. "-just-dc -hashes :NTLM".
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     argv = _impacket_argv("secretsdump.py", target, None, username, password, domain, extra_options)
     return _run_impacket(argv, timeout=600)
 
@@ -226,6 +240,10 @@ def psexec_exec(target, command, username="", password="", domain="", extra_opti
         domain: Windows domain.
         extra_options: Extra psexec flags, e.g. "-service-name X".
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     if not command:
         return "psexec_exec requires a command."
     argv = _impacket_argv("psexec.py", target, command, username, password, domain, extra_options)
@@ -247,6 +265,10 @@ def wmiexec_exec(target, command, username="", password="", domain="", extra_opt
         domain: Windows domain.
         extra_options: Extra wmiexec flags, e.g. "-silentcommand".
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     if not command:
         return "wmiexec_exec requires a command."
     argv = _impacket_argv("wmiexec.py", target, command, username, password, domain, extra_options)
@@ -269,6 +291,10 @@ def atexec_exec(target, command, username="", password="", domain="", extra_opti
         domain: Windows domain.
         extra_options: Extra atexec flags, e.g. "-session-id 1".
     """
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     if not command:
         return "atexec_exec requires a command."
     argv = _impacket_argv("atexec.py", target, command, username, password, domain, extra_options)

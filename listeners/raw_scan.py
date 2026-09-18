@@ -19,6 +19,10 @@ def load_lib():
 
 @framework_tool("Perform a raw SYN scan on a target IP and port.")
 def syn_scan(target_ip: str, port: int, source_ip: str | None = None, timeout_ms: int = 250):
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target_ip)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
     lib = load_lib()
     if os.geteuid() != 0:
         return {

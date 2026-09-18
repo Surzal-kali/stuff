@@ -65,7 +65,7 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
 
     COMMANDS = [
         "list", "run", "info", "resolve", "sweep", "search",
-        "safe-args", "reindex", "help", "quit", "exit", "ipython",
+        "safe-args", "reindex", "help", "quit", "exit", "ipython", "scope",
     ]
     # Commands whose first argument is a tool_id.
     TOOL_COMMANDS = {"run", "info", "resolve", "safe-args"}
@@ -406,6 +406,11 @@ Tool REPL commands:
   safe-args [tool_id]    Show safe-sweep args for a tool (or all)
   reindex                Re-discover tools
   ipython                Drop into IPython with tools preloaded (Jedi completions)
+  scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]
+                         Arm the packet-scope gate (send_packet refuses
+                         out-of-scope destinations; operator-only, not exposed
+                         to the agent). 'scope off' disarms (lab mode).
+  scope status|off|add-ip <ip> [<hostname>]|rm-ip <ip>|list-ips
   help                   This message
   quit / exit            Leave the REPL
 
@@ -437,6 +442,93 @@ def _find_manifest(tool_id: str, manifests: List[ToolManifest]) -> Optional[Tool
     return None
 
 
+def _scope_command(rest: str):
+    """Handle the ``scope`` REPL command — operator-only packet-scope gate.
+
+    This is the ONLY control surface for the packet-scope gate; it is
+    deliberately not exposed as an ``@framework_tool``, so the secretary
+    agent cannot arm/disarm or bless IPs.  When armed, ``send_packet``
+    refuses sends to destinations not confirmed in-scope (see
+    :mod:`utils.scope_gate`).
+    """
+    from utils import scope_gate
+
+    parts = rest.split()
+    if not parts:
+        print("  Packet-scope gate (operator-only — not exposed to the agent).")
+        print("  When armed, send_packet refuses packets to destinations not")
+        print("  confirmed in-scope for the loaded program. Disarmed = lab mode.")
+        print("  Commands:")
+        print("    scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]")
+        print("    scope off")
+        print("    scope status")
+        print("    scope add-ip <ip> [<hostname>]   (bless a resolved in-scope IP)")
+        print("    scope rm-ip <ip>")
+        print("    scope list-ips")
+        st = scope_gate.status()
+        if st.get("armed"):
+            print(f"  Current: ARMED — {st.get('handle')}/{st.get('platform')} "
+                  f"strict={st.get('strict')} allowlist={st.get('allowlist_size',0)}")
+        else:
+            print("  Current: disarmed (lab mode — sends unrestricted)")
+        return
+
+    sub = parts[0].lower()
+
+    if sub == "on":
+        if len(parts) < 2:
+            print("  Usage: scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]")
+            return
+        handle = parts[1]
+        platform = "h1"
+        strict = True
+        i = 2
+        while i < len(parts):
+            tok = parts[i]
+            if tok == "--no-strict":
+                strict = False
+                i += 1
+            elif tok == "--platform" and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                platform = parts[i + 1]
+                i += 2
+            elif tok.startswith("--platform="):
+                platform = tok.split("=", 1)[1]
+                i += 1
+            else:
+                print(f"  Ignoring unknown flag: {tok}")
+                i += 1
+        res = scope_gate.arm(handle, platform, strict)
+
+    elif sub == "off":
+        res = scope_gate.disarm()
+
+    elif sub == "status":
+        res = scope_gate.status()
+
+    elif sub in ("add-ip", "add_ip", "add"):
+        if len(parts) < 2:
+            print("  Usage: scope add-ip <ip> [<hostname>]")
+            return
+        ip = parts[1]
+        hostname = parts[2] if len(parts) > 2 else ""
+        res = scope_gate.add_ip(ip, hostname)
+
+    elif sub in ("rm-ip", "rm_ip", "remove", "rm"):
+        if len(parts) < 2:
+            print("  Usage: scope rm-ip <ip>")
+            return
+        res = scope_gate.remove_ip(parts[1])
+
+    elif sub in ("list-ips", "list_ips", "list", "ips"):
+        res = scope_gate.list_ips()
+
+    else:
+        print(f"  Unknown scope subcommand: {sub!r}. Try 'scope' for help.")
+        return
+
+    print("  " + json.dumps(res, indent=2, default=str))
+
+
 async def repl_loop(manifests: List[ToolManifest]):
     """Interactive REPL loop."""
     repl_help()
@@ -454,9 +546,18 @@ async def repl_loop(manifests: List[ToolManifest]):
         )
 
     async def _read_line() -> str:
+        # Scope-armed indicator: a checkmark when a scope is armed (sends
+        # gated), no sign when disarmed (lab mode). Recomputed each prompt
+        # so 'scope on/off' is reflected immediately. Cheap: one stat/json.
+        try:
+            from utils.scope_gate import is_armed
+            _mark = "✓ " if is_armed() else ""
+        except Exception:
+            _mark = ""
+        _prompt = f"\n{_mark}repl> "
         if session is not None:
-            return await session.prompt_async("\nrepl> ")
-        return input("\nrepl> ")
+            return await session.prompt_async(_prompt)
+        return input(_prompt)
 
     while True:
         try:
@@ -649,6 +750,9 @@ async def repl_loop(manifests: List[ToolManifest]):
                 await asyncio.to_thread(_embed)
             except ImportError:
                 print("  IPython not installed. Install with: pip install ipython")
+
+        elif cmd == "scope":
+            _scope_command(rest)
 
         else:
             print(f"  Unknown command: {cmd}. Type 'help' for commands.")

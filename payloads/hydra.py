@@ -195,6 +195,12 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
     """
     import shlex
 
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     opt_list = shlex.split(options) if options else []
     opt_list, creds_meta = _inject_default_credentials(opt_list)
     if "error" in creds_meta:

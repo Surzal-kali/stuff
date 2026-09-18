@@ -28,6 +28,10 @@ class SMBScanner:
     @framework_tool("Test if a target is vulnerable to SMB Null Sessions.")
     def check_null_session(self, target, remoteName=False):
         """Attempts a Null Session connection to a target SMB share."""
+        from utils.scope_gate import check_scan, ScopeGateError
+        _sc_ok, _sc_reason = check_scan(target)
+        if not _sc_ok:
+            raise ScopeGateError(f"scope gate: {_sc_reason}")
         try:
             # timeout=2 to keep the scan moving
             conn = SMBConnection(target, target, timeout=2)

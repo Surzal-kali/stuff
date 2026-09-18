@@ -403,6 +403,12 @@ def run_masscan(
             "error": "target is required (IP, range, or CIDR)",
         }
 
+    # Scope gate (operator-armed from the Tool REPL; no-op in lab mode).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     # --- ports -----------------------------------------------------------
     ports = (ports or "80").strip() or "80"
 

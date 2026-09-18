@@ -39,6 +39,7 @@ import cryptography
 from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
 
 from constants import framework_tool
+from .scope_gate import check_send, ScopeGateError
 
 # Default capture/send interface for the packet tools.  Env name is
 # PACKET_CRAFT (set in .env; loaded by loaddotenv at stack boot).  Resolved
@@ -84,16 +85,45 @@ def _packet_to_hex(packet: scapy.Packet) -> str:
 def _packet_from_hex(hex_string: str) -> scapy.Packet:
     """Reconstruct a packet from a hex string.
 
-    Picks the L2 (``Ether``) or L3 (``IP``) parser by inspecting the IP
-    version nibble: crafted IPv4 packets start with ``0x4?``, whereas L2
-    frames (ARP, VLAN, DHCP) start with a destination MAC whose high nibble
-    is essentially never 4.  This is reliable for everything the craft tools
-    below produce.
+    Discriminates L2 (Ethernet frame) from L3 (bare IP) by attempting an
+    ``Ether`` parse and checking for a recognised network layer — NOT by the
+    first byte's nibble.  The high nibble of a destination MAC collides with
+    the IPv4 version nibble: Apple ``4c:…``, Cisco ``40:``/``48:`` OUIs all
+    start ``4x:``, so the old ``(raw[0] >> 4) == 4`` test silently misparsed
+    real frames as garbage IP (e.g. ``4c:1f:cc:…`` → ``8.0.69.0 > 0.47.0.1
+    ah frag:17``) with no exception, producing a packet that could never be
+    sent or dissected meaningfully.
+
+    A bare L3 craft output (``IP()/…``, first byte ``0x45``) mis-parses
+    under ``Ether`` with a garbage EtherType, so none of the recognised
+    layers appear and we fall through to the ``IP`` parse.  An L2 frame
+    carrying IP/ARP/DHCP/VLAN parses cleanly under ``Ether`` and is returned
+    as-is.  This keeps the round-trip consistent with
+    :meth:`PacketUtils.import_packet_hex`, which delegates here.
     """
     raw = bytes.fromhex(hex_string.strip())
-    if raw and (raw[0] >> 4) == 4:
-        return IP(raw)
-    return Ether(raw)
+    try:
+        frame = Ether(raw)
+        if IP in frame or ARP in frame or DHCP in frame or Dot1Q in frame:
+            return frame
+    except Exception:
+        pass
+    return IP(raw)
+
+
+def _packet_dst(packet: scapy.Packet) -> "str | None":
+    """Extract the routable destination a send is directed at, for the scope
+    gate.  Returns the destination IP for IP packets, the target protocol
+    address (``pdst``) for ARP, or ``None`` for frames that carry no directed
+    host IP (pure L2).  ``None`` and non-routable (broadcast/multicast/...)
+    destinations are never gated — only routable unicast IPs directed at a
+    real host are.  See :func:`utils.scope_gate.check_send`.
+    """
+    if IP in packet:
+        return packet[IP].dst
+    if ARP in packet:
+        return packet[ARP].pdst
+    return None
 
 
 def _craft_result(packet: scapy.Packet) -> str:
@@ -140,9 +170,15 @@ class PacketUtils:
         return hexdump(packet, dump=True)
 
     def import_packet_hex(self, hex_string: str) -> scapy.Packet:
-        """Import a packet from a hexadecimal string."""
-        raw_bytes = bytes.fromhex(hex_string)
-        return Ether(raw_bytes) if raw_bytes.startswith(b'\x00\x00') else IP(raw_bytes)
+        """Import a packet from a hexadecimal string.
+
+        Delegates to :func:`_packet_from_hex` so the same hex round-trips to
+        the same packet regardless of which tool touches it.  Previously this
+        used an inconsistent ``startswith(b'\\x00\\x00')`` discriminator, so
+        the same hex string could resolve to different packets here vs.
+        ``send_packet``/``dissect_packet``.
+        """
+        return _packet_from_hex(hex_string)
 
     def wait_for_packet(self, filter: str = "", timeout: int = 30, interface: str = "") -> scapy.Packet | None:
         """Wait for a packet matching the filter.
@@ -270,9 +306,24 @@ class PacketCraft:
         return packet
 
     def send_packet(self, packet: scapy.Packet, count: int = 1, interval: float = 0.1):
-        """Send a packet multiple times with a specified interval."""
+        """Send a packet multiple times with a specified interval.
+
+        Uses :func:`send` for L3 packets (``IP()/…``) so scapy wraps the L2
+        header, and :func:`sendp` for L2 frames that already carry an
+        Ethernet header.  Feeding a bare IP packet to ``sendp`` silently
+        emits a frame whose Ethernet header is the first 14 bytes of the
+        IP header — a no-op that looks like success.
+
+        Honours the operator-armed scope gate (see scope_gate.py): refuses
+        to transmit to a destination not confirmed in-scope when a scope is
+        armed.
+        """
+        _ok, _reason = check_send(_packet_dst(packet))
+        if not _ok:
+            raise ScopeGateError(f"scope gate: {_reason}")
+        send_fn = send if isinstance(packet, IP) else sendp
         for _ in range(count):
-            sendp(packet, iface=self.interface, verbose=False)
+            send_fn(packet, iface=self.interface, verbose=False)
             time.sleep(interval)
 
     def sniff_packets(self, filter: str = "", count: int = 10, timeout: int = 30):
@@ -594,11 +645,25 @@ def send_packet(hex: str, count: int = 1, interval: float = 0.1, interface: str 
         interval: Seconds between sends.
         interface: Interface to transmit on; defaults to PACKET_CRAFT env (fallback enp92s0).
     """
+    # Scope gate: refuses sends to out-of-scope destinations when an operator
+    # has armed a bug-bounty scope from the Tool REPL.  No-op in lab mode.
+    # Done BEFORE the try so a block raises (surfaces as Failed on both
+    # dispatch paths) instead of being caught and returned as a string the
+    # Brain relabels Success.  See utils/scope_gate.py.
+    pkt = _packet_from_hex(hex)
+    _ok, _reason = check_send(_packet_dst(pkt))
+    if not _ok:
+        raise ScopeGateError(f"scope gate: {_reason}")
     try:
-        pkt = _packet_from_hex(hex)
         iface = interface or _default_interface()
+        # L3 craft output (IP()/...) must go via send() so scapy wraps the
+        # Ethernet header itself; sendp() on a bare IP packet emits a frame
+        # whose "Ethernet header" is the first 14 bytes of the IP header
+        # (dst MAC 45:00:00:00:00:00) — the switch floods it, no host
+        # accepts it, and the tool still reports "Sent N packet(s)".
+        send_fn = send if isinstance(pkt, IP) else sendp
         for _ in range(int(count)):
-            sendp(pkt, iface=iface, verbose=False)
+            send_fn(pkt, iface=iface, verbose=False)
             time.sleep(float(interval))
         return f"Sent {count} packet(s) on {iface}: {pkt.summary()}"
     except PermissionError as e:
