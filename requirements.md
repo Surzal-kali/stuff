@@ -4,7 +4,6 @@ aiohttp==3.14.3
 aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
-anthropic==1.1.0
 anyio==4.14.2
 appdirs==1.4.4
 argcomplete==3.7.2
@@ -43,9 +42,6 @@ flatbuffers==25.12.19
 frozenlist==1.8.0
 fsspec==2026.7.0
 genai-prices==0.1.4
-google-auth==2.57.0
-google-genai==2.20.0
-googleapis-common-protos==1.75.1
 griffelib==2.2.0
 grpcio==1.78.0
 h11==0.16.0
@@ -97,7 +93,6 @@ nodeenv==1.10.0
 numpy==2.5.2
 oauthlib==3.3.1
 onnxruntime==1.29.0
-openai==3.3.1
 opentelemetry-api==1.44.0
 opentelemetry-exporter-otlp-proto-common==1.44.0
 opentelemetry-exporter-otlp-proto-grpc==1.44.0
@@ -190,8 +185,6 @@ uvloop==0.22.1
 validators==0.35.0
 watchfiles==1.2.0
 wcwidth==0.8.2
-weaviate-agents==1.8.0
-weaviate-client==4.23.0
 websocket-client==1.9.0
 websockets==16.1.1
 Werkzeug==3.1.8

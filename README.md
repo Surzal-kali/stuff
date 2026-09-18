@@ -19,7 +19,8 @@ secretary model and gated by scope-compliance and reportability checks.
 
 ### Tool Secretary (`daharness/`)
 
-The core of the framework. A local LLM (Ollama, e.g. `qwen3:14b`) acts as a
+The core of the framework. A local LLM (Ollama; `SECRETARY_MODEL`, default
+`hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`) acts as a
 conversational agent with two tools:
 
 1. **`search_tools`** — semantic search over the tool registry (ChromaDB,
@@ -162,7 +163,9 @@ is in your `PATH`.
    manages its configuration automatically. The home directory is pinned to
    `.zap_home/` in the workspace root. ZAP is never run as root — the
    launcher drops to the original user if the framework was started with
-   `sudo`.
+   `sudo`. The ZAP *browser-proxy* listener binds `ZAP_PROXY_BIND`
+   (default `0.0.0.0`) for upstream proxying; only the daemon's API is
+   restricted to loopback.
 4. Set `ZAP_API_KEY` in `.env`; it is sent as the `apikey` query parameter on
    every API call.
 
@@ -173,6 +176,24 @@ is in your `PATH`.
 3. `bootstrap.py` starts the MSF MCP sidecar (`msfrpcd`) automatically and
    vectorizes discovered modules into the tool registry.
 
+
+### Docker deployment (`dockered/`)
+
+A containerized workbench lives in `dockered/` and bind-mounts the live
+source tree (code edits on the host need no rebuild). Start with
+`cd dockered && ./up.sh` (removes a legacy standalone `chroma` container
+first). Services:
+
+| Service | Host port | Notes |
+|---|---|---|
+| ChromaDB (`chroma`) | `9000` | Reuses the existing `chroma-data/` volume |
+| Open Terminal | `8000` | Agent shell + file browser; hosts the framework gateway |
+| Framework gateway (in Open Terminal) | `6000` | REST + MCP — container lane; bare-metal host lane is `5000` |
+| Open WebUI | `3000` | Chat front end; calls the framework API routes |
+| JupyterLab | `8888` | Tool nursery; localhost-only, `JUPYTER_TOKEN`-gated |
+
+Keys come from `dockered/.env`: `GATEWAY_API_KEY`, `OPEN_TERMINAL_API_KEY`,
+`JUPYTER_TOKEN`.
 
 ## Supporting Services
 
@@ -226,9 +247,13 @@ Framework tools:
   duplicate-checking. Works without credentials (public feed); includes a
   behavioral guard against silent filter-ignoring.
 
-**Authentication:** The structured-scope endpoints require a HackerOne API
-token (Basic auth). Set `H1_API_USERNAME` and `H1_API_TOKEN` in `.env`.
-`program_hacktivity` works without credentials.
+**Authentication:** The structured-scope endpoints require a platform API
+token. HackerOne uses Basic auth — set `H1_API_USERNAME` and `H1_API_TOKEN`
+in `.env`. `program_hacktivity` works without credentials.
+
+**Intigriti support:** `program_scope.py` also pulls Intigriti program scope
+and hacktivity via `INTIGRITI_USERNAME` + `INTIGRITI_API_TOKEN`; manifests
+cache to `scope/intigriti_<handle>.scope`.
 
 ### Memory Service (`memories.py`)
 
@@ -275,6 +300,7 @@ FastAPI server (port 5000) exposing:
 - `POST /tools/search` — semantic tool search (no execution)
 - `POST /memory/search` — keyword memory search
 - `POST /memory/recall` — vector similarity recall
+- `POST /mcp` — streamable-HTTP MCP endpoint (`tools/list` + `tools/call`)
 
 Also serves MCP (Model Context Protocol) handlers for tool listing and
 execution. If `GATEWAY_API_KEY` is set, every request is authenticated;
@@ -284,10 +310,12 @@ otherwise the gateway runs in unauthenticated dev mode.
 
 ### Prerequisites
 
-- Python 3.13+
+- Python 3.12+ (3.13 supported)
 - [Ollama](https://ollama.ai) running with `nomic-embed-text` and a chat
-  model (default: `qwen3:14b`)
-- ChromaDB server (default: `localhost:9000`)
+  model (default: `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`)
+- ChromaDB server (default: `localhost:9000`; used by the tool registry —
+  the memory service `memories.py` uses its own embedded store at
+  `.memory/chroma`)
 - External CLI tools as needed (see [External Dependencies](#external-dependencies)):
   Nmap, Masscan, OWASP Amass, OWASP ZAP, Radare2, Metasploit Framework, ffuf,
   Hydra, sqlmap, searchsploit
@@ -297,18 +325,19 @@ otherwise the gateway runs in unauthenticated dev mode.
 
 ### Configuration
 
-Environment variables (see `.env`):
+Environment variables (copy `.env.example` to `.env` and fill in real
+values; see `.env.example` for the full key list):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_BASE_URL` | `your-ip-address:11434/v1` | Ollama API endpoint |
+| `OLLAMA_BASE_URL` | code fallback `10.0.0.245:11434/v1` | Ollama API endpoint (set explicitly) |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
-| `SECRETARY_MODEL` | `qwen3:14b` | LLM model for the tool secretary |
+| `SECRETARY_MODEL` | `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M` | LLM model for the tool secretary (non-thinking chat model recommended) |
 | `MSGRPC_PASSWORD` | — | Metasploit RPC password |
-| `MSF_RPC_PORT` | `55552` | Metasploit RPC port |
+| `MSF_RPC_PORT` | `55553` | Metasploit RPC port |
 | `MCP_ENDPOINT` | `http://127.0.0.1:55553` | Metasploit MCP sidecar endpoint |
-| `BRAIN_DISPATCH_TIMEOUT` | `180` | Brain socket dispatch timeout (seconds) |
+| `BRAIN_DISPATCH_TIMEOUT` | `600` | Brain socket dispatch timeout (seconds) |
 | `BRAIN_SCAN_DIRS` | `auxiliaries,listeners,payloads` | Directories the Brain scans at startup |
 | `WORKSPACE_ROOT` | current directory | Root for tool path resolution |
 | `GATEWAY_API_KEY` | — | API gateway authentication key (unset = dev mode) |
@@ -323,6 +352,13 @@ Environment variables (see `.env`):
 | `COLLAB_DNS_PORT` | `53` | OOB collaborator DNS port |
 | `R2_BINARY_TARGETS_ROOT` | `binaries/` | Radare2 binary drop folder |
 | `WORDLISTS_ROOT` | `/usr/share/wordlists` | Wordlist tree root |
+| `SECRETARY_MAX_APPROVAL_ROUNDS` | `5` | Max approval rounds per secretary turn |
+| `SECRETARY_TURN_TIMEOUT` | `600` | Secretary turn wall-clock cap (seconds) |
+| `SQLMAP_TIMEOUT` | `1800` | sqlmap scan wall-clock cap (seconds) |
+| `ZAP_PROXY_BIND` | `0.0.0.0` | ZAP browser-proxy bind address (daemon API ACL stays loopback) |
+| `ZAP_XMX` | `512m` | ZAP daemon JVM heap size |
+| `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |
+| `INTIGRITI_API_TOKEN` | — | Intigriti API token (scope integration) |
 
 ### Running
 
@@ -462,5 +498,8 @@ chroma-data/            ChromaDB persistence (gitignored)
 tests/                  pytest suite for registry + secretary flows
 schema.md               SQLite database schema
 AGENTS.md               AI agent development guide
-docs/                   Bug-check ledger and supplementary docs
+docs/                   Bug-check ledger + target dossiers (local-only, gitignored)
+openwebui_tools/        Open WebUI integration (framework_bridge.py)
+dockered/               Docker workbench: compose, Dockerfiles, start_gateway.py
+.env.example            Configuration template (copy to .env; .env is not tracked)
 ```

@@ -13,7 +13,8 @@ working **on** the codebase.
 ### Tool Secretary (`daharness/`)
 
 The core agent loop lives in `daharness/agent.py`. A local Ollama model
-(default `qwen3:14b`) is given two tools via a `FunctionToolset`:
+(default `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`, override via
+`SECRETARY_MODEL`) is given two tools via a `FunctionToolset`:
 
 - **`search_tools`** — semantic search over the ChromaDB tool registry.
   Returns full manifests. Every result is recorded in
@@ -28,7 +29,7 @@ The core agent loop lives in `daharness/agent.py`. A local Ollama model
 agent must call `search_tools` first. This prevents hallucinated tool calls.
 
 **Approval loop:** `run_secretary()` handles the `DeferredToolRequests` ->
-confirmer -> resume cycle. Up to `SECRETARY_MAX_APPROVAL_ROUNDS` (default 10)
+confirmer -> resume cycle. Up to `SECRETARY_MAX_APPROVAL_ROUNDS` (default 5, env-tunable)
 rounds per turn. Pass the same `deps` + `result.all_messages()` back in to
 continue a conversation.
 
@@ -61,7 +62,10 @@ Two passes scan `ALLOWED_TOOL_ROOTS` (`auxiliaries/`, `payloads/`,
 
 `__init__.py` files are **skipped**, not required. Skip dirs: `venv`,
 `.venv`, `__pycache__`, `.git`, etc. Skip files: `bootstrap.py`,
-`memories.py`, `owui-tool.py`.
+`memories.py`. **This is a tool-indexing exclusion, not a gitignore entry**
+(`skip_files` in `daharness/registry.py` discovery) — both files are tracked
+in git and stay framework entry points; they are skipped only so discovery
+never mints them as tools or dynamically imports them.
 
 ### `@framework_tool` Decorator (`constants.py`)
 
@@ -130,17 +134,26 @@ or doesn't know the tool, execution falls back to `_launch_in_process()`:
 3. Results are wrapped as `{"stdout", "status"}` dicts.
 
 **Important:** if the Brain accepted the call but timed out
-(`BRAIN_DISPATCH_TIMEOUT`, default 180s), the result is a failure and the
+(`BRAIN_DISPATCH_TIMEOUT`, default 600s), the result is a failure and the
 tool is **not** retried in-process — it may still be running on the Brain,
 and a second execution would cause duplicate side effects.
 
 ### Bootstrap (`bootstrap.py`)
 
 Entry point and daemon. `FrameworkLoader.launch_all()` starts:
-- Brain sidecar (subprocess, logs to `/tmp/brain.log`)
+- Brain sidecar (subprocess, logs to `/tmp/brain.log`, fallback
+  `/tmp/brain-<euid>.log`)
 
-- API gateway (async task, `api_gateway.py`, port 6000)
+- OWASP ZAP daemon (`start_zap_daemon()`; API ACL loopback, browser-proxy
+  binds `ZAP_PROXY_BIND`, default `0.0.0.0`)
+- API gateway (async task, `api_gateway.py`, port 5000 on the host lane)
 - Metasploit MCP (launches `msfconsole` with `msgrpc`, waits for RPC port)
+
+Also runs a wordlist-tree preflight (`utils.wordlists.preflight_wordlists`)
+before anything can dispatch. Container lane: the same stack runs inside
+`open-terminal` via `dockered/start_gateway.py` with the gateway on port
+**6000** — see `dockered/docker-compose.yaml` (services: chroma,
+open-terminal, open-webui, jupyter).
 
 Interactive mode: indexes tools via `bootstrap_registry()`, then enters
 `_chat()` REPL. Daemon mode (`--daemon`): starts services and waits for
@@ -148,10 +161,13 @@ SIGTERM/SIGINT.
 
 ### API Gateway (`api_gateway.py`)
 
-FastAPI server (port 6000):
-- `POST /tools/execute` — semantic lookup (`find_best_tool`) + execution
+FastAPI server (port 5000 on the host lane; 6000 in the container lane):
+- `GET /health` — health check
+- `POST /tools/execute` — exact `tool_id` dispatch, or semantic lookup (`find_best_tool`) + execution
+- `POST /tools/search` — candidate menu (top_k) without execution
 - `POST /memory/search` — keyword memory search
 - `POST /memory/recall` — vector similarity recall
+- `POST /mcp` — streamable-HTTP MCP endpoint (tools/list + tools/call)
 
 ### Memory Service (`memories.py`)
 
@@ -235,10 +251,12 @@ Confirmed end-to-end on `192.168.90.110`: `dispatch_metasploit` with
 persistent `msf:` shell session that `interact_session` reads (`uid=0(root)`
 on `Linux metasploitable`).
 
-### OpenWebUI Tool (`owui-tool.py`)
+### Open WebUI Tool (`openwebui_tools/framework_bridge.py`)
 
-External tool definitions that call the framework API for tool execution and
-memory operations. Used to expose the framework as a tool in OpenWebUI.
+Open WebUI tool definitions (v0.3.2) that call the framework API for tool
+execution and memory operations, with per-chat session isolation. Used to
+expose the framework as a tool in Open Web UI. (`owui-tool.py` was the
+predecessor and no longer exists.)
 
 ## Development Guidelines
 

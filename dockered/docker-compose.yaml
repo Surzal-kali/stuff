@@ -86,7 +86,7 @@ services:
       workbench:
         ipv4_address: 172.28.0.20
     env_file:
-      - framework.env
+      - .env
     environment:
       - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
       - GATEWAY_API_KEY=${GATEWAY_API_KEY}
@@ -99,7 +99,7 @@ services:
       - OPEN_TERMINAL_FILE_BROWSER_ROOT=/opt/framework
     volumes:
       - terminal-workspace:/home/user        # agent workspace (ephemeral files)
-      - ..:/opt/framework                     # live production code (bind mount, replaces COPY)
+      - /home/surzal/stuff:/opt/framework       # live production code (bind mount, replaces COPY)
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────────────
@@ -127,6 +127,9 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://10.0.0.245:11434
       - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
+      - WEBUI_URL_PREFIX=${WEBUI_URL_PREFIX}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────────────
@@ -147,7 +150,7 @@ services:
       workbench:
         ipv4_address: 172.28.0.40
     volumes:
-      - ..:/home/jovyan/framework
+      - /home/jovyan/framework
     working_dir: /home/jovyan/framework
     environment:
       - JUPYTER_TOKEN=${JUPYTER_TOKEN}
