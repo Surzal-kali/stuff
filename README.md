@@ -501,7 +501,8 @@ chroma-data/            ChromaDB persistence (gitignored)
 tests/                  pytest suite for registry + secretary flows
 schema.md               SQLite database schema
 AGENTS.md               AI agent development guide
-docs/                   Bug-check ledger + target dossiers (local-only, gitignored)
+docs/                   Target dossiers (local-only, gitignored)
+ledger_archive/         Rotated-out ledger snapshots (local-only, gitignored)
 openwebui_tools/        Open WebUI integration (framework_bridge.py)
 dockered/               Docker workbench: compose, Dockerfiles, start_gateway.py
 .env.example            Configuration template (copy to .env; .env is not tracked)
