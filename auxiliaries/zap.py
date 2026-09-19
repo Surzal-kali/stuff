@@ -42,6 +42,23 @@ from urllib3.util.retry import Retry
 from constants import framework_tool
 
 
+class ZAPAPIError(Exception):
+    """Raised when ZAP returns an HTTP 4xx/5xx with a structured error body.
+
+    Carries the ZAP ``code`` and ``message`` fields so callers (and the model)
+    see *why* the call failed — e.g. ``url_not_found: URL Not Found in the
+    Scan Tree`` — instead of a bare ``400 Client Error`` from
+    ``raise_for_status``.
+    """
+
+    def __init__(self, status_code: int, code: str = "", message: str = "") -> None:
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        super().__init__(f"ZAP {status_code} {code}: {message}" if code
+                         else f"ZAP {status_code}: {message}")
+
+
 ZAP_HOST = os.getenv("ZAP_HOST", "127.0.0.1")
 ZAP_PORT = int(os.getenv("ZAP_PORT", "8090"))
 ZAP_API_KEY = os.getenv("ZAP_API_KEY", "")
@@ -118,9 +135,11 @@ class ZAPClient:
         self.session = requests.Session()
         # Tiny retry budget for the daemon's first few seconds after launch --
         # the API can return 503 briefly while ZAP is initialising its DB.
+        # 500 is included: ZAP can emit transient 500s during heavy scans or
+        # OOM-adjacent GC pauses.
         retry = Retry(
             total=5, backoff_factor=0.5,
-            status_forcelist=(502, 503, 504),
+            status_forcelist=(500, 502, 503, 504),
             allowed_methods=frozenset(["GET"]),
         )
         self.session.mount("http://", requests.adapters.HTTPAdapter(max_retries=retry))
@@ -137,7 +156,20 @@ class ZAPClient:
         # segment -- e.g. "core" -- as the format enum and dies).
         url = f"{self.base}/JSON/{view}"
         r = self.session.get(url, params=params, timeout=120)
-        r.raise_for_status()
+        if not r.ok:
+            # Extract the ZAP error body so callers see the actual reason
+            # (e.g. "url_not_found: URL Not Found in the Scan Tree") instead
+            # of a useless "400 Client Error" from raise_for_status().
+            code = ""
+            message = r.text[:2000]
+            try:
+                body = r.json()
+                if isinstance(body, dict):
+                    code = body.get("code", code)
+                    message = body.get("message", message)
+            except (ValueError, json.JSONDecodeError):
+                pass
+            raise ZAPAPIError(r.status_code, code, message)
         if expect_json:
             return r.json()
         return r.text
@@ -179,9 +211,10 @@ class ZAPClient:
         cleared: List[Dict[str, str]] = []
 
         # --- Replacer rules ---
+        # ZAP 2.17 wraps the list under the "rules" key (NOT "replacerRules").
         try:
             rules = self._get("replacer/view/rules")
-            rule_list = rules.get("replacerRules", rules) if isinstance(rules, dict) else []
+            rule_list = rules.get("rules", []) if isinstance(rules, dict) else []
             if not isinstance(rule_list, list):
                 rule_list = []
             for r in rule_list:
@@ -196,9 +229,11 @@ class ZAPClient:
             cleared.append({"type": "replacer", "description": "_list", "status": f"list_failed: {e}"})
 
         # --- Rate-limit rules ---
+        # ZAP 2.17's endpoint is network/view/getRateLimitRules (NOT
+        # rateLimitRules), and the response key is "getRateLimitRules".
         try:
-            rules = self._get("network/view/rateLimitRules")
-            rule_list = rules.get("rateLimitRules", rules) if isinstance(rules, dict) else []
+            rules = self._get("network/view/getRateLimitRules")
+            rule_list = rules.get("getRateLimitRules", []) if isinstance(rules, dict) else []
             if not isinstance(rule_list, list):
                 rule_list = []
             for r in rule_list:
@@ -361,8 +396,12 @@ class ZAPClient:
                     return inner[0]
                 resp = inner
             return cast(Dict[str, Any], resp)
-        except requests.HTTPError as e:
+        except ZAPAPIError:
             # 400 Bad Request is returned if the raw request is malformed.
+            # Re-raise with the ZAP error body already in the message.
+            raise
+        except requests.HTTPError as e:
+            # Fallback for non-ZAP HTTP errors (proxy, network, etc.).
             if e.response is not None and e.response.status_code == 400:
                 raise ValueError(
                     f"ZAP rejected the raw request: {e.response.text[:2000]}"
@@ -407,10 +446,24 @@ class ZAPClient:
         return " ".join(parts) + "\n" + rest
 
     def spider(self, url: str, max_depth: int = 5, recurse: bool = True) -> str:
-        """Start the traditional crawler; returns the scan id (e.g. ``"0"``)."""
+        """Start the traditional crawler; returns the scan id (e.g. ``"0"``).
+
+        ``max_depth`` is applied via ``setOptionMaxDepth`` because
+        ``spider/action/scan`` does NOT accept a ``maxDepth`` query
+        parameter (ZAP silently ignores unknown params).  The accepted
+        scan-action params are: ``url``, ``maxChildren``, ``recurse``,
+        ``contextName``, ``subtreeOnly``.
+        """
+        # Set the global max-depth option before launching — the scan
+        # action has no maxDepth parameter of its own.
+        if max_depth != 5:
+            try:
+                self._get("spider/action/setOptionMaxDepth", Integer=str(max_depth))
+            except Exception:
+                pass  # non-fatal: scan still runs with the previous depth
         return self._get(
             "spider/action/scan", url=url,
-            maxDepth=max_depth, recurse=str(recurse).lower(),
+            recurse=str(recurse).lower(),
         ).get("scan", "")
 
     def spider_status(self, scan_id: str) -> int:
@@ -418,8 +471,20 @@ class ZAPClient:
         return int(self._get("spider/view/status", scanId=scan_id).get("status", 0))
 
     def ajax_spider(self, url: str) -> str:
-        """Start the headless-browser AJAX spider; returns the scan id."""
-        return self._get("ajaxSpider/action/scan", url=url).get("scan", "")
+        """Start the headless-browser AJAX spider.
+
+        The AJAX spider is a **singleton** — there is no per-scan ID like
+        the traditional spider or active scanner.  The API returns
+        ``{"Result": "OK"}`` with no ``scan`` key.  Poll progress with
+        ``ajax_spider_status()`` (takes no scan-id).  Returns ``"OK"``
+        so the wrapper can report a non-empty, meaningful value.
+        """
+        result = self._get("ajaxSpider/action/scan", url=url)
+        # The response is {"Result": "OK"} — no scan ID.  Return the result
+        # string so the caller gets a truthy, non-empty value instead of "".
+        if isinstance(result, dict):
+            return result.get("Result", "started")
+        return "started"
 
     def ajax_spider_status(self) -> str:
         """Running / stopped / finished."""
@@ -634,6 +699,13 @@ class ZAPClient:
             q["baseurl"] = u
         try:
             urls = self._get("core/view/urls", **q).get("urls", [])
+        except ZAPAPIError as e:
+            return json.dumps({
+                "error": True,
+                "zap_error_code": e.code,
+                "zap_error_body": e.message,
+                "fallback_sites": self.sites(),
+            })
         except requests.HTTPError as e:
             resp = getattr(e, "response", None)
             body = resp.text[:2000] if resp is not None else ""
@@ -681,8 +753,22 @@ class ZAPClient:
                 reportFileName=report_file,
                 reportTitle=report_title,
             )
-        except requests.exceptions.HTTPError as e:
+        except ZAPAPIError as e:
             # 400 + body containing "no_implementor" -> add-on missing.
+            if "no_implementor" in e.message:
+                return {
+                    "path": None,
+                    "error": (
+                        "ZAP reports add-on is not installed. The vanilla "
+                        "zap.sh -daemon image does not bundle it. Run "
+                        "`zap.sh -daemon -addoninstall reports` once to "
+                        "install, or fetch the reports add-on from the "
+                        "ZAP marketplace, then restart the daemon."
+                    ),
+                }
+            raise
+        except requests.exceptions.HTTPError as e:
+            # Fallback for non-ZAP HTTP errors.
             if (e.response is not None
                     and "no_implementor" in (e.response.text or "")):
                 return {
@@ -782,14 +868,17 @@ def zap_spider_status(scan_id: str) -> Dict[str, Any]:
 
 @framework_tool("Start the AJAX (headless-browser) spider against a URL.")
 def zap_ajax_spider(target: str) -> Dict[str, str]:
-    """Args:
+    """The AJAX spider is a singleton — there is no per-scan ID.  Poll
+    progress with ``zap_ajax_spider_status`` (it takes no scan-id argument).
+
+    Args:
         target: Fully qualified URL to start the headless-browser crawl from.
     """
     from utils.scope_gate import check_scan, ScopeGateError
     _sc_ok, _sc_reason = check_scan(target)
     if not _sc_ok:
         raise ScopeGateError(f"scope gate: {_sc_reason}")
-    return {"ajax_spider_id": _zap().ajax_spider(target)}
+    return {"status": _zap().ajax_spider(target)}
 
 
 @framework_tool("Get AJAX spider progress (running / stopped / finished) for a given spider_id.")

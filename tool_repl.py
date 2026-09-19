@@ -22,6 +22,7 @@ discovered at startup) for type coercion — no hardcoded type maps.
 import asyncio
 import inspect
 import json
+import shlex
 import sys
 import time
 import traceback
@@ -515,7 +516,11 @@ def _scope_command(rest: str):
     """
     from utils import scope_gate
 
-    parts = rest.split()
+    try:
+        parts = shlex.split(rest)
+    except ValueError as e:
+        print(f"  Argument parse error: {e}")
+        return
     if not parts:
         print("  Packet-scope gate (operator-only — not exposed to the agent).")
         print("  When armed, send_packet refuses packets to destinations not")
@@ -773,7 +778,14 @@ async def repl_loop(manifests: List[ToolManifest]):
             if not rest:
                 print("  Usage: run <tool_id> [--flag value ...] or run <tool_id> --json '{...}'")
                 continue
-            tokens = rest.split()
+            # Use shlex.split so shell-style quoting is honoured: without it,
+            # --target 'https://example.com' passes the literal quotes as
+            # part of the value → ZAP gets url='https://example.com' → 400.
+            try:
+                tokens = shlex.split(rest)
+            except ValueError as e:
+                print(f"  Argument parse error (unbalanced quotes?): {e}")
+                continue
             tool_id = tokens[0]
             arg_tokens = tokens[1:]
 

@@ -24,7 +24,7 @@ import pytest
 # test (which would clobber a monkeypatched WORKSPACE_ROOT).
 import auxiliaries.program_scope  # noqa: F401
 
-from auxiliaries.zap import ZAPClient, _canonical, _status_from_headers
+from auxiliaries.zap import ZAPClient, ZAPAPIError, _canonical, _status_from_headers
 
 
 # --- helper fixtures --------------------------------------------------------
@@ -216,9 +216,9 @@ def test_configure_surfaces_replacer_failure(zap_client, monkeypatch, tmp_path):
         if view == "replacer/action/addRule":
             raise RuntimeError("ZAP daemon error")
         if view == "replacer/view/rules":
-            return {"replacerRules": []}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": []}
+            return {"rules": []}
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": []}
         return {}
     monkeypatch.setattr(zap_client, "_get", fake_get)
 
@@ -241,9 +241,9 @@ def test_configure_surfaces_ratelimit_failure(zap_client, monkeypatch, tmp_path)
         if view == "network/action/addRateLimitRule":
             raise RuntimeError("network component unavailable")
         if view == "replacer/view/rules":
-            return {"replacerRules": []}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": []}
+            return {"rules": []}
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": []}
         return {}
     monkeypatch.setattr(zap_client, "_get", fake_get)
 
@@ -271,9 +271,9 @@ def test_clear_ri_rules_removes_stale_replacer(zap_client, monkeypatch):
 
     def fake_get(view, **q):
         if view == "replacer/view/rules":
-            return {"replacerRules": existing_rules}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": []}
+            return {"rules": existing_rules}
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": []}
         # removeRule calls
         return {}
     monkeypatch.setattr(zap_client, "_get", fake_get)
@@ -291,9 +291,9 @@ def test_clear_ri_rules_removes_stale_ratelimit(zap_client, monkeypatch):
 
     def fake_get(view, **q):
         if view == "replacer/view/rules":
-            return {"replacerRules": []}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": [
+            return {"rules": []}
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": [
                 {"description": f"{_RI_PREFIX}ratelimit-old.host.com"},
                 {"description": "user-ratelimit-rule"},
             ]}
@@ -324,11 +324,11 @@ def test_configure_clears_stale_before_applying(zap_client, monkeypatch, tmp_pat
     def fake_get(view, **q):
         call_log.append(view)
         if view == "replacer/view/rules":
-            return {"replacerRules": [
+            return {"rules": [
                 {"description": f"{_RI_PREFIX}header-x-old-program-header"},
             ]}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": [
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": [
                 {"description": f"{_RI_PREFIX}ratelimit-old.host.com"},
             ]}
         return {}
@@ -366,9 +366,9 @@ def test_configure_h1_default_header(zap_client, monkeypatch, tmp_path):
     def fake_get(view, **q):
         calls.append((view, q))
         if view == "replacer/view/rules":
-            return {"replacerRules": []}
-        if view == "network/view/rateLimitRules":
-            return {"rateLimitRules": []}
+            return {"rules": []}
+        if view == "network/view/getRateLimitRules":
+            return {"getRateLimitRules": []}
         return {}
     monkeypatch.setattr(zap_client, "_get", fake_get)
 
@@ -392,6 +392,84 @@ def test_configure_no_scope_returns_none(zap_client, monkeypatch):
     cfg = zap_client.configure_scan_config(
         "http://target.com", "nonexistent_program", "intigriti")
     assert cfg is None
+
+
+# --- Regression: AJAX spider returns no scan ID (singleton) -----------------
+
+def test_ajax_spider_returns_result_not_empty(zap_client, monkeypatch):
+    """ajaxSpider/action/scan returns {"Result": "OK"} — no "scan" key.
+    The method must return a non-empty, meaningful value, NOT ""."""
+    monkeypatch.setattr(zap_client, "_get",
+                        lambda v, **q: {"Result": "OK"})
+    result = zap_client.ajax_spider("http://example.com")
+    assert result != ""
+    assert result == "OK"
+
+
+# --- Regression: ZAPAPIError surfaces error code + message ------------------
+
+def test_zap_api_error_carries_code_and_message():
+    err = ZAPAPIError(400, "url_not_found", "URL Not Found in the Scan Tree")
+    assert err.status_code == 400
+    assert err.code == "url_not_found"
+    assert "URL Not Found in the Scan Tree" in str(err)
+
+
+def test_get_raises_zap_api_error_on_400(zap_client, monkeypatch):
+    """When ZAP returns 400 with an error body, _get raises ZAPAPIError
+    with the code and message — not a bare HTTPError."""
+    import requests as _requests
+    from unittest import mock
+
+    fake_resp = mock.Mock()
+    fake_resp.ok = False
+    fake_resp.status_code = 400
+    fake_resp.text = '{"code":"url_not_found","message":"URL Not Found in the Scan Tree"}'
+    fake_resp.json.return_value = {"code": "url_not_found",
+                                   "message": "URL Not Found in the Scan Tree"}
+    monkeypatch.setattr(zap_client.session, "get",
+                        lambda *a, **kw: fake_resp)
+    with pytest.raises(ZAPAPIError) as exc_info:
+        zap_client._get("ascan/action/scan", url="http://nope.invalid")
+    assert exc_info.value.code == "url_not_found"
+    assert "URL Not Found" in exc_info.value.message
+
+
+# --- Regression: spider max_depth uses setOptionMaxDepth --------------------
+
+def test_spider_sets_max_depth_via_option(zap_client, monkeypatch):
+    """spider() must call setOptionMaxDepth when max_depth != 5, because
+    spider/action/scan doesn't accept a maxDepth parameter."""
+    calls = []
+    def fake_get(view, **q):
+        calls.append((view, q))
+        if view == "spider/action/scan":
+            return {"scan": "0"}
+        return {}
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+
+    zap_client.spider("http://example.com", max_depth=10)
+
+    set_depth_calls = [c for c in calls if c[0] == "spider/action/setOptionMaxDepth"]
+    assert len(set_depth_calls) == 1
+    assert set_depth_calls[0][1]["Integer"] == "10"
+
+
+def test_spider_skips_set_option_when_default_depth(zap_client, monkeypatch):
+    """spider() should NOT call setOptionMaxDepth when max_depth == 5
+    (the ZAP default) — avoids an unnecessary API round-trip."""
+    calls = []
+    def fake_get(view, **q):
+        calls.append((view, q))
+        if view == "spider/action/scan":
+            return {"scan": "0"}
+        return {}
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+
+    zap_client.spider("http://example.com", max_depth=5)
+
+    set_depth_calls = [c for c in calls if c[0] == "spider/action/setOptionMaxDepth"]
+    assert len(set_depth_calls) == 0
 
 
 if __name__ == "__main__":
