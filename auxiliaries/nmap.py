@@ -58,6 +58,29 @@ def _parse_nmap_verdict(log_text: str) -> Dict[str, Any]:
     }
 
 
+def _nmap_target_argv(target: str) -> List[str]:
+    """Split a multi-target string into nmap argv elements.
+
+    nmap treats ONE space-containing argv element as a single (unresolvable)
+    hostname — live-verified: "Failed to resolve \"192.168.90.114,...". So:
+    whitespace-separated entries become separate argv items, and full-IP
+    comma merges ('a.b.c.d,w.x.y.z') are split apart too, while nmap's own
+    octet-list syntax ('a.b.c.d,e,f') stays ONE argv element.
+    """
+    import shlex
+
+    argv: List[str] = []
+    for chunk in shlex.split(target):
+        parts = chunk.split(",")
+        if len(parts) > 1 and all(
+            re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", p) for p in parts
+        ):
+            argv.extend(parts)  # full-IP comma merge -> one argv each
+        else:
+            argv.append(chunk)  # octet-lists / CIDRs / hosts / ranges stay whole
+    return argv
+
+
 @framework_tool(
     "Launch and start a new Nmap port scan on a target, subnet, or CIDR "
     "range: discovers live hosts and enumerates open ports and services. "
@@ -97,7 +120,7 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     if "-Pn" not in opt_list and "-Pn" not in options:
         opt_list = ["-Pn", *opt_list]
 
-    command = ["nmap", *opt_list, target]
+    command = ["nmap", *opt_list, *_nmap_target_argv(target)]
 
     return launch_job(
         command,

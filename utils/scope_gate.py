@@ -392,6 +392,28 @@ def _check_broad(spec: str, state: Dict[str, Any]) -> Tuple[bool, str]:
 # Public verdicts (called by traffic-sending tools)
 # --------------------------------------------------------------------------- #
 
+def _expand_comma_shorthand(raw: str) -> str:
+    """Expand nmap-style octet-list commas: 'a.b.c.d,e,f' -> full IPs.
+
+    Only rewrites comma-runs anchored on a dotted quad with BARE-octet
+    followers (192.168.90.114,115,116,118).  Full-IP comma merges
+    ('a.b.c.d,w.x.y.z'), CIDRs, hyphen ranges, and hostnames pass through
+    untouched — nmap's own octet-list syntax stays one argv element for
+    run_nmap, while the gate gets fully-qualified targets to validate.
+    """
+
+    def _expand(match: "re.Match[str]") -> str:
+        anchor = match.group(0).split(",")[0]
+        prefix = anchor.rsplit(".", 1)[0]
+        followers = re.findall(r",(\d{1,3})", match.group(0))
+        return ",".join([anchor] + [f"{prefix}.{o}" for o in followers])
+
+    return re.sub(
+        r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?:,\d{1,3})+(?![\d.])",
+        _expand,
+        raw,
+    )
+
 def check_send(dst_ip: Optional[str]) -> Tuple[bool, str]:
     """Verdict for a single packet destination IP (packetcraft).
 
@@ -429,11 +451,17 @@ def check_scan(target: Optional[str]) -> Tuple[bool, str]:
         )
 
     # Keep a URL whole (it may contain characters that look like separators);
-    # otherwise split nmap/masscan-style "host1 host2,10.0.0.0/24" lists.
+    # otherwise split nmap/masscan-style "host1 host2,10.0.0.0/24" lists,
+    # first expanding octet-list commas ('a.b.c.d,e,f') to full IPs so
+    # shorthand lists validate like their fully-qualified equivalents.
     if "://" in raw:
         specs = [raw]
     else:
-        specs = [s.strip() for s in re.split(r"[\s,]+", raw) if s.strip()]
+        specs = [
+            s.strip()
+            for s in re.split(r"[\s,]+", _expand_comma_shorthand(raw))
+            if s.strip()
+        ]
 
     for spec in specs:
         checkable, broad = _spec_to_checkable(spec)
