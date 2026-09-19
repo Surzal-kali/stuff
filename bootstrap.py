@@ -648,10 +648,49 @@ class FrameworkLoader:
         # ConnectionError on a half-initialised daemon.
         await self.wait_for_zap()
 
+        # Post-launch: if an operator-armed scope exists, mirror it into ZAP
+        # (context includes/excludes) and flip mode=protect — ZAP itself then
+        # refuses every out-of-scope request (redirect hops, spider crawls,
+        # scan traffic, proxied manual browsing). Fire-and-forget: lab mode
+        # without an armed scope is a legitimate state and sync failures are
+        # logged, never fatal to the launch.
+        self.active_tasks.append(
+            asyncio.create_task(_zap_protect_launch_sync())
+        )
+
         logger.info("[+] API Control Panel started on port 5000")
         logger.info("[*] Background servers initialized.")
 
 # --- Main ---
+async def _zap_protect_launch_sync() -> None:
+    """Post-launch ZAP hardening: mirror the armed scope, set mode=protect.
+
+    Non-fatal by design: with no scope armed (lab mode) the sync reports a
+    clean skip; with ZAP down it times out and logs — never blocks launch.
+    """
+    try:
+        from auxiliaries.zap import sync_protect_scope
+
+        result = await asyncio.to_thread(sync_protect_scope)
+        if result.get("status") == "Success":
+            logger.info(
+                "[+] ZAP protect-mode ON (context '%s', mode='%s', "
+                "includes=%d, excludes=%d, skipped=%d)",
+                result.get("context"),
+                result.get("mode"),
+                result.get("include_count"),
+                result.get("exclude_count"),
+                len(result.get("skipped") or []),
+            )
+        else:
+            logger.warning(
+                "[!] ZAP protect-mode sync not applied: %s",
+                result.get("error", result),
+            )
+    except Exception as e:  # noqa: BLE001 - launch must never hinge on ZAP sync
+        logger.warning("[!] ZAP protect-mode sync failed (non-fatal): %s", e)
+
+
 async def run_framework():
     daemon_mode = "--daemon" in sys.argv
     loader = FrameworkLoader(FRAMEWORK_ROOT)

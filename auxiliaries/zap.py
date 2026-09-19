@@ -186,9 +186,54 @@ class ZAPClient:
 
     # ---- primitives ------------------------------------------------------
 
-    def open_url(self, url: str) -> Dict[str, Any]:
-        """Load a URL into the session; passive scanner observes it."""
-        return self._get("core/action/accessUrl", url=url)
+    def open_url(self, url: str, follow_redirects: bool = False) -> Dict[str, Any]:
+        """Load a URL into the session; passive scanner observes it.
+
+        ``core/action/accessUrl`` supports an optional ``followRedirects``
+        param — defaults here to False (redirect-locked at tool/call level):
+        a 3xx hop to an out-of-scope host must never be followed ungated.
+        """
+        _zap_scope_drift_guard()
+        return self._get(
+            "core/action/accessUrl",
+            url=url,
+            followRedirects=str(bool(follow_redirects)).lower(),
+        )
+
+    # ---- mode + protect-scope (2026-09-19) ------------------------------
+
+    def get_mode(self) -> str:
+        resp = self._get("core/view/mode")
+        if isinstance(resp, dict):
+            return str(resp.get("mode", ""))
+        return str(resp)
+
+    def set_mode(self, mode: str) -> None:
+        self._get("core/action/setMode", mode=mode)
+
+    def _context_exists(self, name: str) -> bool:
+        try:
+            resp = self._get("context/view/contextList")
+            names = resp.get("contextList", []) if isinstance(resp, dict) else []
+            return name in names
+        except Exception:  # noqa: BLE001 - a failed list is not proof of absence
+            return False
+
+    def context_new(self, name: str) -> None:
+        if self._context_exists(name):
+            return
+        self._get("context/action/newContext", contextName=name)
+        self._get(
+            "context/action/setContextInScope",
+            contextName=name,
+            booleanInScope="true",
+        )
+
+    def context_include(self, name: str, regex: str) -> None:
+        self._get("context/action/includeInContext", contextName=name, regex=regex)
+
+    def context_exclude(self, name: str, regex: str) -> None:
+        self._get("context/action/excludeFromContext", contextName=name, regex=regex)
 
     # ---- scan-config enforcement (Intigriti RoE) -------------------------
 
@@ -454,6 +499,7 @@ class ZAPClient:
         scan-action params are: ``url``, ``maxChildren``, ``recurse``,
         ``contextName``, ``subtreeOnly``.
         """
+        _zap_scope_drift_guard()
         # Set the global max-depth option before launching — the scan
         # action has no maxDepth parameter of its own.
         if max_depth != 5:
@@ -471,6 +517,7 @@ class ZAPClient:
         return int(self._get("spider/view/status", scanId=scan_id).get("status", 0))
 
     def ajax_spider(self, url: str) -> str:
+        _zap_scope_drift_guard()
         """Start the headless-browser AJAX spider.
 
         The AJAX spider is a **singleton** — there is no per-scan ID like
@@ -491,6 +538,7 @@ class ZAPClient:
         return self._get("ajaxSpider/view/status").get("status", "unknown")
 
     def active_scan(self, url: str, policy: Optional[str] = None) -> str:
+        _zap_scope_drift_guard()
         """Run an active scan against a URL (optionally with a named policy)."""
         q: Dict[str, Any] = {"url": url, "recurse": "true"}
         if policy:
@@ -834,7 +882,12 @@ def zap_open_url(target: str,
     scan_cfg = None
     if scope_handle and scope_platform:
         scan_cfg = zap.configure_scan_config(target, scope_handle, scope_platform)
-    result = zap.open_url(target)
+    # Redirect-locked at tool/call level: accessUrl's followRedirects param
+    # is passed explicitly as False (2026-09-19 redirect-bypass fix). ZAP
+    # has NO API-level global redirect off (network component has no such
+    # option) — every direct request tool must carry the lock itself.
+    result = zap.open_url(target, follow_redirects=False)
+    result["redirect_lock"] = "followRedirects=false (accessUrl)"
     if scan_cfg:
         result["scan_config_applied"] = scan_cfg
     return result
@@ -850,6 +903,13 @@ def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[st
         max_depth: Maximum link depth from ``target`` (default 5).
         recurse: Follow links recursively (default True). Set False for a
             single-page fetch.
+
+    Redirect residual: the spider API has NO follow-redirects parameter
+    (ZAP's network component exposes no such option either, verified against
+    the 2.16 API catalogue) — redirect following is ZAP-internal here. The
+    call-level control that DOES exist is ZAP's own scope (spider
+    excludeFromScan / domainsAlwaysInScope) plus ZAP mode=protect, which
+    makes ZAP itself refuse out-of-scope hops. Operator-level decision.
     """
     from utils.scope_gate import check_scan, ScopeGateError
     _sc_ok, _sc_reason = check_scan(target)
@@ -1114,3 +1174,209 @@ def zap_send_raw(raw_request: str,
         "response_header": env.get("responseHeader", ""),
         "response_body": env.get("responseBody", ""),
     }
+
+
+# ---- protect-mode scope sync (2026-09-19) -----------------------------------
+# ZAP has no API-level redirect off; mode=protect + a context mirroring the
+# operator-armed scope is the architectural control: ZAP itself refuses every
+# out-of-scope request (redirect hops, spider crawls, scan traffic, proxied
+# manual browsing). The armed manifest is read here — never written.
+
+def sync_protect_scope(zap: Optional[ZAPClient] = None) -> Dict[str, Any]:
+    """Mirror the armed scope into a ZAP context and set mode=protect.
+
+    Reads ``scope/.armed_packet_scope.json`` + the cached manifest (the
+    operator-armed scope is the single source of truth; this function NEVER
+    writes scope state). Allowlist IPs, blessed hostnames, and web-surface
+    manifest assets become context includes; out-of-scope assets become
+    excludes. CIDR assets are skipped (not URL-regex expressible — bless
+    individual IPs with ``scope add-ip`` instead). Sets ``mode=protect``
+    last, so ZAP enforces the boundary itself.
+    """
+    import re
+
+    from utils.scope_gate import _load_manifest, _load_state
+
+    state = _load_state()
+    if state is None:
+        return {
+            "status": "Failed",
+            "error": (
+                "no scope armed (lab mode) — nothing to protect; arm with "
+                "'scope on <handle>' (or add-ips) and re-run"
+            ),
+        }
+    handle = state.get("handle", "") or "scope"
+    platform = state.get("platform", "h1")
+    manifest = _load_manifest(state.get("handle", ""), platform)
+    if manifest is None:
+        from auxiliaries.program_scope import _load_cache
+
+        manifest = _load_cache(state.get("handle", ""), platform)
+
+    zap = zap or _zap()
+    context_name = f"framework-armed-{handle}"
+
+    includes: List[str] = []
+    excludes: List[str] = []
+    skipped: List[Dict[str, str]] = []
+
+    def _host_patterns(host: str) -> List[str]:
+        h = re.escape(host.lower())
+        return [
+            rf"https?://([^.]+\.)?{h}(:\d+)?(/.*)?",
+            rf"https?://{h}(:\d+)?(/.*)?",
+        ]
+
+    def _asset_patterns(
+        asset: Dict[str, Any], out: List[str], skip: List[Dict[str, str]]
+    ) -> None:
+        atype = str(asset.get("asset_type", "")).upper()
+        ident = str(asset.get("asset_identifier", "")).strip()
+        if not ident:
+            return
+        if atype == "DOMAIN":
+            out.extend(_host_patterns(ident))
+        elif atype == "WILDCARD":
+            base = ident[2:] if ident.startswith("*.") else ident
+            out.extend(_host_patterns(base))
+        elif atype == "URL":
+            out.append(re.escape(ident.rstrip("/")) + ".*")
+        elif atype in ("ANDROID", "IOS", "BLOCKCHAIN"):
+            skip.append({"asset": ident, "reason": f"{atype}: not a web surface"})
+        elif atype == "CIDR":
+            skip.append(
+                {
+                    "asset": ident,
+                    "reason": "CIDR not URL-regex expressible — bless "
+                    "individual IPs via 'scope add-ip'",
+                }
+            )
+        else:
+            skip.append({"asset": ident, "reason": f"unmapped asset_type {atype}"})
+
+    for ip, host in (state.get("allowlist") or {}).items():
+        if ip:
+            includes.extend(_host_patterns(ip))
+        if host:
+            includes.extend(_host_patterns(host))
+    for asset in manifest.get("out_of_scope_assets") or []:
+        _asset_patterns(asset, excludes, skipped)
+    for asset in manifest.get("in_scope") or []:
+        _asset_patterns(asset, includes, skipped)
+
+    try:
+        zap.context_new(context_name)
+    except Exception as e:  # noqa: BLE001 - tolerate already_exists; refuse real failures
+        if not zap._context_exists(context_name):
+            return {
+                "status": "Failed",
+                "error": f"context setup failed: {type(e).__name__}: {e}",
+            }
+    for rx in includes:
+        zap.context_include(context_name, rx)
+    for rx in excludes:
+        zap.context_exclude(context_name, rx)
+    zap.set_mode("protect")
+
+    return {
+        "status": "Success",
+        "mode": zap.get_mode(),
+        "context": context_name,
+        "include_count": len(includes),
+        "exclude_count": len(excludes),
+        "skipped": skipped[:20],
+        "handle": handle,
+        "note": (
+            "ZAP now refuses out-of-scope requests itself (mode=protect): "
+            "redirect hops, spider crawls, scan traffic, and proxied manual "
+            "browsing to non-scope hosts. Manual recon beyond scope happens "
+            "OUTSIDE ZAP by design."
+        ),
+    }
+
+
+@framework_tool(
+    "ZAP scope sync: mirror the operator-armed scope into the ZAP daemon "
+    "and set mode=protect. Builds the 'framework-armed-<handle>' context "
+    "from the armed allowlist + in-scope assets (out-of-scope assets become "
+    "excludes), then flips ZAP to protect mode so ZAP ITSELF refuses every "
+    "out-of-scope request — redirect hops, spider crawls, active scans, "
+    "and proxied manual browsing. Automatic web recon follows the "
+    "guidelines by construction; RUN THIS AFTER ANY SCOPE ARM/CHANGE and "
+    "before ZAP-heavy work when in doubt (it is also auto-run at framework "
+    "launch and drift-guarded on every traffic-bearing ZAP call). The "
+    "armed scope manifest is read, never written; CIDR assets must be "
+    "blessed as IPs (scope add-ip).",
+    next_hints=["zap_open_url", "zap_spider", "zap_active_scan", "report_finding"],
+)
+def zap_sync_scope() -> Dict[str, Any]:
+    """Sync ZAP's context + mode with the operator-armed scope (read-only on scope)."""
+    return sync_protect_scope()
+
+
+def _zap_scope_drift_guard() -> Optional[Dict[str, Any]]:
+    """Detect armed-scope drift and auto-repair the ZAP mirror.
+
+    Compares the armed state file's mtime against the last-synced mtime
+    (sidecar ``.zap_protect_sync.json`` next to the state file). Called at
+    the top of every traffic-bearing ZAP client method (open_url, spider,
+    active_scan, ajax_spider) so a scope change the operator made without a
+    re-sync is picked up BEFORE the next request fires:
+
+    - scope CHANGED -> sync_protect_scope() re-mirrors the context and keeps
+      mode=protect (layer-1 gate already reads live state at entry; this
+      closes the layer-2 mirror-drift window: internal redirect hops and
+      spider/scan crawling that the per-call locks cannot see).
+    - scope DISARMED -> mode=standard restored and sidecar cleared (lab
+      mode is the operator's chosen state; ZAP must not keep a stale
+      boundary).
+    - fresh mirror -> None, no side effects.
+
+    Repair failures are reported but never block the tool call: the
+    tool-entry gate (check_scan) remains authoritative for the requested
+    target; the drift only ever affects ZAP-internal hops.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from utils.scope_gate import _state_path
+
+    state_p = Path(_state_path())
+    sidecar = state_p.parent / ".zap_protect_sync.json"
+    try:
+        armed_mtime: Optional[float] = state_p.stat().st_mtime
+    except OSError:
+        armed_mtime = None  # armed state file removed -> disarmed
+
+    last: Optional[float] = None
+    if sidecar.is_file():
+        try:
+            last = float(_json.loads(sidecar.read_text()).get("armed_mtime") or 0)
+        except Exception:  # noqa: BLE001 - unreadable sidecar = treat as stale
+            last = None
+
+    if armed_mtime is None:
+        if last is None:
+            return None  # never synced, nothing to restore
+        try:
+            _zap().set_mode("standard")
+            sidecar.unlink()
+            return {"drift": "scope disarmed — ZAP mode restored to standard"}
+        except Exception as e:  # noqa: BLE001
+            return {"drift": f"scope disarmed, but ZAP restore failed: {e}"}
+
+    if last == armed_mtime:
+        return None  # mirror is fresh
+    try:
+        result = sync_protect_scope(_zap())
+        if result.get("status") == "Success":
+            sidecar.write_text(_json.dumps({"armed_mtime": armed_mtime}))
+            return {
+                "drift": "re-synced",
+                "mode": result.get("mode"),
+                "context": result.get("context"),
+            }
+        return {"drift": f"re-sync failed: {result.get('error')}"}
+    except Exception as e:  # noqa: BLE001 - never block the tool call on the guard
+        return {"drift": f"re-sync failed: {type(e).__name__}: {e}"}
