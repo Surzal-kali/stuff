@@ -80,17 +80,18 @@ def _cors_verdict(acao: Optional[str], acac: Optional[str], origin_sent: str) ->
 
 
 def _fetch(url: str, headers: Dict[str, str], insecure: bool):
-    import requests
+    """GET via utils.gated_http — in-scope redirects are followed hop-by-hop
+    with per-hop gate validation; a hop to an out-of-scope host raises
+    ScopeGateError (hard fail for these single-URL tools)."""
+    from utils.gated_http import gated_get
 
-    with requests.Session() as s:
-        s.headers.update({"User-Agent": "framework-corsprobe/1.0"})
-        return s.get(
-            url,
-            headers=headers,
-            timeout=_TIMEOUT,
-            verify=not insecure,
-            allow_redirects=False,
-        )
+    r, _hops = gated_get(
+        url,
+        headers={"User-Agent": "framework-corsprobe/1.0", **(headers or {})},
+        verify=not insecure,
+        timeout=_TIMEOUT,
+    )
+    return r
 
 
 @framework_tool(

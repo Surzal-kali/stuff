@@ -83,17 +83,22 @@ def _ports(ports: str) -> List[int]:
 def _fetch_one(
     url: str, timeout: float, insecure: bool
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """One probe. Returns (result_dict, None) or (None, error_string)."""
+    """One probe. Returns (result_dict, None) or (None, error_string).
+
+    Redirects are followed hop-by-hop with per-hop scope-gate validation
+    (utils/gated_http): a 302 to an out-of-scope host BLOCKS that probe
+    (reported in ``dead`` with the gate reason) instead of firing there.
+    """
+    from utils.gated_http import gated_get
+    from utils.scope_gate import ScopeGateError
+
     try:
-        with requests.Session() as s:
-            s.headers.update({"User-Agent": "framework-webprobe/1.0"})
-            r = s.get(
-                url,
-                timeout=(3.0, timeout),
-                verify=not insecure,
-                allow_redirects=True,
-                stream=False,
-            )
+        r, hops = gated_get(
+            url,
+            headers={"User-Agent": "framework-webprobe/1.0"},
+            verify=not insecure,
+            timeout=(3.0, timeout),
+        )
         head = r.text[:65536] if r.encoding is not None or r.content else ""
         title_m = _TITLE_RE.search(head)
         title = _ws.sub(" ", title_m.group(1)).strip()[:200] if title_m else None
@@ -129,8 +134,10 @@ def _fetch_one(
             "x_powered_by": powered,
             "cookies": [c.name for c in r.cookies],
             "stack_hints": stack,
-            "redirects": [h.headers.get("Location") for h in r.history],
+            "redirects": [h["url"] for h in hops[1:]],
         }, None
+    except ScopeGateError as e:
+        return None, f"scope-gate-blocked: {e}"
     except requests.exceptions.SSLError:
         return None, "ssl-error (try insecure=True)"
     except requests.exceptions.ConnectTimeout:

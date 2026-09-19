@@ -92,19 +92,24 @@ _SECRET_BATTERY: Tuple[Tuple[str, str], ...] = (
 
 
 def _fetch(url: str, timeout: float, insecure: bool) -> Tuple[Optional[str], int, str]:
-    """GET ``url``; returns (text_or_None, status, error_string)."""
+    """GET ``url``; returns (text_or_None, status, error_string).
+
+    Uses utils.gated_http: redirects are followed hop-by-hop with per-hop
+    scope-gate validation — a bundle that 302s out of scope is BLOCKED,
+    never fetched.
+    """
+    from utils.gated_http import gated_get
+    from utils.scope_gate import ScopeGateError
+
     try:
-        with requests.Session() as s:
-            s.headers.update({"User-Agent": "framework-jsrecon/1.0"})
-            r = s.get(
-                url,
-                timeout=(5.0, timeout),
-                verify=not insecure,
-                allow_redirects=True,
-            )
-        if len(r.content) > _MAX_BODY_BYTES:
-            return None, r.status_code, "body-too-large"
-        return r.text, r.status_code, ""
+        r, _hops = gated_get(
+            url,
+            headers={"User-Agent": "framework-jsrecon/1.0"},
+            verify=not insecure,
+            timeout=(5.0, timeout),
+        )
+    except ScopeGateError as e:
+        return None, 0, f"scope-gate-blocked: {e}"
     except requests.exceptions.SSLError:
         return None, 0, "ssl-error (try insecure=True)"
     except requests.exceptions.Timeout:
@@ -113,6 +118,9 @@ def _fetch(url: str, timeout: float, insecure: bool) -> Tuple[Optional[str], int
         return None, 0, f"{type(e).__name__}"
     except Exception as e:  # noqa: BLE001 - recon must never crash the run
         return None, 0, f"{type(e).__name__}:{e}"
+    if len(r.content) > _MAX_BODY_BYTES:
+        return None, r.status_code, "body-too-large"
+    return r.text, r.status_code, ""
 
 
 def _static_asset(path: str) -> bool:

@@ -184,7 +184,21 @@ def archived_urls(
         if wait:
             time.sleep(wait)
         try:
-            r = requests.get(url, timeout=(10.0, 60.0), headers={"User-Agent": _UA})
+            r = requests.get(
+                url,
+                timeout=(10.0, 60.0),
+                headers={"User-Agent": _UA},
+                allow_redirects=False,
+            )
+            if r.status_code in (301, 302, 303, 307, 308):
+                # Egress is hard-locked to web.archive.org: a redirect from
+                # the CDX endpoint means something is wrong — refuse, never
+                # follow.
+                last_err = (
+                    f"cdx endpoint redirected (HTTP {r.status_code}) — "
+                    "refusing; egress is locked to web.archive.org"
+                )
+                break
             if r.status_code == 200:
                 rows = r.json()
                 parsed = _parse_rows(rows if isinstance(rows, list) else [])
