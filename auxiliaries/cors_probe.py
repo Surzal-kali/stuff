@@ -89,7 +89,7 @@ def _fetch(url: str, headers: Dict[str, str], insecure: bool):
             headers=headers,
             timeout=_TIMEOUT,
             verify=not insecure,
-            allow_redirects=True,
+            allow_redirects=False,
         )
 
 
