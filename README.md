@@ -84,31 +84,30 @@ becomes the semantic capability description that the registry embeds.
 
 ## Tool Modules
 
-| Module | Transport | Description |
-| `auxiliaries/program_scope.py` | BRAIN_DISPATCH | HackerOne scope integration: load program scope, check_scope, check_reportable, program_hacktivity |
-| `auxiliaries/impacket_suite.py` | BRAIN_DISPATCH | Impacket post-exploitation: SMB enum/read, secretsdump, psexec/wmiexec/atexec |
-| `auxiliaries/ssh_exec.py` | BRAIN_DISPATCH | SSH batch command execution on a persistent connection |
-| `auxiliaries/smb_scanner.py` | BRAIN_DISPATCH | SMB null session vulnerability scanning |
-| `auxiliaries/cert_tools.py` | BRAIN_DISPATCH | TLS certificate generation/clearing for the OOB collaborator |
-| `auxiliaries/framework_status.py` | BRAIN_DISPATCH | Framework operational health check (Brain, Ollama, ChromaDB, ZAP) |
-| `payloads/metasploiting.py` | BRAIN_DISPATCH / MCP_RPC | Metasploit module search, execution, session polling, interaction |
-| `payloads/ffuf.py` | BRAIN_DISPATCH | ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel) |
-| `payloads/hydra.py` | BRAIN_DISPATCH | Hydra credential brute-force / password-spray (launch/poll/cancel) |
-| `payloads/sqlmap.py` | BRAIN_DISPATCH | sqlmap SQL injection detection (launch/poll with injectable verdict parsing) |
-| `payloads/searchsploiting.py` | BRAIN_DISPATCH | searchsploit (ExploitDB) lookup for known exploits |
-| `payloads/fastcgi.py` | BRAIN_DISPATCH | FastCGI/PHP-FPM exploitation (raw request + php://input RCE chain) |
-| `payloads/wordlists.py` | BRAIN_DISPATCH | Discover and list available wordlist files |
-| `utils/findings.py` | BRAIN_DISPATCH | Report, render, close, and supersede structured security findings |
-| `utils/paramiko_client.py` | BRAIN_DISPATCH | Persistent SSH (connect/exec/shell/close) + one-shot mode |
-| `utils/packetcraft.py` | BRAIN_DISPATCH | Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, sniff_packets, dissect_packet, modify_packet, save/load pcap |
-| `utils/log_reader.py` | BRAIN_DISPATCH | Read/stream Brain and MSF logs |
-| `utils/memory_tools.py` | BRAIN_DISPATCH | Namespaced vector memory (remember_text/recall_text) |
-| `utils/background_job.py` | — (helper) | Shared background-job launch/poll helper for long-running CLI tools |
-| `utils/handles.py` | — (helper) | Session handle formatting, parsing, and validation |
-| `listeners/listening.py` | BRAIN_DISPATCH | TCP listener with Brain event forwarding |
-| `listeners/collaborator.py` | BRAIN_DISPATCH | OOB callback listener (Burp Collaborator analog): HTTP/HTTPS/DNS on one host |
-| `listeners/raw_scan.py` | BRAIN_DISPATCH | Raw SYN port scanner (C++ plugin via ctypes) |
-| `memories.py` | BRAIN_DISPATCH | Namespaced vector memory (remember/search/recall/get/forget) |
+- **`auxiliaries/program_scope.py`** — **BRAIN_DISPATCH**: HackerOne scope integration: load program scope, check_scope, check_reportable, program_hacktivity
+- **`auxiliaries/impacket_suite.py`** — **BRAIN_DISPATCH**: Impacket post-exploitation: SMB enum/read, secretsdump, psexec/wmiexec/atexec
+- **`auxiliaries/ssh_exec.py`** — **BRAIN_DISPATCH**: SSH batch command execution on a persistent connection
+- **`auxiliaries/smb_scanner.py`** — **BRAIN_DISPATCH**: SMB null session vulnerability scanning
+- **`auxiliaries/cert_tools.py`** — **BRAIN_DISPATCH**: TLS certificate generation/clearing for the OOB collaborator
+- **`auxiliaries/framework_status.py`** — **BRAIN_DISPATCH**: Framework operational health check (Brain, Ollama, ChromaDB, ZAP)
+- **`payloads/metasploiting.py`** — **BRAIN_DISPATCH / MCP_RPC**: Metasploit module search, execution, session polling, interaction
+- **`payloads/ffuf.py`** — **BRAIN_DISPATCH**: ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel)
+- **`payloads/hydra.py`** — **BRAIN_DISPATCH**: Hydra credential brute-force / password-spray (launch/poll/cancel)
+- **`payloads/sqlmap.py`** — **BRAIN_DISPATCH**: sqlmap SQL injection detection (launch/poll with injectable verdict parsing)
+- **`payloads/searchsploiting.py`** — **BRAIN_DISPATCH**: searchsploit (ExploitDB) lookup for known exploits
+- **`payloads/fastcgi.py`** — **BRAIN_DISPATCH**: FastCGI/PHP-FPM exploitation (raw request + php://input RCE chain)
+- **`payloads/wordlists.py`** — **BRAIN_DISPATCH**: Discover and list available wordlist files
+- **`utils/findings.py`** — **BRAIN_DISPATCH**: Report, render, close, and supersede structured security findings
+- **`utils/paramiko_client.py`** — **BRAIN_DISPATCH**: Persistent SSH (connect/exec/shell/close) + one-shot mode
+- **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, sniff_packets, dissect_packet, modify_packet, save/load pcap
+- **`utils/log_reader.py`** — **BRAIN_DISPATCH**: Read/stream Brain and MSF logs
+- **`utils/memory_tools.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember_text/recall_text)
+- **`utils/background_job.py`** — **Helper**: Shared background-job launch/poll helper for long-running CLI tools
+- **`utils/handles.py`** — **Helper**: Session handle formatting, parsing, and validation
+- **`listeners/listening.py`** — **BRAIN_DISPATCH**: TCP listener with Brain event forwarding
+- **`listeners/collaborator.py`** — **BRAIN_DISPATCH**: OOB callback listener (Burp Collaborator analog): HTTP/HTTPS/DNS on one host
+- **`listeners/raw_scan.py`** — **BRAIN_DISPATCH**: Raw SYN port scanner (C++ plugin via ctypes)
+- **`memories.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember/search/recall/get/forget)
 
 ### Background Job Pattern
 
