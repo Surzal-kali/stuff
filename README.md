@@ -99,7 +99,7 @@ becomes the semantic capability description that the registry embeds.
 - **`payloads/wordlists.py`** — **BRAIN_DISPATCH**: Discover and list available wordlist files
 - **`utils/findings.py`** — **BRAIN_DISPATCH**: Report, render, close, and supersede structured security findings
 - **`utils/paramiko_client.py`** — **BRAIN_DISPATCH**: Persistent SSH (connect/exec/shell/close) + one-shot mode
-- **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, sniff_packets, dissect_packet, modify_packet, save/load pcap
+- **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, send_and_receive_packet (sr1/srp1: fires a probe and captures its reply in one gated call), sniff_packets, dissect_packet, modify_packet, save/load pcap
 - **`utils/log_reader.py`** — **BRAIN_DISPATCH**: Read/stream Brain and MSF logs
 - **`utils/memory_tools.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember_text/recall_text)
 - **`utils/background_job.py`** — **Helper**: Shared background-job launch/poll helper for long-running CLI tools
@@ -150,7 +150,7 @@ is in your `PATH`.
 | **sqlmap** | `payloads/sqlmap.py` | SQL injection detection |
 | **searchsploit** | `payloads/searchsploiting.py` | ExploitDB local lookup |
 | **Impacket** | `auxiliaries/impacket_suite.py` | Windows post-exploitation (SMB, psexec, wmiexec, atexec, secretsdump) |
-| **Scapy** | `utils/packetcraft.py` | Packet crafting/sniffing (Python library) |
+| **Scapy** | `utils/packetcraft.py` | Packet crafting, send, send-and-receive probes (sr1/srp1), sniffing (Python library) |
 | **Paramiko** | `utils/paramiko_client.py`, `auxiliaries/ssh_exec.py` | SSH client (Python library) |
 
 ### OWASP ZAP
@@ -262,6 +262,60 @@ in `.env`. `program_hacktivity` works without credentials.
 **Intigriti support:** `program_scope.py` also pulls Intigriti program scope
 and hacktivity via `INTIGRITI_USERNAME` + `INTIGRITI_API_TOKEN`; manifests
 cache to `scope/intigriti_<handle>.scope`.
+
+### Scope Gate — Operator-Armed (`utils/scope_gate.py`)
+
+The armed gate is a technical backstop the OPERATOR arms from the Tool
+REPL — separate from `check_scope` above, which only consults a loaded
+manifest. Arming/disarming is deliberately NOT exposed as an
+`@framework_tool`, so the secretary model has no way to toggle or bypass
+it. When disarmed (the default — lab mode) tools behave exactly as
+before.
+
+    scope on <handle> [--platform P] [--no-strict]   # arm (refuses blind: needs a cached manifest)
+    scope status                                      # armed state, asset counts, manifest age
+    scope add-ip <ip> [<hostname>]                    # bless a resolved in-scope IP (CDN-safe)
+    scope rm-ip <ip> / scope list-ips                 # manage the operator allowlist
+
+Enforcement is file-backed, not in-process: the armed state lives in
+`scope/.armed_packet_scope.json` (atomic writes, mtime-checked on every
+call), so a blessing written from the REPL is authoritative in every
+process — a REPL change takes effect immediately inside a running Brain.
+
+Gated calls fail CLOSED — a block raises `ScopeGateError`, which surfaces
+as `Failed` on both dispatch paths (Brain socket + in-process fallback):
+- **`check_send`** — packetcraft `send_packet` / `send_and_receive_packet`:
+  the destination IP extracted from the crafted packet (v4/v6 dst, ARP
+  `pdst`); the check runs BEFORE the probe fires.
+- **`check_scan`** — nmap, masscan, ffuf, hydra, ZAP, impacket/SMB,
+  raw_scan, paramiko SSH, sqlmap, fastcgi, ssh_exec, MSF dispatch:
+  URL / bare host / IP / CIDR / hyphen-range / list shapes; one
+  out-of-scope spec refuses the whole call.
+
+Verdict tiers (first match wins; an out-of-scope match always beats an
+in-scope wildcard):
+1. **Operator allowlist** — `scope add-ip` blessings (authoritative,
+   CDN-safe: the operator confirmed the IP belongs to an in-scope host).
+2. **Manifest match** — the program's typed in-scope assets (DOMAIN/
+   WILDCARD/URL for hostnames, IP/CIDR for IPs).
+3. **Reverse-DNS attribution** — PTR records are attacker-settable, so an
+   in-scope PTR match only auto-allows after forward-confirmation (the
+   PTR name must resolve back to the scanned IP; 2s cap, fail-closed).
+
+Strict mode (default): any unconfirmed target is REFUSED with guidance;
+`--no-strict` warns instead. Broad CIDR/hyphen ranges are allowed only as
+a subnet of an explicit in-scope CIDR asset; otherwise refused — disarm
+(`scope off`) for lab / internal-network work.
+
+Never gated by design: non-routable destinations (broadcast, multicast,
+loopback, link-local, reserved — DHCP/mDNS probes pass), pure-L2 frames
+with no routable IP, receive-only traffic (sniffing, inbound replies), and
+offline tools (crafting/dissecting never touch the wire). Known residual
+surfaces: the gate sees the REQUESTED target only — DNS-resolver traffic
+is out of its view, and redirect-following inside scan binaries is
+handled per-tool (ffuf `-r` is denylist-stripped; ZAP crawls are mirrored
+by `zap_sync_scope`, which puts ZAP itself in protect mode against OOS
+hops).
 
 ### Memory Service (`memories.py`)
 
@@ -535,7 +589,7 @@ utils/
   session_manager.py    Singleton for live session objects
   sessions.py           SQLite database (targets/sessions/notes/findings)
   log_reader.py         Brain/MSF log reading and streaming
-  packetcraft.py        Scapy packet crafting (craft_*/send/sniff/dissect/modify)
+  packetcraft.py        Scapy packet crafting (craft_*/send/send_and_receive/sniff/dissect/modify)
   memory_tools.py       remember_text/recall_text vector memory tools
   background_job.py     Shared background-job launch/poll helper
   handles.py            Session handle formatting/parsing/validation
@@ -543,7 +597,7 @@ utils/
   plugins/              C/C++ shared objects + TLS certs
 encoders/               Encoder plugins (C/C++)
 binaries/               Radare2 binary drop folder (gitignored)
-scope/                  Cached HackerOne program scope manifests (gitignored)
+scope/                  Cached program scope manifests + .armed_packet_scope.json gate state (gitignored)
 findings_md/            Rendered markdown finding reports (gitignored)
 chroma-data/            ChromaDB persistence (gitignored)
 tests/                  pytest suite for registry + secretary flows

@@ -10,6 +10,8 @@ SSH/SMB connection, or raw socket ever fires.
 
 Covers:
 - check_send  (packetcraft): None / non-routable allowed; IP tiers.
+- send_and_receive_packet (packetcraft): gate BEFORE the probe fires; reply
+  captured in the same call.
 - check_scan  (scan tools): URL / host / IP / CIDR / range / list shapes;
   OOS-wins-over-wildcard; broad-range containment; strict vs non-strict;
   empty-target refusal.
@@ -358,6 +360,10 @@ def tools(scope, monkeypatch):
     monkeypatch.setattr(smb, "SMBConnection", _BoomConn)
     monkeypatch.setattr(pc.paramiko, "SSHClient", _FakeSSH)
     monkeypatch.setattr(rs, "load_lib", lambda: _FakeLib())
+    # send_and_receive_packet: stub the live sr1/srp1 points so the
+    # gate-PASSED path never opens a real raw socket or fires a probe.
+    monkeypatch.setattr(p, "sr1", lambda pkt, **kw: None)
+    monkeypatch.setattr(p, "srp1", lambda pkt, **kw: None)
     pkt_hex = p._packet_to_hex(
         p._craft().icmp_echo_request("10.0.0.1", "203.0.113.7", b"x"))
     return type("T", (), dict(nmap=nmap, masscan=masscan, imp=imp, smb=smb,
@@ -388,6 +394,8 @@ class TestEnforcement:
         ("paramiko_oneshot", lambda t: t.pc.paramiko_client("feedback.tesla.com", "u", "p", "id")),
         ("raw_syn_scan", lambda t: t.rs.syn_scan("203.0.113.9", 80)),
         ("packetcraft_send", lambda t: t.pkt.send_packet(t.hex, 1, "lo")),
+        ("packetcraft_send_and_receive",
+         lambda t: t.pkt.send_and_receive_packet(t.hex, 5, "lo")),
     ])
     def test_blocked_raises_scopegate(self, tools, label, call):
         _arm()
@@ -399,6 +407,8 @@ class TestEnforcement:
         ("ssh_connect", lambda t: t.pc.ssh_connect("feedback.tesla.com", "u", "p")),
         ("raw_syn_scan", lambda t: t.rs.syn_scan("203.0.113.9", 80)),
         ("packetcraft_send", lambda t: t.pkt.send_packet(t.hex, 1, "lo")),
+        ("packetcraft_send_and_receive",
+         lambda t: t.pkt.send_and_receive_packet(t.hex, 5, "lo")),
     ])
     def test_disarmed_not_gated(self, tools, label, call):
         g.disarm()
@@ -417,6 +427,97 @@ class TestEnforcement:
             assert _blocked_raises(lambda: tools.pc.ssh_shell(h, "id"))
         finally:
             sm.close(sid)
+
+
+# --- send_and_receive_packet: gate-before-probe + reply capture -------------
+# (2026-09-19) "send and forget" only covers probes that need no answer;
+# sr1/srp1 close the loop in ONE gated call. Stub points: p.sr1 / p.srp1
+# (module-level imports from scapy.all) — nothing real ever fires.
+
+@pytest.fixture
+def sndrcv(scope, monkeypatch):
+    """packetcraft with sr1/srp1 stubbed; canned reply + call recorder."""
+    pytest.importorskip("scapy")
+    import utils.packetcraft as p
+    calls: Dict[str, list] = {"sr1": [], "srp1": []}
+    canned: Dict[str, Any] = {"reply": None}
+
+    def _fake_sr1(pkt, **kw):
+        calls["sr1"].append((pkt, kw))
+        return canned["reply"]
+
+    def _fake_srp1(pkt, **kw):
+        calls["srp1"].append((pkt, kw))
+        return canned["reply"]
+
+    monkeypatch.setattr(p, "sr1", _fake_sr1)
+    monkeypatch.setattr(p, "srp1", _fake_srp1)
+    return type("S", (), dict(p=p, calls=calls, canned=canned))()
+
+
+class TestSendAndReceive:
+    """The probe must be gate-checked BEFORE firing (identical placement to
+    send_packet) and its reply must come back in the same call envelope."""
+
+    def _icmp_echo_hex(self, s, dst="203.0.113.7"):
+        return s.p._packet_to_hex(
+            s.p._craft().icmp_echo_request("10.0.0.1", dst, b"x"))
+
+    def test_blocked_raises_before_any_probe(self, sndrcv):
+        _arm()
+        assert _blocked_raises(
+            lambda: sndrcv.p.send_and_receive_packet(
+                self._icmp_echo_hex(sndrcv), 5, "lo"))
+        assert sndrcv.calls == {"sr1": [], "srp1": []}  # no probe left the box
+
+    def test_in_scope_reply_envelope(self, sndrcv):
+        _arm()
+        reply = sndrcv.p.IP(src="198.51.100.5", dst="10.0.0.1") / sndrcv.p.ICMP(type=0)
+        sndrcv.canned["reply"] = reply
+        out = sndrcv.p.send_and_receive_packet(
+            self._icmp_echo_hex(sndrcv, dst="198.51.100.5"), 5, "lo")
+        assert "Reply after" in out and "reply hex:" in out
+        assert sndrcv.p._packet_to_hex(reply) in out
+        assert len(sndrcv.calls["sr1"]) == 1 and not sndrcv.calls["srp1"]
+        kw = sndrcv.calls["sr1"][0][1]
+        assert kw.get("iface") == "lo" and kw.get("timeout") == 5
+        # roundtrip: the reported reply hex re-parses to the same packet
+        parsed = sndrcv.p._packet_from_hex(sndrcv.p._packet_to_hex(reply))
+        assert sndrcv.p._packet_dst(parsed) == "10.0.0.1"
+
+    def test_no_reply_envelope_when_disarmed(self, sndrcv):
+        g.disarm()
+        out = sndrcv.p.send_and_receive_packet(self._icmp_echo_hex(sndrcv), 5, "lo")
+        assert "no reply within 5s" in out
+        assert len(sndrcv.calls["sr1"]) == 1
+
+    def test_l2_frame_routes_to_srp1(self, sndrcv):
+        g.disarm()
+        sndrcv.canned["reply"] = sndrcv.p.Ether() / sndrcv.p.ARP(op=2)
+        frame = sndrcv.p._craft().craft_arp_request(
+            "aa:bb:cc:dd:ee:ff", "10.0.0.1", "198.51.100.5")
+        out = sndrcv.p.send_and_receive_packet(
+            sndrcv.p._packet_to_hex(frame), 5, "lo")
+        assert "Reply after" in out and len(sndrcv.calls["srp1"]) == 1
+        assert not sndrcv.calls["sr1"]
+
+    def test_broadcast_dhcp_not_gated_when_armed(self, sndrcv):
+        _arm()
+        sndrcv.canned["reply"] = None
+        pkt = sndrcv.p._craft().dhcp_discover("aa:bb:cc:dd:ee:ff")
+        out = sndrcv.p.send_and_receive_packet(
+            sndrcv.p._packet_to_hex(pkt), 5, "lo")
+        assert "no reply within 5s" in out
+        assert len(sndrcv.calls["srp1"]) == 1  # broadcast: allowed, not gated
+
+    def test_v6_probe_gated_when_armed(self, sndrcv):
+        _arm()
+        pkt = sndrcv.p.IPv6(dst="2001:db8::1") / sndrcv.p.TCP(
+            sport=1, dport=80, flags="S")
+        assert _blocked_raises(
+            lambda: sndrcv.p.send_and_receive_packet(
+                sndrcv.p._packet_to_hex(pkt), 5, "lo"))
+        assert sndrcv.calls == {"sr1": [], "srp1": []}
 
 
 # --- ffuf / hydra: load directly (bypass payloads/__init__); skip if absent -

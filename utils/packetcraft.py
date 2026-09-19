@@ -10,6 +10,7 @@ Design notes
 ------------
 * Craft tools return a compact text blob containing a scapy ``summary()`` and
   the packet's ``hex``.  The hex is the currency passed to ``send_packet``,
+  ``send_and_receive_packet`` (send + reply capture in one gated call),
   ``dissect_packet``, ``modify_packet``, and ``save_packet`` — there is no
   session handle because a crafted packet is stateless (unlike an SSH or MSF
   session).  ``next_hints`` and ``_CHAIN_NEXT`` nudge the model from a craft
@@ -37,7 +38,7 @@ import random
 import string
 import time
 import cryptography
-from scapy.all import sr1, send, sniff, hexdump, Raw, sendp
+from scapy.all import sr1, srp1, send, sniff, hexdump, Raw, sendp
 
 from constants import framework_tool
 from .scope_gate import check_send, ScopeGateError
@@ -146,7 +147,8 @@ def _craft_result(packet: scapy.Packet) -> str:
     return (
         f"Packet crafted: {packet.summary()}\n"
         f"hex: {_packet_to_hex(packet)}\n"
-        f"Pass the hex to send_packet (to transmit), dissect_packet "
+        f"Pass the hex to send_packet (to transmit), send_and_receive_packet "
+        f"(to transmit and capture the reply in one call), dissect_packet "
         f"(to inspect), or modify_packet (to change fields)."
     )
 
@@ -340,6 +342,21 @@ class PacketCraft:
         for _ in range(count):
             send_fn(packet, iface=self.interface, verbose=False)
             time.sleep(interval)
+
+    def send_and_receive(self, packet: scapy.Packet, timeout: int = 5):
+        """Send ONE packet and capture its reply (scapy ``sr1``/``srp1``).
+
+        L3 packets (``IP()/IPv6()/...``) go via ``sr1`` (scapy wraps the L2
+        header and routes); L2 frames (``Ether()/...``) go via ``srp1`` on
+        ``self.interface``.  Honours the operator-armed scope gate BEFORE
+        firing (same as :meth:`send_packet`).  Returns the reply packet, or
+        ``None`` when nothing came back within ``timeout`` seconds.
+        """
+        _ok, _reason = check_send(_packet_dst(packet))
+        if not _ok:
+            raise ScopeGateError(f"scope gate: {_reason}")
+        recv_fn = sr1 if isinstance(packet, (IP, IPv6)) else srp1
+        return recv_fn(packet, iface=self.interface, timeout=timeout, verbose=False)
 
     def sniff_packets(self, filter: str = "", count: int = 10, timeout: int = 30):
         """Sniff packets on the specified interface."""
@@ -649,7 +666,11 @@ def craft_http_response(src_ip: str, dst_ip: str, status_code: int = 200, reason
 @framework_tool(
     "Send a previously crafted packet (by hex) on the wire. Requires root "
     "(raw sockets). Pass the hex returned by any craft_* tool.",
-    next_hints=["sniff_packets to capture replies", "dissect_packet to inspect a reply"],
+    next_hints=[
+        "send_and_receive_packet to fire and capture the reply in one call",
+        "sniff_packets to capture replies",
+        "dissect_packet to inspect a reply",
+    ],
 )
 def send_packet(hex: str, count: int = 1, interval: float = 0.1, interface: str = ""):
     """Send a crafted packet one or more times.
@@ -689,6 +710,72 @@ def send_packet(hex: str, count: int = 1, interval: float = 0.1, interface: str 
         )
     except Exception as e:
         return f"send_packet error: {e}"
+
+
+@framework_tool(
+    "Send a crafted packet (by hex) and capture its reply in the SAME call "
+    "(scapy sr1/srp1): ICMP echo->echo reply, TCP SYN->SYN-ACK/RST, DNS "
+    "query->response, ARP request->reply. Returns the reply's summary + hex "
+    "for dissect_packet. Requires root.",
+    next_hints=[
+        "dissect_packet with the reply hex to inspect the reply fully",
+        "modify_packet on the reply hex to craft a follow-up probe",
+    ],
+)
+def send_and_receive_packet(hex: str, timeout: int = 5, interface: str = ""):
+    """Send ONE packet and capture its reply in one gated call.
+
+    Single-probe semantics (scapy sr1/srp1): one packet out, first matching
+    reply back. For bursts or promiscuous capture use send_packet +
+    sniff_packets. Gate: the same check_send runs BEFORE the probe fires
+    (identical to send_packet) — refusals raise ScopeGateError; the inbound
+    reply itself is not gated (receive-only).
+
+    Args:
+        hex: Packet hex string from a craft_* tool.
+        timeout: Seconds to wait for the reply (minimum 1).
+        interface: Interface to transmit/listen on; defaults to PACKET_CRAFT env (fallback enp92s0).
+    """
+    # Scope gate BEFORE the try (same as send_packet): a block must RAISE and
+    # surface as Failed on both dispatch paths, never be caught into a string
+    # the Brain relabels Success.  The reply is inbound receive — the gate
+    # covers the outbound probe destination only.
+    pkt = _packet_from_hex(hex)
+    _ok, _reason = check_send(_packet_dst(pkt))
+    if not _ok:
+        raise ScopeGateError(f"scope gate: {_reason}")
+    try:
+        iface = interface or _default_interface()
+        wait = max(1, int(timeout))
+        t0 = time.monotonic()
+        # Same L3/L2 split as send_packet: sr1 for bare IP/IPv6 (scapy wraps
+        # the Ethernet header + routes), srp1 for frames that already carry
+        # an Ether header (sendp on a bare IP packet would emit a
+        # garbage-frame no-op that looks like success).
+        recv_fn = sr1 if isinstance(pkt, (IP, IPv6)) else srp1
+        reply = recv_fn(pkt, iface=iface, timeout=wait, verbose=False)
+        elapsed = time.monotonic() - t0
+        if reply is None:
+            return (
+                f"Sent 1 packet on {iface} ({pkt.summary()}); no reply within "
+                f"{wait}s. Target may be down, filtered, or this probe type "
+                f"gets no reply."
+            )
+        return (
+            f"Sent 1 packet on {iface}: {pkt.summary()}\n"
+            f"Reply after {elapsed:.2f}s: {reply.summary()}\n"
+            f"reply hex: {_packet_to_hex(reply)}\n"
+            f"Pass the reply hex to dissect_packet (full breakdown) or "
+            f"modify_packet (to craft a follow-up)."
+        )
+    except PermissionError as e:
+        return (
+            f"send_and_receive_packet requires root/raw-socket capability: {e}. "
+            "Run the Brain worker as root, or use craft_* + dissect_packet "
+            "for offline analysis."
+        )
+    except Exception as e:
+        return f"send_and_receive_packet error: {e}"
 
 
 @framework_tool(

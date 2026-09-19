@@ -451,30 +451,46 @@ _CHAIN_NEXT = {
         "calls back to it (a VALUE, not a tool id). Stop it later with "
         "'listeners.listening.TCPListener.close_listener'."
     ),
-    # Packet craft -> send/dissect.  Craft tools return a text blob whose
-    # `hex:` line is the value to forward (no session handle — a packet is
-    # stateless).  One canonical hint covers every craft_* tool id.
+    # Packet craft -> send/send_and_receive/dissect.  Craft tools return a
+    # text blob whose `hex:` line is the value to forward (no session handle —
+    # a packet is stateless).  Request-shaped craft tools nudge to
+    # send_and_receive_packet (probe + reply in one gated call); spoofed-
+    # response tools (dns_response*, http_response) keep send_packet.
     "utils.packetcraft.craft_icmp_echo": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument "
-        "(a VALUE, not a tool id). Or use 'dissect_packet' to inspect it."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument (a VALUE, not a tool "
+        "id) — the echo reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget, or "
+        "'dissect_packet' to inspect it."
     ),
     "utils.packetcraft.craft_icmp_packet": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument. "
-        "Or use 'modify_packet' to set ICMP type/code first."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the reply comes "
+        "back in the same call. Or use 'modify_packet' to set ICMP type/code "
+        "first, or 'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_tcp_packet": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_udp_packet": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_arp_request": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_arp_packet": (
         "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
@@ -483,15 +499,22 @@ _CHAIN_NEXT = {
     ),
     "utils.packetcraft.craft_vlan_frame": (
         "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "passing the hex string from the result VERBATIM as the 'hex' argument "
+        "(pure L2 frame — no reply matching)."
     ),
     "utils.packetcraft.craft_dhcp_discover": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_dns_query": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_dns_response": (
         "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
@@ -504,24 +527,38 @@ _CHAIN_NEXT = {
         "Consider 'report_finding' to log the spoofing demo."
     ),
     "utils.packetcraft.craft_mdns_query": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_http_request": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet', passing the hex string "
+        "from the result VERBATIM as the 'hex' argument — the probe fires and "
+        "its reply comes back in the same call. Or use "
+        "'utils.packetcraft.send_packet' for fire-and-forget."
     ),
     "utils.packetcraft.craft_http_response": (
         "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet', "
-        "passing the hex string from the result VERBATIM as the 'hex' argument."
+        "passing the hex string from the result VERBATIM as the 'hex' argument "
+        "(spoofed response — no reply expected; do not wait for one)."
     ),
     "utils.packetcraft.sniff_packets": (
         "Next: use 'dissect_packet' with any captured hex string to inspect a "
         "packet in full (a VALUE, not a tool id)."
     ),
+    "utils.packetcraft.send_and_receive_packet": (
+        "Next: use 'dissect_packet' with the returned 'reply hex' to inspect "
+        "the reply in full (a VALUE, not a tool id), or 'modify_packet' on it "
+        "to craft a follow-up probe."
+    ),
     "utils.packetcraft.modify_packet": (
-        "Next: call execute_tool with tool_id 'utils.packetcraft.send_packet' "
-        "with the new hex, or 'dissect_packet' to verify the change."
+        "Next: call execute_tool with tool_id "
+        "'utils.packetcraft.send_and_receive_packet' with the new hex (probe "
+        "+ reply in one call), or 'utils.packetcraft.send_packet' for "
+        "fire-and-forget, or 'dissect_packet' to verify the change."
     ),
 }
 
