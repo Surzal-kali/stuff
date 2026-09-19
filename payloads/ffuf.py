@@ -130,6 +130,22 @@ def _inject_ignore_comments(extra: List[str]) -> List[str]:
     return extra + ["-ic"]
 
 
+# SCOPE DENYLIST (operator decision 2026-09-19): '-r'/'--follow-redirects'
+# makes ffuf follow 30x hops INSIDE the binary — beyond the launch gate's
+# reach, potentially onto out-of-scope hosts.  Stripped from caller options
+# (fail-visible note on the job).  '-recursion' (same-host fuzz recursion)
+# is NOT a redirect flag and is untouched.
+_FOLLOW_REDIRECT_FLAGS = frozenset(
+    {"-r", "--follow-redirects", "-follow-redirects"}
+)
+
+
+def _strip_follow_redirects(extra: List[str]) -> Tuple[List[str], bool]:
+    """Drop redirect-following flags; returns (clean_list, stripped_any)."""
+    kept = [a for a in extra if a not in _FOLLOW_REDIRECT_FLAGS]
+    return kept, len(kept) != len(extra)
+
+
 def _path_from_record(rec: Dict[str, Any]) -> str:
     """Extract the fuzzed value from a ffuf result record.
 
@@ -268,7 +284,9 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
     "are given for an Intigriti program, mandatory testing requirements "
     "(custom User-Agent, X-Intigriti-Username header, req/sec cap) are "
     "auto-injected from the program manifest — you never need to pass them "
-    "manually and can't accidentally fire raw traffic that violates the RoE.",
+    "manually and can't accidentally fire raw traffic that violates the RoE. "
+    "Redirect-following ('-r'/'--follow-redirects') is DENYLISTED and "
+    "stripped — 30x hops inside ffuf are beyond the launch gate's reach.",
     next_hints=["ffuf_status"],
 )
 def run_ffuf(url: str, wordlist: str = "", options: str = "",
@@ -296,7 +314,9 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
         options: Additional ffuf command-line options as a single string
             (e.g. ``"-mc 200,301,401 -t 80 -recursion -recursion-depth 2"``).
             ``-noninteractive`` (if supported) and ``-ic`` are auto-injected
-            unless already present.
+            unless already present. ``-r``/``--follow-redirects`` are on the
+            scope DENYLIST and are stripped (30x hops inside ffuf are
+            beyond the gate's reach); ``-recursion`` is untouched.
         scope_handle: Program handle for auto-injection of mandatory testing
             requirements (Intigriti RoE: custom UA, request header, req/sec
             cap). Pair with ``scope_platform``. When set, the program
@@ -355,6 +375,7 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
     )
 
     opt_list = shlex.split(options) if options else []
+    opt_list, _rr_stripped = _strip_follow_redirects(opt_list)
     opt_list = _inject_noninteractive(opt_list)
     opt_list = _inject_ignore_comments(opt_list)
     opt_list, scan_cfg = _inject_scan_config(
@@ -383,6 +404,13 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
         timeout=float(os.getenv("FFUF_TIMEOUT", "1800")),
         verdict_parser=_verdict,
     )
+    if _rr_stripped:
+        job["note"] = (
+            "'-r/--follow-redirects' stripped from options (scope denylist): "
+            "ffuf would follow 30x hops inside the binary, beyond the launch "
+            "gate's reach — potentially onto out-of-scope hosts. Same-host "
+            "fuzz recursion (-recursion) is unaffected."
+        )
     # Surface which wordlist actually ran (and whether it was the fallback
     # default) so the secretary model knows to swap in a targeted list.
     job["wordlist"] = wordlist
