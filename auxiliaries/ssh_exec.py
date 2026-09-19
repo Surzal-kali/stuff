@@ -73,6 +73,16 @@ def ssh_exec_batch(
             for no pacing on fast local targets; increase to 1-2 for
             rate-limited sshd instances.
     """
+    # Scope gate (operator-armed from the Tool REPL; no-op when disarmed).
+    # Stateless batch tool: one verdict at entry covers every command — there
+    # is no persistent session handle to re-check (paramiko_client re-gates
+    # per exec because its session outlives the call). 2026-09-19 gap: this
+    # module shipped without any gate check while its twin was gated.
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(hostname)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     if not commands:
         return {
             "status": "Failed",

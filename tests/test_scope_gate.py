@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -450,3 +451,157 @@ def test_hydra_disarmed_not_gated(scope, monkeypatch):
     monkeypatch.setattr(_hydra, "launch_job", _fake_launch)
     g.disarm()
     assert _not_gated(lambda: _hydra.run_hydra("ssh://feedback.tesla.com:22", "-l a -p b"))
+
+
+# --- sqlmap / fastcgi / ssh_exec_batch / dispatch_metasploit: gate coverage -
+# (2026-09-19) These four target-touching modules shipped WITHOUT gate checks;
+# the tests below pin the fix: blocked target -> ScopeGateError BEFORE any
+# subprocess/socket/RPC fires; disarmed -> the tool proceeds (live points
+# stubbed, nothing real ever fires from the test).
+
+_sqlmap = _load_isolated("payloads/sqlmap.py", "_regr_sqlmap")
+_fastcgi = _load_isolated("payloads/fastcgi.py", "_regr_fastcgi")
+_sshe = _load_isolated("auxiliaries/ssh_exec.py", "_regr_sshe")
+_msf = None
+
+
+def _load_msf_isolated():
+    """Load metasploiting with a temporary dotenv stub.
+
+    metasploiting calls ``load_dotenv`` at module level; on a root-0600 .env
+    that PermissionErrors for non-root runners and _load_isolated would
+    silently return None (test skipped). Stub dotenv for the exec, then
+    restore the real module so nothing else in the session is masked.
+    """
+    if "_regr_msf" in sys.modules:
+        return sys.modules["_regr_msf"]
+    real_dotenv = sys.modules.get("dotenv")
+    stub = types.ModuleType("dotenv")
+    stub.load_dotenv = lambda *a, **k: None
+    stub.dotenv_values = lambda *a, **k: {}
+    sys.modules["dotenv"] = stub
+    try:
+        return _load_isolated("payloads/metasploiting.py", "_regr_msf")
+    finally:
+        if real_dotenv is not None:
+            sys.modules["dotenv"] = real_dotenv
+        else:
+            sys.modules.pop("dotenv", None)
+
+
+_msf = _load_msf_isolated()
+
+_OOS = "feedback.tesla.com"     # out-of-scope in the synthetic manifest
+_INS = "www.tesla.com"          # in-scope via the *.tesla.com wildcard
+_OOS_IP = "203.0.113.9"         # out-of-scope CIDR 203.0.113.0/24
+
+
+class _NoPopen:
+    def __init__(self, *a, **k):
+        raise OSError("stub: no real subprocess")
+
+
+@pytest.mark.skipif(_sqlmap is None, reason="sqlmap module not importable")
+def test_sqlmap_blocked_raises(scope, monkeypatch):
+    monkeypatch.setattr(_sqlmap.subprocess, "Popen", _NoPopen)
+    _arm()
+    assert _blocked_raises(lambda: _sqlmap.run_sqlmap(f"http://{_OOS}/x?id=1"))
+
+
+@pytest.mark.skipif(_sqlmap is None, reason="sqlmap module not importable")
+def test_sqlmap_disarmed_not_gated(scope, monkeypatch):
+    monkeypatch.setattr(_sqlmap.subprocess, "Popen", _NoPopen)
+    g.disarm()
+    assert _not_gated(lambda: _sqlmap.run_sqlmap(f"http://{_OOS}/x?id=1"))
+
+
+@pytest.mark.skipif(_fastcgi is None, reason="fastcgi module not importable")
+@pytest.mark.parametrize("tool", ["fastcgi_request", "fastcgi_php_exec"])
+def test_fastcgi_blocked_raises(scope, tool):
+    _arm()
+    assert _blocked_raises(lambda: getattr(_fastcgi, tool)(_OOS_IP))
+
+
+@pytest.mark.skipif(_fastcgi is None, reason="fastcgi module not importable")
+def test_fastcgi_disarmed_not_gated(scope, monkeypatch):
+    monkeypatch.setattr(
+        _fastcgi, "_fastcgi_send", lambda *a, **k: {"stdout": "stub"})
+    g.disarm()
+    assert _not_gated(lambda: _fastcgi.fastcgi_request(_OOS_IP))
+
+
+@pytest.mark.skipif(_sshe is None, reason="ssh_exec module not importable")
+def test_ssh_exec_batch_blocked_raises(scope, monkeypatch):
+    monkeypatch.setattr(_sshe.paramiko, "SSHClient", _FakeSSH)
+    _arm()
+    assert _blocked_raises(
+        lambda: _sshe.ssh_exec_batch(_OOS, "u", "p", ["id"]))
+
+
+@pytest.mark.skipif(_sshe is None, reason="ssh_exec module not importable")
+def test_ssh_exec_batch_disarmed_not_gated(scope, monkeypatch):
+    monkeypatch.setattr(_sshe.paramiko, "SSHClient", _FakeSSH)
+    g.disarm()
+    assert _not_gated(lambda: _sshe.ssh_exec_batch(_OOS, "u", "p", ["id"]))
+
+
+def _msf_client(monkeypatch):
+    """MetasploitClient without __init__ (no RPC connect) + stubbed impl."""
+
+    async def _fake_impl(self, *a, **k):
+        return {"stdout": "stub", "status": "Success"}
+
+    monkeypatch.setattr(
+        _msf.MetasploitClient, "_execute_module_impl", _fake_impl)
+    return _msf.MetasploitClient.__new__(_msf.MetasploitClient)
+
+
+@pytest.mark.skipif(_msf is None, reason="metasploiting module not importable")
+def test_msf_dispatch_blocked_raises(scope, monkeypatch):
+    import asyncio
+
+    client = _msf_client(monkeypatch)
+    _arm()
+    with pytest.raises(ScopeGateError):
+        asyncio.run(client.dispatch_metasploit(
+            "exploit/unix/ftp/vsftpd_234_backdoor", "exploit",
+            {"RHOSTS": _OOS, "PAYLOAD": "cmd/unix/interact"}))
+
+
+@pytest.mark.skipif(_msf is None, reason="metasploiting module not importable")
+def test_msf_dispatch_missing_target_refused_when_armed(scope, monkeypatch):
+    import asyncio
+
+    client = _msf_client(monkeypatch)
+    _arm()
+    assert _blocked_raises(lambda: asyncio.run(client.dispatch_metasploit(
+        "exploit/unix/ftp/vsftpd_234_backdoor", "exploit",
+        {"PAYLOAD": "cmd/unix/interact"})))
+
+
+@pytest.mark.skipif(_msf is None, reason="metasploiting module not importable")
+def test_msf_dispatch_in_scope_passes_post_exempt(scope, monkeypatch):
+    import asyncio
+
+    client = _msf_client(monkeypatch)
+    _arm()
+    res = asyncio.run(client.dispatch_metasploit(
+        "exploit/unix/ftp/vsftpd_234_backdoor", "exploit",
+        {"RHOSTS": _INS, "PAYLOAD": "cmd/unix/interact"}))
+    assert res.get("status") == "Success"
+    # Post modules are session-bound (session origin was already gated) —
+    # SESSION-only options must NOT hit the missing-target refusal.
+    post = asyncio.run(client.dispatch_metasploit(
+        "post/multi/gather/enum", "post", {"SESSION": "1"}))
+    assert post.get("status") == "Success"
+
+
+@pytest.mark.skipif(_msf is None, reason="metasploiting module not importable")
+def test_msf_dispatch_disarmed_not_gated(scope, monkeypatch):
+    import asyncio
+
+    client = _msf_client(monkeypatch)
+    g.disarm()
+    assert _not_gated(lambda: asyncio.run(client.dispatch_metasploit(
+        "exploit/unix/ftp/vsftpd_234_backdoor", "exploit",
+        {"RHOSTS": _OOS, "PAYLOAD": "cmd/unix/interact"})))

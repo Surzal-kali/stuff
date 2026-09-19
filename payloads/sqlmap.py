@@ -122,6 +122,14 @@ def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
             Quoted sub-phrases are preserved by shlex. ``--batch`` is injected
             automatically if absent.
     """
+    # Scope gate (operator-armed from the Tool REPL; no-op when disarmed).
+    # Active SQLi payload traffic — this tool must honour the gate like every
+    # other traffic-sending module (2026-09-19 gap: was ungated).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target_url)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     # -u takes the URL as its own argv element; never interpolate it into a
     # shell string.
     extra = shlex.split(options) if options else []

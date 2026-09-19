@@ -424,6 +424,32 @@ class MetasploitClient:
                 SEPARATE persistent exploit/multi/handler job before firing
                 the module (required for reverse/bind payloads over msfrpcd).
         """
+        # Scope gate (operator-armed from the Tool REPL; no-op when disarmed).
+        # dispatch_metasploit is the ONLY target-bearing entry point: every
+        # exploit/auxiliary launch must carry a gate-confirmed target.
+        # Post modules run inside an existing (already-gated) session, so
+        # SESSION-only options are exempt from the missing-target refusal.
+        # 2026-09-19 gap: this dispatch shipped without any gate check.
+        from utils.scope_gate import check_scan, is_armed, ScopeGateError
+        if is_armed():
+            _opts = options if isinstance(options, dict) else {}
+            _targets = [
+                str(_opts.get(_k))
+                for _k in ("RHOSTS", "RHOST", "RHOST6", "rhosts", "rhost")
+                if _opts.get(_k)
+            ]
+            if category in ("exploit", "auxiliary") and not _targets:
+                raise ScopeGateError(
+                    "scope gate: no RHOST/RHOSTS option on a target-bearing "
+                    f"{category} dispatch; the armed gate cannot verify the "
+                    "target and refuses. Pass RHOSTS explicitly, or run "
+                    "'scope off' for lab mode."
+                )
+            for _t in _targets:
+                _ok, _reason = check_scan(_t)
+                if not _ok:
+                    raise ScopeGateError(f"scope gate: {_reason}")
+
         # Validate category matches the module_path prefix. Catches model
         # confusion (passing an auxiliary module with category='exploit')
         # BEFORE we waste 30s polling for sessions that will never appear.

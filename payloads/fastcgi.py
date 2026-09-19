@@ -348,6 +348,14 @@ def fastcgi_request(
             (e.g. ``{"HTTP_HOST": "target.local"}``).
         timeout: Socket timeout in seconds (default 10).
     """
+    # Scope gate (operator-armed from the Tool REPL; no-op when disarmed).
+    # Raw FastCGI param injection is RCE-grade traffic — honour the gate
+    # (2026-09-19 gap: was ungated).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     params = _default_params(
         script_filename=script_filename,
         method=method,
@@ -435,6 +443,14 @@ def fastcgi_php_exec(
         server_name: SERVER_NAME param (default localhost).
         timeout: Socket timeout in seconds (default 10).
     """
+    # Scope gate (operator-armed from the Tool REPL; no-op when disarmed).
+    # The php://input chain is arbitrary code execution — honour the gate
+    # (2026-09-19 gap: was ungated).
+    from utils.scope_gate import check_scan, ScopeGateError
+    _sc_ok, _sc_reason = check_scan(target)
+    if not _sc_ok:
+        raise ScopeGateError(f"scope gate: {_sc_reason}")
+
     # Ensure the PHP code has opening/closing tags.
     code = php_code.strip()
     if not code.startswith("<?"):
