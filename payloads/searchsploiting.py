@@ -1,7 +1,38 @@
 
+import os
 import shlex
+import shutil
 import subprocess
 from constants import framework_tool
+
+# Canonical ExploitDB install locations. searchsploit is shipped as a single
+# shell script under /opt/exploitdb on Kali/Parrot and similar. /usr/local/bin
+# symlinks to it, and since /usr/local/bin is on sudo's secure_path,
+# shutil.which("searchsploit") resolves it even when the framework runs as
+# root. We still hard-code /opt/exploitdb/searchsploit as a fallback for boxes
+# that lack the symlink (or where it has been removed/broken again), so a bare
+# subprocess.run never raises FileNotFoundError. (See bootstrap.py's .env
+# loading note about the same sudo env-stripping situation.)
+_SEARCHSPLOIT_CANDIDATES = (
+    "/opt/exploitdb/searchsploit",
+    "/usr/local/bin/searchsploit",
+    "/usr/bin/searchsploit",
+)
+
+
+def _resolve_searchsploit():
+    """Locate the searchsploit binary, or return None if not installed."""
+    found = shutil.which("searchsploit")
+    if found and os.access(found, os.X_OK):
+        return found
+    for cand in _SEARCHSPLOIT_CANDIDATES:
+        # os.path.exists follows symlinks; reject broken symlinks (e.g. the
+        # /opt/expldb typo) so we don't hand subprocess a dangling path.
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 #this module will be our primary searchsploit module, it will be used to search for exploits using the local searchsploit CLI.
 @framework_tool(
     "Look up known exploits for a vulnerability or service using the local "
@@ -24,8 +55,13 @@ def search_exploit(query):
         terms = shlex.split(query) if isinstance(query, str) else list(query)
         if not terms:
             return "Error: empty search query"
+        binary = _resolve_searchsploit()
+        if not binary:
+            return ("Error: searchsploit not found. Install exploitdb "
+                    "(apt install exploitdb) or ensure /opt/exploitdb/searchsploit "
+                    "is executable and on PATH.")
         result = subprocess.run(
-            ['searchsploit', '--disable-colour', *terms],
+            [binary, '--disable-colour', *terms],
             capture_output=True,
             text=True,
         )
