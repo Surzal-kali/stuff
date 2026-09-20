@@ -125,7 +125,7 @@ registry = FunctionRegistry()
 # Brain is the shared session broker for ssh:/listener: handles, and without
 # it ssh: sessions strand in whichever process hit the in-process fallback
 # (REPL / harness), invisible to the other lane.
-DEFAULT_SCAN_DIRS = ("auxiliaries", "listeners", "payloads")
+DEFAULT_SCAN_DIRS = ("auxiliaries", "listeners", "payloads", "utils")
 
 
 def scan_tools(scan_path: str) -> str:
