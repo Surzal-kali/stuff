@@ -99,6 +99,7 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
     SCOPE_ON_FLAGS = {
         "--platform": "h1|bugcrowd|intigriti (default h1)",
         "--no-strict": "unconfirmed targets warn instead of refuse",
+        "--ip-boundary": "hostname/manifest assets must resolve into the blessed IP set (lab drift guard)",
     }
 
     def __init__(self, manifests: List[ToolManifest]):
@@ -599,7 +600,7 @@ Tool REPL commands:
   safe-args [tool_id]    Show safe-sweep args for a tool (or all)
   reindex                Re-discover tools
   ipython                Drop into IPython with tools preloaded (Jedi completions)
-  scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]
+  scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict] [--ip-boundary]
                          Arm the packet-scope gate (send_packet refuses
                          out-of-scope destinations; operator-only, not exposed
                          to the agent). 'scope off' disarms (lab mode).
@@ -656,7 +657,7 @@ def _scope_command(rest: str):
         print("  When armed, send_packet refuses packets to destinations not")
         print("  confirmed in-scope for the loaded program. Disarmed = lab mode.")
         print("  Commands:")
-        print("    scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]")
+        print("    scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict] [--ip-boundary]")
         print("    scope off")
         print("    scope status")
         print("    scope search <kw> [--assets]  (query the boards: matching programs + bounty-relevant stats)")
@@ -677,16 +678,20 @@ def _scope_command(rest: str):
 
     if sub == "on":
         if len(parts) < 2:
-            print("  Usage: scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict]")
+            print("  Usage: scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict] [--ip-boundary]")
             return
         handle = parts[1]
         platform = "h1"
         strict = True
+        ip_boundary = False
         i = 2
         while i < len(parts):
             tok = parts[i]
             if tok == "--no-strict":
                 strict = False
+                i += 1
+            elif tok == "--ip-boundary":
+                ip_boundary = True
                 i += 1
             elif tok == "--platform" and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
                 platform = parts[i + 1]
@@ -697,7 +702,7 @@ def _scope_command(rest: str):
             else:
                 print(f"  Ignoring unknown flag: {tok}")
                 i += 1
-        res = scope_gate.arm(handle, platform, strict)
+        res = scope_gate.arm(handle, platform, strict, ip_boundary=ip_boundary)
 
     elif sub == "off":
         res = scope_gate.disarm()

@@ -53,6 +53,16 @@ wins (out-of-scope always wins over an in-scope wildcard, mirroring
    false-negative; the operator falls back to tier 1 (``scope add-ip``) for
    those.
 
+4. **IP boundary (optional, ``--ip-boundary`` at ``scope on``)** - when set and
+   the operator has blessed >=1 IP, hostname targets that pass tier 1b/2 must
+   forward-resolve into the blessed IP set; a manifest hostname asset that
+   resolves outside it is refused (tier 3 PTR attribution is skipped for
+   non-blessed IPs).  This is the drift guard from the 2026-09-20 fuzz-C
+   finding: an explicit re-arm with a narrowed IP allowlist must supersede
+   stale manifest hostname assets (a vhost whose DNS now points at a dropped
+   host is refused, not waved through).  remove_ip also cascades: removing an
+   IP purges blessed hostnames mapped to it.
+
 Broad ranges (CIDR wider than /32, hyphen-ranges) can't be reliably
 attributed host-by-host, so when armed they are allowed ONLY if the network
 is a subnet of an explicit in-scope CIDR asset; otherwise they are refused
@@ -250,7 +260,32 @@ def _is_gated_target(ip: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+def _resolved_ips(host: str, timeout: float = 2.0) -> List[str]:
+    """Forward-resolve a hostname to its CURRENT IP set (bounded).
+
+    Used only by the optional ``--ip-boundary`` tier: a hostname asset passes
+    the operator's IP boundary when every address it resolves to right now is
+    in the blessed allowlist.  Capped at ``timeout`` like
+    :func:`_reverse_dns` so a slow/broken resolver never pins a scan; any
+    failure -> empty list, which the boundary treats as 'unconfirmable'
+    (refused, fail-closed).
+    """
+
+    def _resolve() -> List[str]:
+        infos = socket.getaddrinfo(host, None)
+        return sorted({info[4][0] for info in infos})
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_resolve)
+            return fut.result(timeout=timeout)
+    except Exception:
+        return []
+
+
+# --------------------------------------------------------------------------- #
 # Per-target verdict (shared by check_send and check_scan)
+# --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
 
 def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, str]:
@@ -275,6 +310,7 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
 
     checkable = checkable.strip()
 
+    ip_boundary = bool(state.get("ip_boundary"))
     # Tier 1: operator-blessed allowlist (IPs; authoritative, CDN-safe).
     allowlist: Dict[str, str] = state.get("allowlist") or {}
     if checkable in allowlist:
@@ -287,10 +323,19 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
     # Keys are stored lowercased, trailing dot stripped; compare the same way.
     blessed_hosts: Dict[str, str] = state.get("blessed_hosts") or {}
     _hkey = checkable.lower().rstrip(".")
+    stale_vhost_ip = ""
     if _hkey in blessed_hosts:
-        return True, (
-            f"in operator blessed-host list (maps to {blessed_hosts[_hkey]})"
-        )
+        # Drift guard (2026-09-20 fuzz-C): the vhost blessing is only as good
+        # as the IP it was blessed against.  If that IP has since left the
+        # allowlist (remove_ip on an older state file, a hand-edited state),
+        # the stale hostname must not keep the dropped IP alive.  Fall through
+        # to the manifest tiers; the refusal below carries the drift note.
+        mapped_ip = (blessed_hosts[_hkey] or "").strip()
+        if mapped_ip and mapped_ip in allowlist:
+            return True, (
+                f"in operator blessed-host list (maps to {mapped_ip})"
+            )
+        stale_vhost_ip = mapped_ip
 
     manifest = _load_manifest(handle, platform)
     if manifest is None:
@@ -311,13 +356,43 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
 
     # Tier 2: manifest match (domain/wildcard/URL for a hostname; CIDR/IP for an IP).
     if _find_match(checkable, in_assets):
+        if ip_boundary and not _is_ip(checkable):
+            # Operator IP boundary: the manifest asset passes only when the
+            # hostname resolves, RIGHT NOW, into the blessed IP set.  A stale
+            # manifest hostname asset (DNS moved to a dropped host) is caught
+            # here instead of passing on a name match alone.
+            resolved = _resolved_ips(checkable)
+            if not resolved:
+                return (
+                    False,
+                    f"{checkable} matches an in-scope asset but could not be "
+                    f"resolved to verify the --ip-boundary; refused (strict). "
+                    f"Bless the resolved IP with 'scope add-ip <ip> <hostname>' "
+                    f"or re-arm without --ip-boundary.",
+                )
+            outside = [ip for ip in resolved if ip not in allowlist]
+            if outside:
+                return (
+                    False,
+                    f"{checkable} matches an in-scope asset but resolves to "
+                    f"non-blessed IP(s) {outside} (operator IP boundary). "
+                    f"Bless them with 'scope add-ip <ip> <hostname>' or re-arm "
+                    f"without --ip-boundary.",
+                )
+            return True, (
+                f"{checkable} matches an in-scope asset "
+                f"(resolves to blessed IP(s) {resolved})"
+            )
         return True, f"{checkable} matches an in-scope asset"
 
     # Tier 3: reverse-DNS attribution (IPs only).  PTR records are unverified,
     # attacker-settable data: an in-scope PTR name is accepted only after it
     # forward-confirms back to the same IP.  An out-of-scope PTR match still
     # refuses (fail-closed).
-    if _is_ip(checkable):
+    if _is_ip(checkable) and not ip_boundary:
+        # Under --ip-boundary a non-blessed IP has no path to a pass: the
+        # operator's IP set IS the scope, so PTR attribution is skipped for
+        # any IP outside it.
         for host in _reverse_dns(checkable):
             if _find_match(host, out_assets):
                 return False, f"reverse-DNS {host} (for {checkable}) matches an out-of-scope asset; refused"
@@ -332,12 +407,17 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
 
     # Unconfirmed.
     if strict:
+        drift = (
+            f" NOTE: blessed host {_hkey!r} still maps to {stale_vhost_ip} which "
+            "is no longer in the allowlist (stale vhost blessing - re-add via "
+            "'scope add-host <hostname> <blessed-ip>' or 'scope rm-host');"
+        ) if stale_vhost_ip else ""
         return (
             False,
             f"{checkable} not confirmed in-scope for program {handle!r}; refused "
             f"(strict). Bless a resolved IP with 'scope add-ip <ip> <hostname>' "
             f"or a vhost with 'scope add-host <hostname> <blessed-ip>' in the "
-            f"Tool REPL, or 'scope off' for lab mode.",
+            f"Tool REPL, or 'scope off' for lab mode.{drift}",
         )
     return True, f"WARNING: {checkable} not confirmed in-scope (non-strict); proceeding"
 
@@ -474,6 +554,7 @@ def check_scan(target: Optional[str]) -> Tuple[bool, str]:
             if s.strip()
         ]
 
+    warnings: List[str] = []
     for spec in specs:
         checkable, broad = _spec_to_checkable(spec)
         if broad:
@@ -482,7 +563,15 @@ def check_scan(target: Optional[str]) -> Tuple[bool, str]:
             ok, reason = _check_one(checkable, state)
         if not ok:
             return False, f"target {spec!r}: {reason}"
-    return True, f"all {len(specs)} target spec(s) confirmed in-scope"
+        # Surface non-strict WARNING verdicts in the aggregate too: the model
+        # only ever sees check_scan's summary, so a pass-with-warning must not
+        # be silently flattened into 'all specs confirmed in-scope'.
+        if reason.upper().startswith("WARNING"):
+            warnings.append(reason)
+    summary = f"all {len(specs)} target spec(s) confirmed in-scope"
+    if warnings:
+        summary += " | " + " | ".join(warnings)
+    return True, summary
 
 
 def _spec_to_checkable(spec: str) -> Tuple[Optional[str], bool]:
@@ -514,7 +603,12 @@ def _spec_to_checkable(spec: str) -> Tuple[Optional[str], bool]:
 # Operator control surface — called from the Tool REPL only (not agent tools)
 # --------------------------------------------------------------------------- #
 
-def arm(handle: str, platform: str = "h1", strict: bool = True) -> Dict[str, Any]:
+def arm(
+    handle: str,
+    platform: str = "h1",
+    strict: bool = True,
+    ip_boundary: bool = False,
+) -> Dict[str, Any]:
     """Arm the scope gate against a program's manifest.
 
     Ensures the manifest is cached first (fetches via load_program_scope if
@@ -550,6 +644,7 @@ def arm(handle: str, platform: str = "h1", strict: bool = True) -> Dict[str, Any
         "handle": handle,
         "platform": platform,
         "strict": bool(strict),
+        "ip_boundary": bool(ip_boundary),
         "allowlist": {},
         "blessed_hosts": {},
         "armed_at": time.time(),
@@ -685,6 +780,9 @@ def remove_host(hostname: str) -> Dict[str, Any]:
 
 
 def remove_ip(ip: str) -> Dict[str, Any]:
+    """Unbless an IP.  Cascades: blessed hostnames mapped to the removed IP
+    are purged too - a stale vhost blessing must not keep a dropped IP alive
+    through the tier-1b hostname lane (2026-09-20 fuzz-C drift fix)."""
     state = _load_state()
     if state is None:
         return {"ok": False, "error": "no scope armed"}
@@ -692,8 +790,19 @@ def remove_ip(ip: str) -> Dict[str, Any]:
     if ip not in allowlist:
         return {"ok": False, "error": f"{ip} not in allowlist"}
     del allowlist[ip]
+    blessed = state.get("blessed_hosts") or {}
+    purged = sorted(h for h, mapped in blessed.items() if (mapped or "").strip() == ip)
+    for h in purged:
+        del blessed[h]
     _write_state(state)
-    return {"ok": True, "ip": ip, "allowlist_size": len(allowlist)}
+    return {
+        "ok": True,
+        "ip": ip,
+        "allowlist_size": len(allowlist),
+        "purged_blessed_hosts": purged,
+        "message": f"unblessed {ip}"
+        + (f"; purged stale vhost blessings: {purged}" if purged else ""),
+    }
 
 
 def list_ips() -> Dict[str, Any]:
@@ -715,6 +824,7 @@ def status() -> Dict[str, Any]:
         "strict": state.get("strict", True),
         "allowlist_size": len(state.get("allowlist") or {}),
         "blessed_hosts_size": len(state.get("blessed_hosts") or {}),
+        "ip_boundary": bool(state.get("ip_boundary")),
         "armed_at": state.get("armed_at"),
     }
     manifest = _load_manifest(state.get("handle", ""), state.get("platform", "h1"))
