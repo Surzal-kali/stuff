@@ -661,9 +661,14 @@ async def secretary_execute_tool(
         )
 
     if isinstance(args, dict) and "_raw" in args:
-        logger.warning(
-            f"[secretary] execute_tool '{tool_id}': arguments were not a valid "
-            f"JSON object; passing raw payload {str(args.get('_raw'))[:200]!r}"
+        # Preflight hardening (fuzz 2026-09-20): malformed arguments used to
+        # pass through as {"_raw": ...} and reach the tool body (TypeError at
+        # best, a hung tool until BRAIN_DISPATCH_TIMEOUT at worst). Fail the
+        # model NOW with the concrete shape so it self-corrects on the retry.
+        raise ModelRetry(
+            f"arguments for '{tool_id}' were not a valid JSON object (payload "
+            f"started: {str(args.get('_raw'))[:120]!r}). Re-emit 'arguments' as a "
+            "JSON object of named parameters per the manifest's 'parameters' schema."
         )
 
     # Layer 1: tolerate the legacy ``session_id`` argument name on tools that

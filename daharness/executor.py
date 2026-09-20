@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from constants import TransportType
 from .models import ToolManifest
+from .preflight import normalize_arguments, validate_against_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,21 @@ class ExecutorMixin:
 
     async def execute_tool(self, manifest: ToolManifest, arguments: dict, *, session_id: str = "0"):
         manifest = self._ensure_valid_manifest(manifest)
+
+        # --- Pre-flight (deterministic, <1ms): validate BEFORE anything that
+        # can block. Fuzz 2026-09-20: malformed calls (JSON-string arguments,
+        # bogus keys, scalar args) flowed past every entry gate and hung inside
+        # tool bodies until BRAIN_DISPATCH_TIMEOUT. A rejected call must cost
+        # milliseconds, never the dispatch budget. See daharness/preflight.py.
+        _args, _rej = normalize_arguments(arguments)
+        if _rej is not None:
+            logger.warning(f"[PREFLIGHT_REJECT] {manifest.module_id}: {_rej.get('error')}")
+            return _rej
+        _rej = validate_against_manifest(_args, manifest)
+        if _rej is not None:
+            logger.info(f"[PREFLIGHT_REJECT] {manifest.module_id}: {_rej.get('error')}")
+            return _rej
+        arguments = _args
 
         # LOGGING: Record actual execution start
         logger.info(
@@ -159,9 +175,30 @@ class ExecutorMixin:
             message = f"CALL_TOOL|{brain_session}|{tool_id}|{args_json}"
 
             # Use asyncio for non-blocking socket I/O
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(socket_path), dispatch_timeout
-            )
+            # Connect and read are different failure modes (fuzz 2026-09-20):
+            # a dead/wedged socket should fail in seconds, not burn the whole
+            # tool budget. BRAIN_CONNECT_TIMEOUT (default 10s) bounds the
+            # connect; the read below keeps BRAIN_DISPATCH_TIMEOUT so
+            # long-running legit tools keep their full budget.
+            connect_timeout = float(os.getenv("BRAIN_CONNECT_TIMEOUT", "10"))
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(socket_path), connect_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[BRAIN_DISPATCH] {tool_id}: Brain socket connect did not complete "
+                    f"within {connect_timeout:.0f}s (BRAIN_CONNECT_TIMEOUT); sidecar wedged "
+                    "or overloaded. Tool was NOT started."
+                )
+                return {
+                    "error": (
+                        f"Brain socket connect timed out after {connect_timeout:.0f}s "
+                        f"(BRAIN_CONNECT_TIMEOUT); tool '{tool_id}' was not started. "
+                        "Check the sidecar before retrying."
+                    ),
+                    "status": "Failed",
+                }, False
 
             # Use the framing logic to send/receive (consistent with the Brain)
             from listeners.thebrain import pack_message, read_message

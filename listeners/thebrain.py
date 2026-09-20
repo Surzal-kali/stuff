@@ -508,9 +508,34 @@ async def dispatch(event, full_payload=None):
                         elif isinstance(parsed, list):
                             args = parsed
                         else:
-                            args = [parsed]
+                            # Scalar payload (string/number/bool): reject instead
+                            # of a positional call. Fuzz 2026-09-20: scalar args
+                            # reached tool bodies as garbage and could hang them
+                            # until BRAIN_DISPATCH_TIMEOUT. Legit positional
+                            # callers send a JSON list.
+                            return json.dumps({
+                                "status": "error",
+                                "tool_id": tool_id,
+                                "error": (
+                                    f"Malformed arguments for {tool_id}: expected a "
+                                    f"JSON object (named args) or a JSON list "
+                                    f"(positional), got {type(parsed).__name__}."
+                                ),
+                            })
                     except json.JSONDecodeError:
-                        # Legacy fallback: bare comma-separated positional args
+                        # Legacy fallback: bare comma-separated positional args —
+                        # only for payloads that never looked like JSON. A
+                        # malformed JSON OBJECT must NOT silently become garbage
+                        # positional args (fuzz 2026-09-20 hang root cause).
+                        if "{" in args_str or '"' in args_str:
+                            return json.dumps({
+                                "status": "error",
+                                "tool_id": tool_id,
+                                "error": (
+                                    f"Malformed arguments for {tool_id}: payload is "
+                                    "not valid JSON. Send arguments as a JSON object."
+                                ),
+                            })
                         args = [a for a in args_str.split(',') if a]
             else:
                 tool_id = payload
