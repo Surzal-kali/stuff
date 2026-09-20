@@ -6,14 +6,24 @@ registers the live object here and receives a ``session_id``.  Subsequent
 tool calls pass that ``session_id`` to retrieve the live object and interact
 with it.  A dedicated ``close`` tool (or stale-session cleanup) tears it down.
 
-This is a **process-local singleton**.  Whichever process actually runs the
-tool -- the Brain sidecar (``listeners/thebrain.py``) or the in-process
-launcher inside the ToolRegistry -- holds the sessions it created.  As long
-as all calls for a given session go through the same process (which they do
-when the Brain is up, the normal path), sessions are consistent.  If the
-Brain dies and a later call falls back in-process, that call cannot see
-sessions the Brain was holding -- a known limitation of the dual-dispatch
-design.
+This is a **process-local singleton**, and since 2026-09-20 the Brain
+sidecar is the deliberate shared broker for it: ``listeners/thebrain.py``
+registers ``utils.paramiko_client`` at startup, so the ssh: session tools
+run ON the Brain (the agent's Bridge dispatches Brain-first, and the Tool
+REPL's ``run`` dispatches ``BRAIN_DISPATCH`` tools Brain-first too).  With
+the Brain up, a session opened from EITHER lane lands in the Brain's store
+and its ``<kind>:<id>`` handle is usable from both; ``list_sessions`` is the
+canonical cross-lane view (the Tool REPL's ``sessions`` command shows the
+Brain-held vs REPL-local lists side by side).  ``msf:`` handles are
+daemon-backed by msfrpcd and were always cross-process visible.
+
+Known limitation (unchanged): if the Brain is down, a fallback launch runs
+the tool in the CALLER's process and the session lands in THAT process's
+local store, invisible to every other lane (REPL results are
+degraded-tagged when this happens; Brain-routed REPL calls refuse instead
+of falling back).  Note the store is global to the Brain process, so
+ssh:/listener: handles are visible to all Brain sessions/agents —
+isolation is per-namespace (typed handles), not per-agent.
 """
 
 from __future__ import annotations

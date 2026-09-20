@@ -22,6 +22,9 @@ Safety rails, by construction:
   with an optional body success_marker / fail_marker override.
 - Bounded: max_attempts (default 500, hard cap 5000), wall-clock cap
   (default 300s), per-request timeout, request rate cap (default 10/s).
+- Vhost-gated apps: every tool takes an optional ``host_header`` override
+  (e.g. 'earth.local') — requests still CONNECT to the URL's host/IP, so
+  the scope gate sees and validates the exact host it checked.
 - Wordlist: explicit path wins; empty falls back to utils.wordlists
   resolve_default_wordlist("hydra_passwords") (rockyou on this box), read
   latin-1 with line caps.
@@ -58,6 +61,15 @@ def _origin(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+def _host_headers(host_header: str) -> Optional[Dict[str, str]]:
+    """Optional Host header override for vhost-gated apps.
+
+    requests still CONNECTS to the URL's host (no DNS change), so the scope
+    gate sees and validates the exact host/IP it checked at entry.
+    """
+    return {"Host": host_header} if host_header else None
+
+
 def _extract_form(html: str) -> Dict[str, Any]:
     hidden: List[Tuple[str, str]] = []
     for tag in _HIDDEN_INPUT_RX.findall(html or ""):
@@ -89,18 +101,23 @@ def _resolve_wordlist(wordlist: str) -> Optional[str]:
     "before web_login_brute. Scope-gated.",
     next_hints=["web_login_brute with the field names found here"],
 )
-def web_login_probe(url: str, timeout: float = 8.0, insecure: bool = False):
+def web_login_probe(url: str, timeout: float = 8.0, insecure: bool = False,
+                    host_header: str = ""):
     """GET a login page and report everything a brute needs.
 
     Args:
         url: Login page URL (scope-gate checked before fetch).
         timeout: Per-request timeout in seconds.
         insecure: Skip TLS verification (self-signed lab certs).
+        host_header: Optional Host header override for vhost-gated apps
+            (e.g. 'earth.local') — requests still connect to the URL's host,
+            so the scope gate sees the same host/IP it validated.
     """
     _gate(url)
     try:
         s = requests.Session()
-        r = s.get(url, timeout=float(timeout), verify=not insecure,
+        r = s.get(url, headers=_host_headers(host_header),
+                  timeout=float(timeout), verify=not insecure,
                   allow_redirects=False)
         form = _extract_form(r.text)
         pwd = re.findall(
@@ -134,7 +151,8 @@ def web_login_brute(url: str, username: str,
                     rate: float = 10.0, timeout: float = 8.0,
                     insecure: bool = False, success_marker: str = "",
                     fail_marker: str = "",
-                    success_statuses: str = "301,302,303,307,308"):
+                    success_statuses: str = "301,302,303,307,308",
+                    host_header: str = ""):
     """POST-brute a login form for one username.
 
     Cookie-bound CSRF: the form's hidden fields (token included) are fetched
@@ -155,6 +173,9 @@ def web_login_brute(url: str, username: str,
         success_marker: Body substring that means success (optional).
         fail_marker: Body marker that means failure (optional, for noisy oracles).
         success_statuses: Comma list of status codes treated as success.
+        host_header: Optional Host header override for vhost-gated apps
+            (e.g. 'earth.local') — requests still connect to the URL's host,
+            so the scope gate sees the same host/IP it validated.
     """
     _gate(url)
     attempts_cap = min(int(max_attempts), MAX_ATTEMPTS_CAP)
@@ -166,7 +187,8 @@ def web_login_brute(url: str, username: str,
                 "wordlist path (or check utils.wordlists discovery)")
     try:
         s = requests.Session()
-        r = s.get(url, timeout=float(timeout), verify=not insecure,
+        r = s.get(url, headers=_host_headers(host_header),
+                  timeout=float(timeout), verify=not insecure,
                   allow_redirects=False)
         form = _extract_form(r.text)
         if not form["hidden"] and not form["action"] and "<form" not in r.text.lower():
@@ -200,7 +222,8 @@ def web_login_brute(url: str, username: str,
                 try:
                     r = s.post(url, data=data, timeout=float(timeout),
                                verify=not insecure, allow_redirects=False,
-                               headers={"Referer": referer, "Origin": origin})
+                               headers={"Referer": referer, "Origin": origin,
+                                        **(_host_headers(host_header) or {})})
                 except Exception as e:
                     return f"web_login_brute error after {fired} attempts: {e}"
                 fired += 1
@@ -239,7 +262,8 @@ def web_login_brute(url: str, username: str,
 def web_login_test(url: str, username: str, password: str,
                    username_field: str = "username",
                    password_field: str = "password",
-                   timeout: float = 8.0, insecure: bool = False):
+                   timeout: float = 8.0, insecure: bool = False,
+                   host_header: str = ""):
     """One POST with a real credential pair (recon-grade login test).
 
     Args:
@@ -248,11 +272,14 @@ def web_login_test(url: str, username: str, password: str,
         username_field / password_field: Form field names.
         timeout: Per-request timeout in seconds.
         insecure: Skip TLS verification (self-signed lab certs).
+        host_header: Optional Host header override (vhost-gated apps, e.g.
+            'earth.local') — requests still connect to the URL's host/IP.
     """
     _gate(url)
     try:
         s = requests.Session()
-        r = s.get(url, timeout=float(timeout), verify=not insecure,
+        r = s.get(url, headers=_host_headers(host_header),
+                  timeout=float(timeout), verify=not insecure,
                   allow_redirects=False)
         form = _extract_form(r.text)
         if not form["hidden"]:
@@ -262,7 +289,8 @@ def web_login_test(url: str, username: str, password: str,
         data[password_field] = password
         r = s.post(url, data=data, timeout=float(timeout), verify=not insecure,
                    allow_redirects=False,
-                   headers={"Referer": url, "Origin": _origin(url)})
+                   headers={"Referer": url, "Origin": _origin(url),
+                            **(_host_headers(host_header) or {})})
         return (
             f"web_login_test {url} user={username!r}\n"
             f"status: {r.status_code} location: {r.headers.get('Location', '')} "

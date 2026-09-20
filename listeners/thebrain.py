@@ -118,6 +118,12 @@ registry = FunctionRegistry()
 # zero tools), memories.py (instantiates MemoryService/chroma at import),
 # bootstrap/api_gateway/daharness (harness machinery).
 # Override with BRAIN_SCAN_DIRS="auxiliaries,memories.py"; empty disables.
+# NOTE: utils/ as a directory stays out of the startup scan (packetcraft's
+# scapy import is too heavy). The persistent-SSH session sidecar is
+# registered separately in _startup_scan() via a direct module import — the
+# Brain is the shared session broker for ssh:/listener: handles, and without
+# it ssh: sessions strand in whichever process hit the in-process fallback
+# (REPL / harness), invisible to the other lane.
 DEFAULT_SCAN_DIRS = ("auxiliaries", "listeners", "payloads")
 
 
@@ -200,6 +206,25 @@ def _startup_scan():
         added = len(registry.tools) - before
         total += added
         print(f"[+] Startup scan {p.name}: {status} (+{added} tools)")
+
+    # Shared-session broker: register the persistent SSH session tools
+    # (utils.paramiko_client.*) DIRECTLY, not via DEFAULT_SCAN_DIRS. A direct
+    # import keeps the canonical dotted tool_ids (scan_tools on a bare file
+    # would import it as top-level "paramiko_client" and register ids the
+    # harness/REPL can never match). The Brain's SessionManager then holds
+    # every ssh:/listener: session, so a session the operator opens via the
+    # REPL's Brain-routed `run` is visible to the agent through the Bridge
+    # (and vice versa) — list_sessions is the shared view.
+    try:
+        import utils.paramiko_client as _paramiko_sidecar
+
+        _before = len(registry.tools)
+        registry.scan_module(_paramiko_sidecar)
+        _added = len(registry.tools) - _before
+        total += _added
+        print(f"[+] Startup scan utils.paramiko_client: (+{_added} tools)")
+    except Exception as e:
+        print(f"[!] Startup scan utils.paramiko_client failed: {e}")
     print(f"[+] Brain registry primed: {total} tools available at startup")
 
 class FrameworkEvent(ctypes.Structure):
