@@ -133,20 +133,35 @@ class ZAPClient:
         self.base = ZAP_BASE
         self.api_key = ZAP_API_KEY
         self.session = requests.Session()
-        # Tiny retry budget for the daemon's first few seconds after launch --
-        # the API can return 503 briefly while ZAP is initialising its DB.
-        # 500 is included: ZAP can emit transient 500s during heavy scans or
-        # OOM-adjacent GC pauses.
+        # Retry budget for VIEW endpoints only (read-only, idempotent): the
+        # daemon can return 503 briefly while initialising its DB, and 500
+        # during heavy scans / OOM-adjacent GC pauses.
+        #
+        # IMPORTANT: this retry is mounted on self.session and applies to ALL
+        # requests that go through it.  ACTION endpoints (sendRequest, scan,
+        # spider, etc.) are side-effecting — retrying a sendRequest that
+        # timed out means ZAP sends the raw request to the target AGAIN,
+        # and each retry blocks for ZAP's internal connection timeout
+        # (~30s to an unreachable host).  5 retries × 30s = 150s+ of frozen
+        # worker thread, which compounds against BRAIN_DISPATCH_TIMEOUT and
+        # freezes the whole stack.
+        #
+        # Fix: action endpoints use a SEPARATE session (_action_session)
+        # with NO retry adapter and a shorter per-call timeout.  _get()
+        # routes automatically based on the view string.
         retry = Retry(
             total=5, backoff_factor=0.5,
             status_forcelist=(500, 502, 503, 504),
             allowed_methods=frozenset(["GET"]),
         )
         self.session.mount("http://", requests.adapters.HTTPAdapter(max_retries=retry))
+        # Action session: no retries, no keep-alive surprises.  Used for any
+        # view string containing "/action/".
+        self._action_session = requests.Session()
 
     # ---- raw transport ---------------------------------------------------
 
-    def _get(self, view: str, expect_json: bool = True, **q: Any) -> Any:
+    def _get(self, view: str, expect_json: bool = True, timeout: float = 120.0, **q: Any) -> Any:
         params = dict(q)
         if self.api_key:
             params["apikey"] = self.api_key
@@ -155,7 +170,13 @@ class ZAPClient:
         # format detection is broken: it tries to parse the first path
         # segment -- e.g. "core" -- as the format enum and dies).
         url = f"{self.base}/JSON/{view}"
-        r = self.session.get(url, params=params, timeout=120)
+        # Route action endpoints through the no-retry session so a timed-out
+        # sendRequest doesn't get retried 5× (each retry blocks for ZAP's
+        # internal connection timeout to the target — the "freeze the whole
+        # stack" root cause).
+        is_action = "/action/" in view
+        sess = self._action_session if is_action else self.session
+        r = sess.get(url, params=params, timeout=timeout)
         if not r.ok:
             # Extract the ZAP error body so callers see the actual reason
             # (e.g. "url_not_found: URL Not Found in the Scan Tree") instead
@@ -416,7 +437,8 @@ class ZAPClient:
         return cfg
 
     def send_raw(self, raw_request: str,
-                 follow_redirects: bool = False) -> Dict[str, Any]:
+                 follow_redirects: bool = False,
+                 timeout: float = 30.0) -> Dict[str, Any]:
         """Send a raw HTTP request byte-for-byte through ZAP's HTTP sender.
 
         Uses the core ``core/action/sendRequest`` endpoint (no add-on
@@ -428,6 +450,13 @@ class ZAPClient:
         Drift-guarded like every traffic-bearing ZAP method (2026-09-20):
         the protect-mode mirror is re-synced at call time when the armed
         scope changed, so a scope edit never leaves the mirror stale.
+
+        Timeout: defaults to 30s (NOT the 120s view-endpoint default).
+        ``sendRequest`` blocks while ZAP's internal HTTP client connects to
+        the target — an unreachable host hangs for ZAP's connection-timeout
+        budget.  The action session has NO retry, so a timeout surfaces
+        immediately as a ``requests.exceptions.ReadTimeout`` instead of
+        retrying 5× and freezing the stack for minutes.
         """
         _zap_scope_drift_guard()
         raw_request = self._ensure_https_scheme(raw_request)
@@ -436,6 +465,7 @@ class ZAPClient:
                 "core/action/sendRequest",
                 request=raw_request,
                 followRedirects=str(follow_redirects).lower(),
+                timeout=timeout,
             )
             # core/action/sendRequest wraps the message envelope under a
             # "sendRequest" key; return the envelope itself.
@@ -443,13 +473,44 @@ class ZAPClient:
                 inner = resp["sendRequest"]
                 # some ZAP builds return the envelope(s) as a list.
                 if isinstance(inner, list) and inner:
-                    return inner[0]
-                resp = inner
+                    resp = inner[0]
+                else:
+                    resp = inner
+            # Detect ZAP's "zero response" envelope: when the target is
+            # unreachable, ZAP returns 200 OK with a synthetic response
+            # whose status line is "HTTP/1.0 0" and an empty body.  Surface
+            # this as a clear error so the caller knows the target didn't
+            # respond, rather than treating it as a successful empty page.
+            rh = (resp or {}).get("responseHeader", "")
+            if rh and rh.splitlines() and " 0\r" in rh.splitlines()[0]:
+                req_h = (resp or {}).get("requestHeader", "")
+                return {
+                    "error": (
+                        "ZAP sent the request but the target did not respond "
+                        f"(connection failed/timed out). ZAP returned a "
+                        f"synthetic zero-status response. Request: "
+                        f"{req_h.splitlines()[0] if req_h else '(unknown)'}"
+                    ),
+                    "response_status": "0",
+                    "requestHeader": req_h,
+                    "responseHeader": rh,
+                    "responseBody": "",
+                    "id": (resp or {}).get("id", ""),
+                }
             return cast(Dict[str, Any], resp)
         except ZAPAPIError:
             # 400 Bad Request is returned if the raw request is malformed.
             # Re-raise with the ZAP error body already in the message.
             raise
+        except requests.exceptions.Timeout as e:
+            # The action session has no retry, so this fires once and
+            # surfaces immediately.  Wrap it so the _zap_error_guard
+            # returns a structured dict instead of a bare exception.
+            raise ZAPAPIError(
+                0, "timeout",
+                f"ZAP sendRequest timed out after {timeout}s — the target "
+                f"is likely unreachable. {e}"
+            ) from e
         except requests.HTTPError as e:
             # Fallback for non-ZAP HTTP errors (proxy, network, etc.).
             if e.response is not None and e.response.status_code == 400:
@@ -842,6 +903,94 @@ def _zap() -> ZAPClient:
     return ZAPClient.get_instance()
 
 
+# --- ZAP error guard --------------------------------------------------------
+#
+# Every zap_* wrapper is decorated with @_zap_error_guard (below the
+# @framework_tool decorator) so a ZAPAPIError — whether a 400 structured
+# error (url_not_found, MODE_VIOLATION, DOES_NOT_EXIST) or a 500 internal
+# daemon error — is returned as a structured dict the model can reason about,
+# instead of propagating as a bare exception that _launch_in_process wraps in
+# a generic "In-process launch failed: ZAP 500: ..." message with no
+# actionable detail.
+#
+# ScopeGateError is deliberately NOT caught here: it's a pre-flight scope
+# violation (the operator armed the wrong scope), not a ZAP daemon problem.
+
+import functools as _functools
+
+# Hints surfaced for specific ZAP error codes / status patterns so the model
+# gets an actionable next step, not just the raw error text.
+_ZAP_ERROR_HINTS = {
+    "MODE_VIOLATION": (
+        "ZAP is in protect mode and refused this target as out-of-scope. "
+        "Run zap_sync_scope to re-mirror the armed scope, or check that "
+        "the target is in the armed scope manifest."
+    ),
+    "url_not_found": (
+        "The URL is not in ZAP's sites tree. Run zap_open_url or zap_spider "
+        "on it first so ZAP discovers it before querying."
+    ),
+    "DOES_NOT_EXIST": (
+        "The named ZAP resource does not exist (e.g. a replacer rule that "
+        "was already removed). This is usually benign — the operation is "
+        "idempotent."
+    ),
+    "BAD_VIEW": (
+        "This ZAP API endpoint was removed or renamed in this ZAP version "
+        "(2.17). The client code may need updating for the installed build."
+    ),
+    "no_implementor": (
+        "The required ZAP add-on is not installed. Install it from the ZAP "
+        "marketplace and restart the daemon."
+    ),
+    "timeout": (
+        "The ZAP API call timed out waiting for the target to respond. "
+        "The target is likely unreachable or very slow. Verify the target "
+        "is up and reachable from this host before retrying. "
+        "Action endpoints are NOT retried (no double side-effects)."
+    ),
+}
+
+
+def _zap_error_guard(func):
+    """Catch ZAPAPIError and return a structured dict instead of propagating.
+
+    Applied as the inner decorator (below @framework_tool) on every zap_*
+    wrapper.  Uses functools.wraps so inspect.signature (used by the registry
+    for parameter extraction) sees the original function's signature.
+    """
+
+    @_functools.wraps(func)
+    def _wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ZAPAPIError as e:
+            hint = _ZAP_ERROR_HINTS.get(e.code, "")
+            if not hint and e.status_code >= 500:
+                _xmx = os.getenv("ZAP_XMX", "512m")
+                hint = (
+                    f"ZAP daemon returned HTTP {e.status_code} (internal "
+                    f"server error). View endpoints are retried 5x with "
+                    f"backoff; action endpoints (sendRequest, scan, etc.) "
+                    f"are NOT retried to avoid double side-effects. If this "
+                    f"persists: check /tmp/zap.log for Java stack traces, "
+                    f"verify the daemon is healthy (curl "
+                    f"http://127.0.0.1:{ZAP_PORT}/JSON/core/view/version), "
+                    f"and consider restarting ZAP or raising ZAP_XMX "
+                    f"(currently {_xmx}) if OOM-adjacent."
+                )
+            return {
+                "error": str(e),
+                "zap_code": e.code,
+                "zap_status": e.status_code,
+                "zap_message": e.message,
+                "status": "Failed",
+                **({"hint": hint} if hint else {}),
+            }
+
+    return _wrapper
+
+
 # --- @framework_tool wrappers ----------------------------------------------
 #
 # Doc strings here are what the registry embeds for semantic matching. Keep
@@ -856,6 +1005,7 @@ def _zap() -> ZAPClient:
     "header, req/sec cap) are auto-applied to the ZAP daemon so every "
     "subsequent spider/active-scan request respects the RoE.",
 )
+@_zap_error_guard
 def zap_open_url(target: str,
                  scope_handle: Optional[str] = None,
                  scope_platform: Optional[str] = None) -> Dict[str, Any]:
@@ -899,6 +1049,7 @@ def zap_open_url(target: str,
 
 
 @framework_tool("Start the traditional ZAP spider against a URL; returns spider_id.")
+@_zap_error_guard
 def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[str, str]:
     """Crawl from ``target`` up to ``max_depth`` hops. Returns the spider id;
     poll with ``zap_spider_status`` until it reaches 100.
@@ -924,6 +1075,7 @@ def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[st
 
 
 @framework_tool("Get spider progress (0..100) for a given spider_id.")
+@_zap_error_guard
 def zap_spider_status(scan_id: str) -> Dict[str, Any]:
     """Args:
         scan_id: The spider id returned by ``zap_spider``.
@@ -932,6 +1084,7 @@ def zap_spider_status(scan_id: str) -> Dict[str, Any]:
 
 
 @framework_tool("Start the AJAX (headless-browser) spider against a URL.")
+@_zap_error_guard
 def zap_ajax_spider(target: str) -> Dict[str, str]:
     """The AJAX spider is a singleton — there is no per-scan ID.  Poll
     progress with ``zap_ajax_spider_status`` (it takes no scan-id argument).
@@ -947,11 +1100,13 @@ def zap_ajax_spider(target: str) -> Dict[str, str]:
 
 
 @framework_tool("Get AJAX spider progress (running / stopped / finished) for a given spider_id.")
+@_zap_error_guard
 def zap_ajax_spider_status() -> Dict[str, str]:
     return {"status": _zap().ajax_spider_status()}
 
 
 @framework_tool("Start an active scan against a URL; returns ascan_id.")
+@_zap_error_guard
 def zap_active_scan(target: str, policy: Optional[str] = None) -> Dict[str, str]:
     """Active scan attacks every URL the spider discovered. ``policy`` is
     optional and names a ZAP scan policy (e.g. ``"Default Policy"``).
@@ -978,6 +1133,7 @@ def zap_active_scan(target: str, policy: Optional[str] = None) -> Dict[str, str]
     "by this tool; use zap_alerts or zap_report for the detailed payload.",
     next_hints=["zap_alerts", "zap_report"],
 )
+@_zap_error_guard
 def zap_active_scan_status(scan_id: str, base_url: Optional[str] = None) -> Dict[str, Any]:
     """Args:
         scan_id: The ascan id returned by ``zap_active_scan``.
@@ -1006,6 +1162,7 @@ def zap_active_scan_status(scan_id: str, base_url: Optional[str] = None) -> Dict
     "List ZAP alerts (optionally filtered by URL prefix and risk level).",
     next_hints=["zap_alert_message", "report_finding"],
 )
+@_zap_error_guard
 def zap_alerts(base_url: Optional[str] = None,
                risk_id: Optional[int] = None,
                summary: bool = True,
@@ -1040,6 +1197,7 @@ def zap_alerts(base_url: Optional[str] = None,
     "Get an alert's metadata plus the full HTTP request/response that triggered it.",
     next_hints=["report_finding"],
 )
+@_zap_error_guard
 def zap_alert_message(alert_id: str) -> Dict[str, Any]:
     """Returns the alert rule that fired (name, risk, CWE, evidence) AND the
     raw HTTP request + response that triggered it. Use to triage a finding:
@@ -1055,6 +1213,7 @@ def zap_alert_message(alert_id: str) -> Dict[str, Any]:
     "Grep the raw HTTP response for a previously-spidered URL using a regex. "
     "This is the ZAP-as-grep tool: pass any regex, get all matches back."
 )
+@_zap_error_guard
 def zap_history_regex(target: str, pattern: str,
                       body_only: bool = True) -> Dict[str, Any]:
     """Use cases: enumerate hidden form fields, find all JS endpoints, locate
@@ -1070,11 +1229,13 @@ def zap_history_regex(target: str, pattern: str,
 
 
 @framework_tool("List top-level hosts discovered by the ZAP session.")
+@_zap_error_guard
 def zap_sites() -> List[str]:
     return _zap().sites()
 
 
 @framework_tool("Get the full ZAP sites tree (optionally scoped to a subtree URL).")
+@_zap_error_guard
 def zap_sites_tree(target: Optional[str] = None) -> str:
     """JSON dump of the entire discovered URL hierarchy.
 
@@ -1086,6 +1247,7 @@ def zap_sites_tree(target: Optional[str] = None) -> str:
 
 
 @framework_tool("Generate a ZAP report file (html/xml/json/md) and return its path.")
+@_zap_error_guard
 def zap_report(report_format: str = "html",
                report_file: str = "/tmp/zap_report.html",
                report_title: str = "Framework ZAP scan") -> Dict[str, Any]:
@@ -1143,8 +1305,10 @@ def _host_from_raw_request(raw_request: str) -> "Optional[str]":
     "passive scanner observes it.",
     next_hints=["zap_history_regex", "report_finding"],
 )
+@_zap_error_guard
 def zap_send_raw(raw_request: str,
-                 follow_redirects: bool = False) -> Dict[str, Any]:
+                 follow_redirects: bool = False,
+                 timeout: float = 30.0) -> Dict[str, Any]:
     """Send a raw HTTP/1.1 request exactly as written.
 
     First line must be ``METHOD /path HTTP/1.1``; separate headers from the
@@ -1156,6 +1320,10 @@ def zap_send_raw(raw_request: str,
             "earth.local\\n\\n"`` -- always include a Host header for
             vhost-gated targets.
         follow_redirects: If True, ZAP follows 3xx responses automatically.
+        timeout: Per-request timeout in seconds (default 30). If the target
+            is unreachable, ZAP's sendRequest blocks until this fires —
+            there is NO retry on action endpoints, so the timeout surfaces
+            immediately as a structured error instead of freezing the stack.
     """
     lines = raw_request.lstrip().splitlines()
     if not lines or " HTTP/1." not in lines[0]:
@@ -1169,9 +1337,10 @@ def zap_send_raw(raw_request: str,
         raise ScopeGateError(f"scope gate: {_sc_reason}")
     # Model-written requests use \n; the wire needs \r\n. Normalize.
     wire = raw_request.replace("\r\n", "\n").replace("\n", "\r\n")
-    env = _zap().send_raw(wire, follow_redirects=follow_redirects)
+    env = _zap().send_raw(wire, follow_redirects=follow_redirects, timeout=timeout)
     if env.get("error"):
-        return {"error": env["error"]}
+        return {"error": env["error"], "status": "Failed",
+                "response_status": env.get("response_status", "")}
     return {
         "message_id": env.get("id", ""),
         "status": _status_from_headers(env.get("responseHeader", "")),
@@ -1323,6 +1492,7 @@ def sync_protect_scope(zap: Optional[ZAPClient] = None) -> Dict[str, Any]:
     "blessed as IPs (scope add-ip).",
     next_hints=["zap_open_url", "zap_spider", "zap_active_scan", "report_finding"],
 )
+@_zap_error_guard
 def zap_sync_scope() -> Dict[str, Any]:
     """Sync ZAP's context + mode with the operator-armed scope (read-only on scope)."""
     return sync_protect_scope()

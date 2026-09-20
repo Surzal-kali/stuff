@@ -37,6 +37,9 @@ def zap_client():
     client.api_key = "test-key"
     import requests
     client.session = requests.Session()
+    # Action endpoints route through a separate no-retry session; provide
+    # one so _get doesn't AttributeError on /action/ views.
+    client._action_session = requests.Session()
     return client
 
 
@@ -427,7 +430,9 @@ def test_get_raises_zap_api_error_on_400(zap_client, monkeypatch):
     fake_resp.text = '{"code":"url_not_found","message":"URL Not Found in the Scan Tree"}'
     fake_resp.json.return_value = {"code": "url_not_found",
                                    "message": "URL Not Found in the Scan Tree"}
-    monkeypatch.setattr(zap_client.session, "get",
+    # "ascan/action/scan" is an action endpoint — _get routes it through
+    # _action_session, not session.
+    monkeypatch.setattr(zap_client._action_session, "get",
                         lambda *a, **kw: fake_resp)
     with pytest.raises(ZAPAPIError) as exc_info:
         zap_client._get("ascan/action/scan", url="http://nope.invalid")
