@@ -10,7 +10,7 @@ Modes:
   interactive       (default) — REPL prompt: list, search, run, info, sweep, quit
   run <id> [--flag val ...]   — one-shot: run a tool with --flag value args
   run <id> --json '{...}'     — one-shot: run a tool with JSON args (fallback)
-  sweep [--safe]              — run every discoverable tool with safe/no-op args
+  sweep [--force]             — run every discoverable tool with safe/no-op args
   info <id>                   — show a tool's manifest without running it
   search <query>              — semantic search (needs ChromaDB + Ollama);
                                 best match prints LAST, nearest the prompt

@@ -23,6 +23,11 @@ Design notes
   take effect without re-import.  Every packet tool takes an ``interface``
   parameter; craft tools accept it for schema uniformity but ignore it
   (crafting never touches the wire).
+* Source-IP rule (2026-09-20): ``src_ip`` in the craft family MUST be THIS
+  host's real routable IP on the target's network — replies go there, so a
+  spoofed, unroutable, or guessed source means the reply goes elsewhere and
+  ``send_and_receive_packet`` returns its no-reply envelope.  If the proper
+  source IP is unknown, ASK THE OPERATOR — never guess or auto-derive it.
 """
 
 import os
@@ -395,7 +400,7 @@ def craft_icmp_echo(src_ip: str, dst_ip: str, payload: str = "", interface: str 
     """Craft an ICMP Echo Request (type 8) packet.
 
     Args:
-        src_ip: Source IP address.
+        src_ip: This host's REAL routable IP on the target network (replies go here); ask the operator if unknown.
         dst_ip: Destination IP address.
         payload: Optional payload text (encoded to bytes).
         interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
@@ -413,7 +418,7 @@ def craft_icmp_packet(src_ip: str, dst_ip: str, payload: str = "", interface: st
     """Craft a generic ICMP packet (type/code left at scapy defaults).
 
     Args:
-        src_ip: Source IP address.
+        src_ip: This host's REAL routable IP on the target network (replies go here); ask the operator if unknown.
         dst_ip: Destination IP address.
         payload: Optional payload text.
         interface: Interface override for schema consistency with the send/sniff tools; ignored while crafting (crafting never touches the wire).
@@ -433,7 +438,7 @@ def craft_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, fla
     """Craft a TCP/IP packet.
 
     Args:
-        src_ip: Source IP address.
+        src_ip: This host's REAL routable IP on the target network (replies go here); ask the operator if unknown.
         dst_ip: Destination IP address.
         src_port: Source TCP port.
         dst_port: Destination TCP port.
@@ -453,7 +458,7 @@ def craft_udp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int, pay
     """Craft a UDP/IP packet.
 
     Args:
-        src_ip: Source IP address.
+        src_ip: This host's REAL routable IP on the target network (replies go here); ask the operator if unknown.
         dst_ip: Destination IP address.
         src_port: Source UDP port.
         dst_port: Destination UDP port.
@@ -730,6 +735,11 @@ def send_and_receive_packet(hex: str, timeout: int = 5, interface: str = ""):
     sniff_packets. Gate: the same check_send runs BEFORE the probe fires
     (identical to send_packet) — refusals raise ScopeGateError; the inbound
     reply itself is not gated (receive-only).
+
+    Source-IP note: the probe's src_ip is chosen in the craft_* call and MUST
+    be this host's real routable IP on the target network — a spoofed or
+    unknown source means the reply never arrives (no-reply envelope). Ask
+    the operator if the proper source IP is unknown.
 
     Args:
         hex: Packet hex string from a craft_* tool.
