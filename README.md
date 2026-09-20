@@ -263,6 +263,57 @@ in `.env`. `program_hacktivity` works without credentials.
 and hacktivity via `INTIGRITI_USERNAME` + `INTIGRITI_API_TOKEN`; manifests
 cache to `scope/intigriti_<handle>.scope`.
 
+### Tool REPL (`tool_repl.py`)
+
+The operator's console for exercising framework tools directly — it
+bypasses the secretary LLM entirely: pick a tool, supply arguments, see
+the raw result. Use it to isolate tool-execution problems from
+model-reasoning problems, to arm/control the scope gate, and to
+smoke-test tools after adding or editing modules. `run` dispatches
+through the same executor as the Brain, so the armed scope gate applies
+here too — the REPL is also where refusals can be tested safely.
+
+Launch: `python tool_repl.py` (interactive). One-shot modes:
+`python tool_repl.py run <tool_id> [--flag value ...]` (or
+`run <tool_id> --json '{...}'`, or bare `run <tool_id>` = safe defaults),
+`info <tool_id>`, `sweep`, `search <query>`.
+
+Interactive commands:
+
+    list [filter]        print discovered tool manifests (substring filter)
+    info <tool_id>       full manifest: params, defaults, embedding blurb
+    resolve <tool_id>    import the callable; print signature + docstring
+    run <tool_id> [--flag value ...] | --json '{...}'
+                         execute a tool; shlex quoting honoured; args
+                         type-coerced from the tool's own manifest schema;
+                         bare `run` falls back to the tool's SAFE_ARGS
+                         defaults (see safe-args)
+    sweep [--force]      run EVERY discoverable tool with safe args and a
+                         summary table; tools needing a live service are
+                         skipped unless --force
+    safe-args [<id>]     show the SAFE_ARGS table (or one tool's entry)
+    search <query>       semantic search (needs ChromaDB + Ollama);
+                         rendered worst-match-first so rank #1 prints
+                         LAST, right above the prompt
+    scope ...            scope-gate control — see the next section
+    reindex              re-discover tools after adding/editing modules
+                         (manifests only, no ChromaDB re-embed)
+    ipython              IPython shell preloaded with the registry,
+                         manifests, and quick_run(tool_id, **kwargs)
+    help / quit
+
+Input UX: prompt_toolkit ghost text plus a tiered completer — commands →
+tool IDs → `--flag` names from the chosen tool's schema → scope
+subcommands and their flags. History persists in `~/.tool_repl_history`.
+The prompt carries a `✓` prefix while the scope gate is ARMED (sends
+gated); it disappears when disarmed.
+
+Two refresh layers, easy to confuse: REPL `reindex` re-runs tool
+discovery in-process (manifests + direct `run` see code edits
+immediately), while `python -m daharness.core` rebuilds the vector
+registry — semantic `search` and the secretary keep seeing the OLD
+embeddings until that re-embed runs (and the Brain is restarted).
+
 ### Scope Gate — Operator-Armed (`utils/scope_gate.py`)
 
 The armed gate is a technical backstop the OPERATOR arms from the Tool
@@ -275,7 +326,8 @@ before.
     scope on <handle> [--platform P] [--no-strict]   # arm (refuses blind: needs a cached manifest)
     scope status                                      # armed state, asset counts, manifest age
     scope add-ip <ip> [<hostname>]                    # bless a resolved in-scope IP (CDN-safe)
-    scope rm-ip <ip> / scope list-ips                 # manage the operator allowlist
+    scope add-host <hostname> <ip>                    # bless a vhost hostname (IP must already be blessed)
+    scope rm-ip <ip> / scope rm-host <hostname>       # revoke blessings; scope list-ips shows the allowlist
 
 Enforcement is file-backed, not in-process: the armed state lives in
 `scope/.armed_packet_scope.json` (atomic writes, mtime-checked on every
@@ -296,6 +348,10 @@ Verdict tiers (first match wins; an out-of-scope match always beats an
 in-scope wildcard):
 1. **Operator allowlist** — `scope add-ip` blessings (authoritative,
    CDN-safe: the operator confirmed the IP belongs to an in-scope host).
+1b. **Operator-blessed hostnames** — `scope add-host <hostname> <ip>` maps a
+   vhost hostname to an ALREADY-blessed IP (for lanes whose connect target
+   is the Host header, e.g. ZAP raw send). The operator asserts the mapping;
+   the gate never resolves DNS for it.
 2. **Manifest match** — the program's typed in-scope assets (DOMAIN/
    WILDCARD/URL for hostnames, IP/CIDR for IPs).
 3. **Reverse-DNS attribution** — PTR records are attacker-settable, so an

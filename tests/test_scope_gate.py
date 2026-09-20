@@ -520,6 +520,59 @@ class TestSendAndReceive:
         assert sndrcv.calls == {"sr1": [], "srp1": []}
 
 
+# --- scope_gate add_host/remove_host: tier-1b blessed hostnames -------------
+# (2026-09-19) Vhost lanes (e.g. ZAP raw send, whose connect target comes from
+# the Host header) present HOSTNAMES the IP allowlist can never bless.  The
+# operator blesses hostname->IP explicitly; the gate accepts the blessed
+# hostname via tier-1b, never resolves DNS for it, and revocation is immediate
+# (mtime-checked state).  NOTE: check_send only ever sees packet destination
+# IPs, so hostname verdicts flow through check_scan -> _check_one.
+
+class TestBlessedHosts:
+    def test_add_host_requires_blessed_ip(self, scope):
+        _arm()
+        res = g.add_host("evil.example", "203.0.113.9")
+        assert not res["ok"] and "allowlist" in res["error"].lower()
+
+    def test_blessed_host_passes_and_normalizes(self, scope):
+        _arm()
+        g.add_ip("198.51.100.5", "vhost host")
+        res = g.add_host("Earth.Example.com.", "198.51.100.5")
+        assert res["ok"] and res["blessed_hosts"] == {"earth.example.com": "198.51.100.5"}
+        ok, _ = g.check_scan("earth.example.com")
+        assert ok
+        ok, _ = g.check_scan("EARTH.Example.COM")
+        assert ok
+        # direct verdict names the tier (check_scan aggregates reasons)
+        ok, reason = g._check_one("earth.example.com", g._load_state())
+        assert ok and "blessed-host" in reason
+
+    def test_unblessed_hostname_refused_strict(self, scope):
+        _arm()
+        ok, reason = g.check_scan("nope.example.com")
+        assert not ok and "not confirmed in-scope" in reason and "add-host" in reason
+
+    def test_remove_host_revokes(self, scope):
+        _arm()
+        g.add_ip("198.51.100.5", "x")
+        g.add_host("foo.example.com", "198.51.100.5")
+        assert g.check_scan("foo.example.com")[0]
+        assert g.remove_host("foo.example.com")["ok"]
+        assert not g.check_scan("foo.example.com")[0]
+
+    def test_add_host_rejects_bad_shapes(self, scope):
+        _arm()
+        g.add_ip("198.51.100.5", "x")
+        for bad in ("http://x.com", "a b.com", "198.51.100.5", "user@x.com", "x/y.com"):
+            assert not g.add_host(bad, "198.51.100.5")["ok"], bad
+
+    def test_status_reports_blessed_hosts(self, scope):
+        _arm()
+        g.add_ip("198.51.100.5", "x")
+        g.add_host("foo.example.com", "198.51.100.5")
+        assert g.status()["blessed_hosts_size"] == 1
+
+
 # --- ffuf / hydra: load directly (bypass payloads/__init__); skip if absent -
 
 _ffuf = _load_isolated("payloads/ffuf.py", "_regr_ffuf")

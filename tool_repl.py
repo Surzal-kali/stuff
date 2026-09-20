@@ -80,6 +80,8 @@ class ToolReplCompleter(Completer if _PROMPT_TOOLKIT else object):
         "off": "disarm — lab mode, tools unrestricted",
         "status": "armed state, asset counts, manifest_age_s",
         "add-ip": "add-ip <ip> [<hostname>] — bless a resolved in-scope IP",
+        "add-host": "add-host <hostname> <ip> — bless a vhost hostname (IP must already be blessed)",
+        "rm-host": "rm-host <hostname> — remove a blessed hostname",
         "rm-ip": "rm-ip <ip> — remove a blessed IP",
         "list-ips": "show the operator allowlist",
         "search": "query boards: <kw> [--platform P] [--assets] [--handle H] [--refresh] [--limit N] [--json]",
@@ -531,6 +533,8 @@ def _scope_command(rest: str):
         print("    scope status")
         print("    scope search <kw> [--assets]  (query the boards: matching programs + bounty-relevant stats)")
         print("    scope add-ip <ip> [<hostname>]   (bless a resolved in-scope IP)")
+        print("    scope add-host <hostname> <ip>   (bless a vhost hostname; IP must already be blessed)")
+        print("    scope rm-host <hostname>")
         print("    scope rm-ip <ip>")
         print("    scope list-ips")
         st = scope_gate.status()
@@ -672,6 +676,18 @@ def _scope_command(rest: str):
         ip = parts[1]
         hostname = parts[2] if len(parts) > 2 else ""
         res = scope_gate.add_ip(ip, hostname)
+
+    elif sub in ("add-host", "add_host"):
+        if len(parts) < 3:
+            print("  Usage: scope add-host <hostname> <ip>")
+            return
+        res = scope_gate.add_host(parts[1], parts[2])
+
+    elif sub in ("rm-host", "rm_host"):
+        if len(parts) < 2:
+            print("  Usage: scope rm-host <hostname>")
+            return
+        res = scope_gate.remove_host(parts[1])
 
     elif sub in ("rm-ip", "rm_ip", "remove", "rm"):
         if len(parts) < 2:

@@ -281,6 +281,17 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
         host = allowlist.get(checkable) or ""
         return True, f"in operator allowlist ({host})" if host else "in operator allowlist"
 
+    # Tier 1b: operator-blessed hostnames (vhost lanes).  The operator asserts
+    # the hostname->IP mapping explicitly via add_host (REPL-only); the gate
+    # never resolves DNS for it - the operator's assertion IS the authority.
+    # Keys are stored lowercased, trailing dot stripped; compare the same way.
+    blessed_hosts: Dict[str, str] = state.get("blessed_hosts") or {}
+    _hkey = checkable.lower().rstrip(".")
+    if _hkey in blessed_hosts:
+        return True, (
+            f"in operator blessed-host list (maps to {blessed_hosts[_hkey]})"
+        )
+
     manifest = _load_manifest(handle, platform)
     if manifest is None:
         return (
@@ -324,9 +335,9 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
         return (
             False,
             f"{checkable} not confirmed in-scope for program {handle!r}; refused "
-            f"(strict). Bless it with 'scope add-ip {checkable} <hostname>' in "
-            f"the Tool REPL after confirming it belongs to an in-scope host, or "
-            f"'scope off' for lab mode.",
+            f"(strict). Bless a resolved IP with 'scope add-ip <ip> <hostname>' "
+            f"or a vhost with 'scope add-host <hostname> <blessed-ip>' in the "
+            f"Tool REPL, or 'scope off' for lab mode.",
         )
     return True, f"WARNING: {checkable} not confirmed in-scope (non-strict); proceeding"
 
@@ -540,6 +551,7 @@ def arm(handle: str, platform: str = "h1", strict: bool = True) -> Dict[str, Any
         "platform": platform,
         "strict": bool(strict),
         "allowlist": {},
+        "blessed_hosts": {},
         "armed_at": time.time(),
     }
     _write_state(state)
@@ -587,7 +599,13 @@ def add_ip(ip: str, hostname: str = "") -> Dict[str, Any]:
     try:
         ipaddress.ip_address(ip)
     except ValueError:
-        return {"ok": False, "error": f"{ip!r} is not a valid IP address"}
+        return {
+            "ok": False,
+            "error": (
+                f"{ip!r} is not a valid IP address; to bless a hostname "
+                f"(vhost lane) use 'scope add-host <hostname> <blessed-ip>'"
+            ),
+        }
     state.setdefault("allowlist", {})[ip] = (hostname or "").strip()
     _write_state(state)
     return {
@@ -597,6 +615,73 @@ def add_ip(ip: str, hostname: str = "") -> Dict[str, Any]:
         "allowlist_size": len(state["allowlist"]),
         "message": f"blessed {ip}" + (f" ({hostname})" if hostname else ""),
     }
+
+
+def add_host(hostname: str, ip: str) -> Dict[str, Any]:
+    """Bless a hostname into the operator's blessed-host list (vhost support).
+
+    For lanes whose connect target is a Host header (ZAP raw send), the gate
+    sees a hostname the IP allowlist can never bless.  The operator asserts
+    the hostname->IP mapping EXPLICITLY: ``ip`` must already be in the IP
+    allowlist (bless the IP first), the mapping is stored verbatim, and the
+    gate never resolves DNS for it.  Hostname shape is validated (no scheme,
+    path, spaces, userinfo, or IP-lookalike); keys are lowercased, trailing
+    dot stripped.
+    """
+    state = _load_state()
+    if state is None:
+        return {"ok": False, "error": "no scope armed; run 'scope on <handle>' first"}
+    hostname = (hostname or "").strip().lower().rstrip(".")
+    ip = (ip or "").strip()
+    if not hostname or not ip:
+        return {
+            "ok": False,
+            "error": "hostname and ip are required: scope add-host <hostname> <ip>",
+        }
+    if (
+        _is_ip(hostname)
+        or "://" in hostname
+        or "/" in hostname
+        or " " in hostname
+        or ":" in hostname
+        or "@" in hostname
+    ):
+        return {"ok": False, "error": f"{hostname!r} does not look like a bare hostname"}
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"ok": False, "error": f"{ip!r} is not a valid IP address"}
+    if ip not in (state.get("allowlist") or {}):
+        return {
+            "ok": False,
+            "error": (
+                f"{ip} is not in the IP allowlist; run 'scope add-ip {ip} "
+                f"<hostname>' first - hostnames may only map to blessed IPs"
+            ),
+        }
+    state.setdefault("blessed_hosts", {})[hostname] = ip
+    _write_state(state)
+    return {
+        "ok": True,
+        "hostname": hostname,
+        "ip": ip,
+        "blessed_hosts": dict(state["blessed_hosts"]),
+        "message": f"blessed {hostname} -> {ip}",
+    }
+
+
+def remove_host(hostname: str) -> Dict[str, Any]:
+    """Remove a blessed hostname (REPL authority, same as add_host)."""
+    state = _load_state()
+    if state is None:
+        return {"ok": False, "error": "no scope armed"}
+    blessed = state.get("blessed_hosts") or {}
+    key = (hostname or "").strip().lower().rstrip(".")
+    if key not in blessed:
+        return {"ok": False, "error": f"{key} not in blessed-host list"}
+    del blessed[key]
+    _write_state(state)
+    return {"ok": True, "hostname": key, "blessed_hosts": dict(blessed)}
 
 
 def remove_ip(ip: str) -> Dict[str, Any]:
@@ -629,6 +714,7 @@ def status() -> Dict[str, Any]:
         "platform": state.get("platform", "h1"),
         "strict": state.get("strict", True),
         "allowlist_size": len(state.get("allowlist") or {}),
+        "blessed_hosts_size": len(state.get("blessed_hosts") or {}),
         "armed_at": state.get("armed_at"),
     }
     manifest = _load_manifest(state.get("handle", ""), state.get("platform", "h1"))
@@ -661,6 +747,8 @@ __all__ = [
     "disarm",
     "add_ip",
     "remove_ip",
+    "add_host",
+    "remove_host",
     "list_ips",
     "status",
     "is_armed",
