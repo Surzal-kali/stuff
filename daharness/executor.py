@@ -270,7 +270,7 @@ class ExecutorMixin:
             return {
                 "error": (
                     f"Tool '{tool_id}' did not return a result within {dispatch_timeout:.0f}s. "
-                    "It may still be running on the Brain; check the sidecar logs before retrying."
+                    "It may still be running on the Brain; see list_tool_executions / kill_tool_execution (and BRAIN_EXEC_CEILING) to stop it."
                 ),
                 "status": "Failed",
             }, False

@@ -22,6 +22,7 @@ if str(_FRAMEWORK_ROOT) not in sys.path:
     sys.path.insert(0, str(_FRAMEWORK_ROOT))
 
 from constants import TransportType, framework_tool
+from listeners.execution_tracker import EXECUTION_TRACKER
 
 EVENT_HANDLERS = {}
 
@@ -557,15 +558,67 @@ async def dispatch(event, full_payload=None):
                 # Execute tool without blocking the event loop. Coroutine
                 # functions MUST be awaited directly — run_in_executor on them
                 # silently creates a coroutine that never runs.
+                #
+                # Fuzz 2026-09-20 residual fix: every execution is now tracked
+                # (EXECUTION_TRACKER) so list_tool_executions /
+                # kill_tool_execution can see and stop zombies, and
+                # BRAIN_EXEC_CEILING (default 3600s, 0=off) hard-stops an
+                # execution that outlives every caller's timeout.
                 loop = asyncio.get_event_loop()
-                if inspect.iscoroutinefunction(tool):
-                    result = await tool(**kwargs) if kwargs else await tool(*args)
-                else:
-                    if kwargs:
-                        call = functools.partial(tool, **kwargs)
+                EXECUTION_TRACKER.set_caller_session(event.session_id)
+                kind = "async" if inspect.iscoroutinefunction(tool) else "thread"
+                exec_id = EXECUTION_TRACKER.begin(tool_id, event.session_id, kind)
+                ceiling = float(os.getenv("BRAIN_EXEC_CEILING", "3600"))
+                try:
+                    if kind == "async":
+                        task = asyncio.ensure_future(
+                            tool(**kwargs) if kwargs else tool(*args)
+                        )
+                        EXECUTION_TRACKER.attach_task(exec_id, task)
+                        result = (
+                            await asyncio.wait_for(task, ceiling)
+                            if ceiling > 0
+                            else await task
+                        )
                     else:
-                        call = functools.partial(tool, *args)
-                    result = await loop.run_in_executor(None, call)
+                        if kwargs:
+                            call = functools.partial(tool, **kwargs)
+                        else:
+                            call = functools.partial(tool, *args)
+                        fut = loop.run_in_executor(None, call)
+                        EXECUTION_TRACKER.attach_future(exec_id, fut)
+                        result = (
+                            await asyncio.wait_for(fut, ceiling)
+                            if ceiling > 0
+                            else await fut
+                        )
+                except asyncio.TimeoutError:
+                    verdict = await EXECUTION_TRACKER.kill(
+                        exec_id,
+                        force=True,
+                        reason=f"BRAIN_EXEC_CEILING ({ceiling:.0f}s) exceeded",
+                    )
+                    print(f"[!] Ceiling-terminated {tool_id} ({exec_id}): {verdict}")
+                    return json.dumps({
+                        "status": "error",
+                        "tool_id": tool_id,
+                        "error": (
+                            f"Execution of {tool_id} ({exec_id}) exceeded "
+                            f"BRAIN_EXEC_CEILING ({ceiling:.0f}s) and was terminated "
+                            f"on the Brain. Details: {verdict}"
+                        ),
+                    })
+                except asyncio.CancelledError:
+                    return json.dumps({
+                        "status": "error",
+                        "tool_id": tool_id,
+                        "error": (
+                            f"Execution of {tool_id} ({exec_id}) was cancelled "
+                            "(kill_tool_execution or ceiling)."
+                        ),
+                    })
+                finally:
+                    EXECUTION_TRACKER.finish(exec_id)
 
                 print(f"[+] Tool {tool_id} executed successfully: {result}")
                 # JSON status envelope — the harness parses this structurally
