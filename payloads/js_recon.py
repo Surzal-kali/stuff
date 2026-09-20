@@ -55,13 +55,13 @@ _SCRIPT_SRC_RE = re.compile(
 )
 _CLIENT_CALL_RE = re.compile(
     r"(?:fetch|axios(?:\.(?:get|post|put|patch|delete|request))?)\(\s*"
-    r"[\"'`](/[^\"'`\s]{1,200}|https?://[^\"'`\s]{1,200})", re.IGNORECASE
+    r"[\"'`](?P<url>/[^\"'`\s]{1,200}|https?://[^\"'`\s]{1,200})", re.IGNORECASE
 )
 _XHR_OPEN_RE = re.compile(
-    r"\.open\(\s*[\"'](GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)[\"']\s*,\s*"
-    r"[\"']([^\"'\s]+)[\"']", re.IGNORECASE
+    r"\.open\(\s*[\"'](?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)[\"']\s*,\s*"
+    r"[\"'](?P<url>[^\"'\s]+)[\"']", re.IGNORECASE
 )
-_ABS_PATH_RE = re.compile(r"[\"'`](/[A-Za-z0-9_\-][A-Za-z0-9_\-./]{1,120})[\"'`]")
+_ABS_PATH_RE = re.compile(r"[\"'`](?P<url>/[A-Za-z0-9_\-][A-Za-z0-9_\-./]{1,120})[\"'`]")
 _FULL_URL_RE = re.compile(r"https?://[^\s\"'`<>\\)]{4,300}")
 _SOURCEMAP_RE = re.compile(r"sourceMappingURL\s*=\s*(\S+?\.map)")
 _ANY_MAP_RE = re.compile(r"[A-Za-z0-9_\-./]+\.js\.map\b")
@@ -148,8 +148,7 @@ def _extract_routes(text: str) -> List[str]:
     found: Set[str] = set()
     for pattern in (_CLIENT_CALL_RE, _XHR_OPEN_RE, _ABS_PATH_RE):
         for m in pattern.finditer(text):
-            # XHR regex captures (method, path); the rest capture (path,).
-            candidate = m.group(m.lastindex if pattern is _XHR_OPEN_RE else 1)
+            candidate = m.group("url")
             if not candidate:
                 continue
             if candidate.startswith("//"):

@@ -33,7 +33,6 @@ import requests
 
 from constants import framework_tool
 
-_TIMEOUT = (5.0, 10.0)
 _EVIL_ORIGIN = "https://evil.example.com"
 
 _SECURITY_HEADERS: Tuple[Tuple[str, str], ...] = (
@@ -79,7 +78,7 @@ def _cors_verdict(acao: Optional[str], acac: Optional[str], origin_sent: str) ->
     )
 
 
-def _fetch(url: str, headers: Dict[str, str], insecure: bool):
+def _fetch(url: str, headers: Dict[str, str], insecure: bool, timeout: float = 10.0):
     """GET via utils.gated_http — in-scope redirects are followed hop-by-hop
     with per-hop gate validation; a hop to an out-of-scope host raises
     ScopeGateError (hard fail for these single-URL tools)."""
@@ -89,7 +88,7 @@ def _fetch(url: str, headers: Dict[str, str], insecure: bool):
         url,
         headers={"User-Agent": "framework-corsprobe/1.0", **(headers or {})},
         verify=not insecure,
-        timeout=_TIMEOUT,
+        timeout=(5.0, max(1.0, float(timeout))),
     )
     return r
 
@@ -128,7 +127,7 @@ def check_cors(
     probes: List[Dict[str, Any]] = []
     for label, origin in (("evil-origin", _EVIL_ORIGIN), ("null-origin", "null")):
         try:
-            r = _fetch(url, {"Origin": origin}, insecure)
+            r = _fetch(url, {"Origin": origin}, insecure, timeout)
         except requests.exceptions.SSLError:
             return {
                 "status": "Failed",
@@ -220,7 +219,7 @@ def check_security_headers(
 
     started = time.time()
     try:
-        r = _fetch(url, {}, insecure)
+        r = _fetch(url, {}, insecure, timeout)
     except requests.exceptions.SSLError:
         return {"status": "Failed", "error": "TLS verification failed — retry with insecure=True", "url": url}
     except requests.exceptions.RequestException as e:

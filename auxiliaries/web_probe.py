@@ -174,11 +174,11 @@ def probe_web(
 ) -> Dict[str, Any]:
     """Probe ``targets`` (hosts and/or URLs) concurrently and return intel.
 
-    Bare hosts get every port in ``ports`` probed as http:// and https://
-    (scheme matched to port: 443/8443 -> https, others -> http, plus the
-    alternate scheme if the first fails).  Entries containing ``://`` are
-    probed verbatim.  Every target is scope-gate validated first; a single
-    out-of-scope entry refuses the whole run (never partially fire).
+    Bare hosts get every port in ``ports`` probed with ONE scheme each
+    (443/8443 -> https, everything else -> http — no alternate-scheme retry;
+    port-scan results should tell you which is right).  Entries containing
+    ``://`` are probed verbatim.  Every target is scope-gate validated first;
+    a single out-of-scope entry refuses the whole run (never partially fire).
 
     Args:
         targets: Space/comma-separated hosts or URLs, e.g.

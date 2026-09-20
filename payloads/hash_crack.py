@@ -91,7 +91,11 @@ def _preflight(env_var: str, name: str, candidates: Tuple[str, ...]) -> Optional
 
 
 def _write_hashfile(hash_input: str) -> str:
-    """One hash per line; accepts newline, comma, or semicolon separation."""
+    """One hash per line; accepts newline, comma, or semicolon separation.
+
+    The tempfile is 0600 in /tmp and MUST be removed by the caller once the
+    cracker process has read it — cracked material should not linger
+    world-writable-adjacent.  See _drop_hashfile / the run_* call sites."""
     lines = [
         part.strip()
         for part in re.split(r"[\n;,]+", (hash_input or "").strip())
@@ -103,6 +107,16 @@ def _write_hashfile(hash_input: str) -> str:
     with os.fdopen(fd, "w") as fh:
         fh.write("\n".join(lines) + "\n")
     return path
+
+
+def _drop_hashfile(path: Optional[str]) -> None:
+    """Remove a tempfile written by _write_hashfile; ignore failures."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _default_wordlist() -> Optional[str]:
@@ -259,12 +273,15 @@ def run_john(
             "(-m 0 / -m 1000, GPU on this box), or pass explicit "
             "options with --format."
         )
-    result = launch_job(
-        command,
-        tool_name="john",
-        timeout=_JOHN_TIMEOUT,
-        verdict_parser=_parse_john,
-    )
+    try:
+        result = launch_job(
+            command,
+            tool_name="john",
+            timeout=_JOHN_TIMEOUT,
+            verdict_parser=_parse_john,
+        )
+    finally:
+        _drop_hashfile(hashfile)
     if note:
         result["note"] = note
     return result
@@ -327,6 +344,8 @@ def john_show(hash_input: str, options: str = "") -> Dict[str, Any]:
         return {"status": "Failed", "error": "john --show timed out"}
     except FileNotFoundError:
         return {"status": "Failed", "error": f"john binary vanished at {binp}"}
+    finally:
+        _drop_hashfile(hashfile)
 
 
 # --------------------------------------------------------------------------- #
@@ -409,12 +428,15 @@ def run_hashcat(
         wl = wordlist or _default_wordlist()
         if wl:
             command.append(wl)
-    return launch_job(
-        command,
-        tool_name="hashcat",
-        timeout=_HASHCAT_TIMEOUT,
-        verdict_parser=_parse_hashcat,
-    )
+    try:
+        return launch_job(
+            command,
+            tool_name="hashcat",
+            timeout=_HASHCAT_TIMEOUT,
+            verdict_parser=_parse_hashcat,
+        )
+    finally:
+        _drop_hashfile(hashfile)
 
 
 @framework_tool(
@@ -466,6 +488,8 @@ def hashcat_show(hash_input: str, mode: int) -> Dict[str, Any]:
         return {"status": "Failed", "error": "hashcat --show timed out"}
     except FileNotFoundError:
         return {"status": "Failed", "error": f"hashcat binary vanished at {binp}"}
+    finally:
+        _drop_hashfile(hashfile)
 
 
 __all__ = [

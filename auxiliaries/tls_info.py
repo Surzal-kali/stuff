@@ -98,7 +98,7 @@ def _parse_cert(der: bytes) -> Dict[str, Any]:
     }
 
 
-def _sweep_protocols(host: str, port: int, insecure: bool) -> Dict[str, Any]:
+def _sweep_protocols(host: str, port: int) -> Dict[str, Any]:
     """Try each TLS version; record accepted/refused + the live cipher."""
     accepted: List[str] = []
     refused: List[str] = []
@@ -108,8 +108,13 @@ def _sweep_protocols(host: str, port: int, insecure: bool) -> Dict[str, Any]:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.minimum_version = enum_version
             ctx.maximum_version = enum_version
+            # Verification OFF by design: a version sweep tests which protocol
+            # versions the endpoint NEGOTIATES, not whether its cert chains.
+            # Running verification here would report TLSv1.0/1.1 as "refused"
+            # whenever the cert is self-signed/expired — a false negative on
+            # exactly the legacy-acceptance question this sweep answers.
             ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE if insecure else ssl.CERT_REQUIRED
+            ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((host, port), timeout=_HANDSHAKE_TIMEOUT) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as s:
                     proto = s.version() or label
@@ -195,7 +200,7 @@ def tls_info(
         }
 
     cert = _parse_cert(der)
-    sweep = _sweep_protocols(target, int(port), insecure)
+    sweep = _sweep_protocols(target, int(port))
     tls_versions_accepted = sweep["accepted"]
     weak_versions = [v for v in tls_versions_accepted if v in ("TLSv1", "TLSv1.1")]
 
@@ -210,6 +215,11 @@ def tls_info(
         },
         "certificate": cert,
         "protocol_sweep": sweep,
+        "sweep_note": (
+            "per-version probes run with certificate verification OFF — "
+            "refused/accepted reflect VERSION negotiation only; cert trust "
+            "issues do not suppress legacy-version detection."
+        ),
         "weak_protocol_flags": (
             [f"{v} accepted (legacy/deprecated)" for v in tls_versions_accepted
              if v in ("TLSv1", "TLSv1.1")]
