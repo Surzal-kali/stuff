@@ -424,7 +424,12 @@ class ZAPClient:
         passive scanner observes the response, exactly like a proxied
         request. Returns the standard message envelope (requestHeader /
         responseHeader / responseBody / id).
+
+        Drift-guarded like every traffic-bearing ZAP method (2026-09-20):
+        the protect-mode mirror is re-synced at call time when the armed
+        scope changed, so a scope edit never leaves the mirror stale.
         """
+        _zap_scope_drift_guard()
         raw_request = self._ensure_https_scheme(raw_request)
         try:
             resp = self._get(
@@ -1260,6 +1265,14 @@ def sync_protect_scope(zap: Optional[ZAPClient] = None) -> Dict[str, Any]:
             includes.extend(_host_patterns(ip))
         if host:
             includes.extend(_host_patterns(host))
+    # Blessed hostnames (tier 1b, 'scope add-host'): operator-asserted
+    # hostname->blessed-IP mappings.  ZAP's sender connects to the Host
+    # header's host, so protect mode must accept the same NAMES the L1 gate
+    # accepts — without these, a gate-blessed vhost still hits
+    # "mode_violation" (mirror lagging the gate, observed live 2026-09-20).
+    for hostname in (state.get("blessed_hosts") or {}):
+        if hostname:
+            includes.extend(_host_patterns(hostname))
     for asset in manifest.get("out_of_scope_assets") or []:
         _asset_patterns(asset, excludes, skipped)
     for asset in manifest.get("in_scope") or []:
@@ -1321,8 +1334,8 @@ def _zap_scope_drift_guard() -> Optional[Dict[str, Any]]:
     Compares the armed state file's mtime against the last-synced mtime
     (sidecar ``.zap_protect_sync.json`` next to the state file). Called at
     the top of every traffic-bearing ZAP client method (open_url, spider,
-    active_scan, ajax_spider) so a scope change the operator made without a
-    re-sync is picked up BEFORE the next request fires:
+    active_scan, ajax_spider, send_raw) so a scope change the operator made
+    without a re-sync is picked up BEFORE the next request fires:
 
     - scope CHANGED -> sync_protect_scope() re-mirrors the context and keeps
       mode=protect (layer-1 gate already reads live state at entry; this
