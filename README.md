@@ -169,6 +169,41 @@ is in your `PATH`.
 4. Set `ZAP_API_KEY` in `.env`; it is sent as the `apikey` query parameter on
    every API call.
 
+### Playwright Rendered-DOM Recon Sidecar
+
+The scope-enforcing headless-Chromium sidecar for JS-heavy / SPA recon
+(`auxiliaries/playwright_sidecar.py` + `auxiliaries/playwright_recon.py`).
+It gates **navigations + fetch/XHR/websockets** through the operator-armed
+scope gate at the browser request-routing layer; passive subresources
+(img/css/font/media/script) are allowed from anywhere so pages render.
+
+1. Install the Python package and the Chromium browser binary:
+   ```bash
+   ./venv/bin/pip install playwright
+   # IMPORTANT: install the browser INTO THE REPO (gitignored) so the path
+   # is workspace-relative and root can find it. The framework runs as root
+   # (HOME=/root), where the default ~/.cache/ms-playwright is empty.
+   PLAYWRIGHT_BROWSERS_PATH="$(pwd)/.pw-browsers" \
+     ./venv/bin/python -m playwright install chromium
+   ```
+   The browser lands in `.pw-browsers/` (gitignored). The sidecar
+   auto-resolves it from `$WORKSPACE_ROOT/.pw-browsers` (falling back to
+   this module's repo root) and sets `PLAYWRIGHT_BROWSERS_PATH` at import —
+   so it works whether the framework was launched as root or your user.
+2. The framework runs as root, so Chromium is launched with `--no-sandbox`
+   (the setuid sandbox cannot run as root and would hang the launch).
+   Sandbox isolation is kept when running non-root (lab/dev).
+3. Enable the sidecar at launch with `PLAYWRIGHT_SIDECAR=1` (off by
+   default). Tools: `playwright_fetch` (one-shot rendered-DOM envelope),
+   `playwright_crawl` / `playwright_crawl_status` /
+   `playwright_crawl_stop` (bounded launch/poll crawl). If the sidecar is
+   down, the tools return a clear "not reachable" error — never a faked
+   result. `challenge_detected` flags Cloudflare-class interstitials
+   honestly (vanilla only — no stealth patches).
+4. Auth'd crawling: set `PLAYWRIGHT_STORAGE_STATE` to a Playwright
+   `storageState` JSON path (env / deploy-time injection only — never a
+   tool argument).
+
 ### Metasploit Framework
 
 1. Install Metasploit Framework.
@@ -405,6 +440,19 @@ rides in the subdomain; `collab_generate` produces a unique callback
 URL/DNS name and `collab_poll` returns correlated events. Requires root for
 ports 80, 443, and 53.
 
+**Public mode** — set `COLLAB_PUBLIC_URL` (e.g. a Tailscale Funnel endpoint
+like `https://<device>.<tailnet>.ts.net`) and `collab_generate` returns
+path-based PUBLIC callback URLs (`<public>/c/<id>/`) instead of lab
+subdomains, and a token-gated redirect endpoint goes live at
+`/r/<id>?to=<url>` → 302 (redirect-to-internal blind SSRF; `scan_ssrf`
+gains a `redirect_to` param for it). Funnel walkthrough: `tailscale funnel
+<COLLAB_HTTP_PORT>` (use 8080 — no root needed), public HTTPS terminates at
+Tailscale and forwards plain HTTP to `127.0.0.1:<COLLAB_HTTP_PORT>`. Honest
+limits: Funnel serves HTTPS only and does not expose DNS-query events, so
+public mode is HTTP-callback-only (subdomain mode keeps the DNS signal).
+Every callback is appended to `scope/collab_hits.jsonl` as durable
+evidence (gitignored); the in-memory store is capped at 5000 entries.
+
 ### SQLite Database (`utils/sessions.py`)
 
 Tracks targets, sessions, payloads, and notes in `ids.db`. Schema defined
@@ -468,6 +516,7 @@ values; see `.env.example` for the full key list):
 | `COLLAB_HTTP_PORT` | `80` | OOB collaborator HTTP port |
 | `COLLAB_HTTPS_PORT` | `443` | OOB collaborator HTTPS port |
 | `COLLAB_DNS_PORT` | `53` | OOB collaborator DNS port |
+| `COLLAB_PUBLIC_URL` | *(empty)* | Public HTTPS base URL for the collaborator (e.g. Tailscale Funnel `https://<host>.ts.net`); set = public path-based callback URLs + `/r/<id>?to=` 302 endpoint live |
 | `R2_BINARY_TARGETS_ROOT` | `binaries/` | Radare2 binary drop folder |
 | `WORDLISTS_ROOT` | `/usr/share/wordlists` | Wordlist tree root |
 | `SECRETARY_MAX_APPROVAL_ROUNDS` | `5` | Max approval rounds per secretary turn |

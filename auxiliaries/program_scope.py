@@ -842,6 +842,33 @@ def get_scan_config(handle: str, platform: str = "h1") -> Optional[Dict[str, Any
     return None
 
 
+def get_armed_scan_config() -> Optional[Dict[str, Any]]:
+    """Resolve scan config from the OPERATOR-ARMED scope state (no args).
+
+    Reads ``scope/.armed_packet_scope.json`` — the same file-backed state the
+    packet gate enforces from (READ-ONLY here) — for the armed
+    ``(handle, platform)`` and resolves that program's testing requirements
+    via :func:`get_scan_config`.
+
+    This is the zero-argument backstop for traffic tools that never receive a
+    ``scope_handle`` (ssrf_probe, the playwright sidecar): identification
+    headers and rate caps get applied by construction instead of by secretary
+    discipline. Returns ``None`` when nothing is armed or no manifest is
+    cached — callers then fall back to their own identification defaults.
+    """
+    state_path = (Path(os.getenv("WORKSPACE_ROOT", "."))
+                  / "scope" / ".armed_packet_scope.json")
+    try:
+        state = _json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return None
+    handle = (state.get("handle") or "").strip()
+    if not handle:
+        return None
+    platform = (state.get("platform") or "h1").strip().lower()
+    return get_scan_config(handle, platform)
+
+
 def _normalise_rate(raw: Any) -> Optional[int]:
     """Coerce a rate value to int or None (0 / None / negative → None)."""
     if raw is None:

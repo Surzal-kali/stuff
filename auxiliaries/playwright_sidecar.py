@@ -30,6 +30,22 @@ same mtime-cached read the gate itself uses), so a REPL-side scope change
 takes effect on the very next browser request. When DISARMED (lab mode),
 nothing is gated — the browser behaves vanilla.
 
+Program identification headers (compliance)
+-------------------------------------------
+The sidecar resolves the ARMED program's testing requirements (zero-arg
+``program_scope.get_armed_scan_config`` backstop) and injects the mandated
+identification headers (e.g. HackerOne's ``X-HackerOne-Research``) into
+every gated in-scope request (navigations/fetch/XHR/websocket) via the
+route handler — NEVER onto passive subresources (tracker CDNs don't get
+your handle). A program-mandated max-requests-per-second paces the crawl
+loop (per-page sleep); one-shot fetches are serial by construction.
+Re-resolved on every /fetch and /crawl/start call, so re-arming the scope
+updates the headers without a sidecar restart. Honest limit: a
+prose-mandated custom User-Agent is applied at the HTTP-header level per
+request, but the browser-context ``navigator.userAgent`` stays
+``PLAYWRIGHT_UA`` — UA-strict programs would need a sidecar restart with
+``PLAYWRIGHT_UA`` set.
+
 API (loopback only, JSON)
 -------------------------
   GET  /health            -> {"ok": true, "browser": "..."}
@@ -50,6 +66,12 @@ Honest limits
 - Passive subresource allowance means a page CAN load a tracker CDN; the
   programmatic lane (fetch/xhr/ws) is where the boundary lives.
 - No sandboxed-phone support (desktop/framework host only — Sept 13 rule).
+- The framework runs as root, so Chromium is launched with
+  ``--no-sandbox`` (the setuid sandbox cannot run as root and would hang
+  the launch).  Sandbox isolation is kept when running non-root (lab/dev).
+  Reduced process isolation under root is the accepted trade-off — the
+  sidecar only navigates operator-blessed in-scope targets and gates
+  navigations + fetch/XHR/ws at the request layer.
 - The sidecar is launched by ``bootstrap`` (env-gated, like ZAP); if it is
   not running, the client tools return a clear error instead of faking.
 """
@@ -75,6 +97,55 @@ _PORT = int(os.getenv("PLAYWRIGHT_SIDECAR_PORT", "8484"))
 _UA = os.getenv("PLAYWRIGHT_UA", "framework-pwrecon/1.0")
 _STORAGE_STATE = os.getenv("PLAYWRIGHT_STORAGE_STATE", "") or None
 _NAV_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", "25000"))
+# Browser cache lives IN THE REPO (gitignored at .pw-browsers/) so the path
+# is workspace-relative, not hardcoded to an installer user's home.  The
+# framework runs as root (HOME=/root) where ~/.cache/ms-playwright is empty;
+# resolving relative to WORKSPACE_ROOT (same convention as utils.scope_gate)
+# lets root find a browser placed under <repo>/.pw-browsers regardless of
+# which user launched the framework or installed the browser.
+_BROWSER_DIR = ".pw-browsers"
+
+
+def _workspace_root() -> str:
+    """Resolve the framework root: $WORKSPACE_ROOT, else this module's
+    parent's parent (it lives at <root>/auxiliaries/playwright_sidecar.py)."""
+    wr = os.getenv("WORKSPACE_ROOT", "").strip()
+    if wr and os.path.isdir(wr):
+        return wr
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_browsers_path() -> None:
+    """Point PLAYWRIGHT_BROWSERS_PATH at the repo-local browser cache.
+
+    Resolution order (first that contains a ``chromium*`` browser wins):
+      1. an already-set, valid ``PLAYWRIGHT_BROWSERS_PATH`` (operator override)
+      2. ``<WORKSPACE_ROOT>/.pw-browsers`` (the repo-local default)
+    Must run BEFORE ``async_playwright().start()`` (the driver subprocess
+    inherits env then), so it's called at module import.
+    """
+    import glob
+
+    def _has_chromium(parent: str) -> bool:
+        try:
+            return bool(
+                glob.glob(os.path.join(parent, "chromium*"))
+                or glob.glob(os.path.join(parent, "chromium_headless_shell*"))
+            )
+        except Exception:
+            return False
+
+    cur = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if cur and _has_chromium(cur):
+        return
+    cand = os.path.join(_workspace_root(), _BROWSER_DIR)
+    if _has_chromium(cand):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = cand
+
+
+if _HAS_PW:
+    _resolve_browsers_path()
+
 
 # Resource types we GATE (active surface). Everything else is allowed.
 _GATED_RESOURCE_TYPES = frozenset(
@@ -104,6 +175,41 @@ def _scope_ok(url: str) -> Tuple[bool, str]:
         return True, f"gate-check-skipped ({type(e).__name__})"
 
 
+def _scan_extra_headers() -> Dict[str, str]:
+    """Program-mandated identification headers for the ARMED scope (no args).
+
+    Zero-arg backstop via ``program_scope.get_armed_scan_config`` — same
+    class as ssrf_probe._scan_config. Empty dict = nothing injected (disarmed
+    or a program with no header requirements).
+    """
+    try:
+        from auxiliaries.program_scope import get_armed_scan_config
+        cfg = get_armed_scan_config() or {}
+        return dict(cfg.get("headers") or {})
+    except Exception:  # noqa: BLE001 — never crash the browser on config hiccups
+        return {}
+
+
+_ACTIVE_SCAN_HEADERS: Dict[str, str] = {}  # snapshot refreshed per /fetch + /crawl/start
+
+
+def _refresh_scan_headers() -> Dict[str, str]:
+    global _ACTIVE_SCAN_HEADERS
+    _ACTIVE_SCAN_HEADERS = _scan_extra_headers()
+    return _ACTIVE_SCAN_HEADERS
+
+
+def _scan_rps() -> Optional[float]:
+    """Program-mandated max-requests-per-second from the ARMED scope, if any."""
+    try:
+        from auxiliaries.program_scope import get_armed_scan_config
+        raw = (get_armed_scan_config() or {}).get("max_requests_per_second")
+        r = float(raw) if raw else 0.0
+        return r if r > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _route_handler(route, request) -> None:
     """Playwright route interception: gate active requests, pass passive."""
     rtype = request.resource_type
@@ -119,6 +225,15 @@ async def _route_handler(route, request) -> None:
                              "ts": time.time()})
             try:
                 await route.abort("blockedbyclient")
+                return
+            except PWError:
+                return
+        # Program identification headers (e.g. X-HackerOne-Research) go on
+        # gated IN-SCOPE requests only — passive subresources stay clean.
+        if _ACTIVE_SCAN_HEADERS:
+            try:
+                await route.continue_(
+                    headers={**request.headers, **_ACTIVE_SCAN_HEADERS})
                 return
             except PWError:
                 return
@@ -230,7 +345,21 @@ class Sidecar:
         if not _HAS_PW:
             raise RuntimeError("playwright not installed")
         self.pw = await async_playwright().start()
-        self.browser = await self.pw.chromium.launch(headless=True)
+        # The framework is intentionally started as root (token-safety behind
+        # file perms + tools that need it).  Chromium's setuid sandbox CANNOT
+        # run as root -- without --no-sandbox the browser launch HANGS (it
+        # doesn't error cleanly; it stalls bringing up the renderer process),
+        # which is what froze the launch.  So when we're root we MUST pass
+        # --no-sandbox.  When non-root (lab/dev), keep the sandbox for the
+        # stronger process isolation.  --disable-dev-shm-usage avoids /dev/shm
+        # exhaustion in containers/limited-shm hosts; --disable-gpu is a
+        # headless no-op that skips a pointless GPU init.
+        launch_args = ["--disable-dev-shm-usage", "--disable-gpu"]
+        if os.geteuid() == 0:
+            launch_args.append("--no-sandbox")
+        self.browser = await self.pw.chromium.launch(
+            headless=True, args=launch_args
+        )
         ctx_kwargs: Dict[str, Any] = {"user_agent": _UA}
         if _STORAGE_STATE and os.path.isfile(_STORAGE_STATE):
             ctx_kwargs["storage_state"] = _STORAGE_STATE
@@ -260,6 +389,7 @@ class Sidecar:
     async def fetch(self, url: str, wait_until: str = "networkidle",
                     timeout_ms: int = _NAV_TIMEOUT_MS) -> Dict[str, Any]:
         since = time.time()
+        scan_headers = _refresh_scan_headers()
         page = await self.new_page()
         try:
             try:
@@ -270,8 +400,11 @@ class Sidecar:
                 env = await _extract_envelope(page, since)
                 env["goto_error"] = str(e)
                 env["status"] = env.get("status")
+                env["scan_headers_applied"] = sorted(scan_headers)
                 return env
-            return await _extract_envelope(page, since)
+            env = await _extract_envelope(page, since)
+            env["scan_headers_applied"] = sorted(scan_headers)
+            return env
         finally:
             await page.close()
 
@@ -281,12 +414,15 @@ class Sidecar:
                           same_origin: bool = True) -> str:
         self._job_counter += 1
         jid = f"crawl-{self._job_counter}"
+        rps = _scan_rps()
         self.jobs[jid] = {
             "url": url, "max_pages": max_pages, "max_depth": max_depth,
             "wall_cap": wall_cap, "same_origin": same_origin,
             "status": "running", "progress": 0,
             "visited": [], "results": [], "blocked": [],
             "started": time.time(), "cancel": False,
+            "pace_s": (1.0 / rps) if rps else 0.0,
+            "scan_headers": sorted(_refresh_scan_headers()),
         }
         asyncio.create_task(self._crawl(jid))
         return jid
@@ -336,6 +472,10 @@ class Sidecar:
                                 queue.append((link, depth + 1))
                 finally:
                     await page.close()
+                # Program-mandated pacing (armed scope max-requests-per-
+                # second); no-op when the program is silent (serial crawl).
+                if job["pace_s"]:
+                    await asyncio.sleep(job["pace_s"])
             if job["status"] == "running":
                 job["status"] = "done"
         except Exception as e:  # noqa: BLE001
@@ -354,6 +494,8 @@ class Sidecar:
             "visited": len(j["visited"]),
             "pages": len(j["results"]),
             "blocked_count": len(j["blocked"]),
+            "scan_headers_applied": j.get("scan_headers", []),
+            "pace_s": j.get("pace_s", 0.0),
             "results": j["results"] if j["status"] in ("done", "deadline") \
                 or j["status"].startswith("error") else [],
             "blocked": j["blocked"],

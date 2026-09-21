@@ -11,6 +11,7 @@ ids.db
 *.memory/
 chroma-data/
 .zap_home/
+.pw-browsers/
 findings_md/
 scope/
 *.scope
