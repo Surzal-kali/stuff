@@ -7,6 +7,21 @@
 > (all four landed in 0529b4c, verified) removed. Open acceptance criteria and
 > genuinely unfinished work retained below.
 
+- [x] **SSRF scanner** LANDED: `auxiliaries/ssrf_probe.py` → `scan_ssrf`.
+      Parametric SSRF fuzzer/probe (OWASP Top 10 now has its own scanner like
+      the rest). Payload battery: OOB/collaborator (blind, hard confirm),
+      localhost variants, internal RFC1918 + cloud metadata (169.254.169.254,
+      metadata.google.internal), scheme bypasses (file/gopher/dict/ftp/ldap).
+      Detection: blind collab callback correlation; in-band metadata/file
+      reflection; fetch-error-string leak; status/length/timing anomaly vs
+      baseline (inferential, flagged honestly). Target endpoint scope-gated
+      (payload values intentionally NOT gated — they are what the server
+      fetches, not our traffic). Uses new `utils.gated_http.gated_request`
+      (method+body, per-hop gated). Pair with collab_start + zap_send_raw.
+      Note: redirect-to-internal payloads deferred (collaborator has no
+      redirect endpoint yet) — add a /redirect path to listeners/collaborator
+      to unlock.
+
 ## Open acceptance criteria (from landed phases)
 - [ ] e2e runner ends every chain with ≥1 Finding; render_findings output saved
       as an e2e artifact (Phase 1 acceptance)
@@ -26,18 +41,26 @@
 - [ ] **static JS route extractor** (BUILD FIRST — cheap 80%, no browser):
       fetch .js bundles + regex endpoints/API routes (linkfinder-style),
       ~50-line auxiliary, zero heavy deps, sandbox-workable today.
-- [ ] **playwright integration** (desktop/framework host ONLY — phone sandbox is
-      permanently out: Sept 13 install got the app killed; standing rule).
-      Lane = framework tools (like amass/nmap), NOT deny-all secretary
-      containers — browser needs egress. Tools: playwright_fetch (one-shot
-      rendered-DOM envelope: final URL, status, title, text, links, forms,
-      JS-discovered routes) + playwright_crawl (launch/poll pair, nmap.py
-      pattern: bounded pages/depth/time). Auth'd crawling via persisted
-      storageState; login secrets env/deploy-time injection ONLY. Scope gate at
-      dispatch non-negotiable — browser fires real traffic. Envelope carries
-      "challenge_detected" (Cloudflare-class walls: expect partial success,
-      never fake it). STEALTH PATCHES = ARMS RACE — skip; stay vanilla + honest
-      negatives. Use case: JS-heavy bounty surfaces (SPA recon, auth'd crawling,
+- [x] **playwright integration** LANDED (desktop/framework host ONLY — phone sandbox
+      is permanently out: Sept 13 install got the app killed; standing rule).
+      Sidecar: `auxiliaries/playwright_sidecar.py` (loopback HTTP API, env-gated
+      launch PLAYWRIGHT_SIDECAR=1, bootstrap-wired like ZAP). Client:
+      `auxiliaries/playwright_recon.py` — `playwright_fetch` (one-shot rendered-
+      DOM envelope: final URL, status, title, text, links, forms, JS-discovered
+      routes, blocked_requests, challenge_detected) + `playwright_crawl` /
+      `playwright_crawl_status` / `playwright_crawl_stop` (launch/poll, nmap
+      pattern, bounded pages/depth/time). Scope enforced at the BROWSER REQUEST
+      ROUTING LAYER via context.route: navigations + fetch/XHR/websocket are
+      check_scan-gated and aborted out-of-scope; PASSIVE subresources (img/css/
+      font/media/script) allowed from anywhere so pages render (operator policy
+      2026-09-21: strict subresource gating breaks most real pages). Live
+      scope read (mtime-cached) so a REPL scope change takes effect next
+      request. Auth'd crawling via persisted storageState (env-injected only).
+      challenge_detected honest flag, never faked. Vanilla only — no stealth
+      patches. Install: `pip install playwright` + `python -m playwright install
+      chromium` (done on this host). Verified: armed Cloudflare scope correctly
+      blocked an OOS example.com navigation and logged it in blocked_requests.
+      Use case: JS-heavy bounty surfaces (SPA recon, auth'd crawling,
       bugbounty-arsenal.net), UNMJobs/Workday-class form flows (career lane).
 
 ## Phase 4 — Credential motion (lab chain)

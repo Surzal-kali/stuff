@@ -460,6 +460,70 @@ class FrameworkLoader:
                        "zap_* tools will fail until it does", timeout)
         return False
 
+    async def start_playwright_sidecar(self, host=None, port=None):
+        """Start the scope-enforcing Playwright recon sidecar as a subprocess.
+
+        Env-gated (PLAYWRIGHT_SIDECAR=1) -- only called when the operator
+        opts in.  Same lifecycle shape as ``start_zap_daemon``: asyncio
+        subprocess appended to ``active_tasks`` so ``stop()`` reaps it.
+
+        The sidecar drives a headless Chromium and gates every navigation +
+        fetch/XHR/websocket through the operator-armed scope gate (passive
+        subresources allowed so pages render).  Bound loopback-only.  Logs
+        to /tmp via ``_open_child_log`` so a crash is inspectable.
+
+        If the playwright package or chromium binary is missing, the sidecar
+        process exits immediately with a clear message; the ``playwright_*``
+        client tools then return a 'sidecar not reachable' error guiding the
+        operator to install -- they never fake a result.
+        """
+        host = host or os.getenv("PLAYWRIGHT_SIDECAR_HOST", "127.0.0.1")
+        port = port or int(os.getenv("PLAYWRIGHT_SIDECAR_PORT", "8484"))
+        venv_py = str(self.framework_root / "venv" / "bin" / "python")
+        if not Path(venv_py).exists():
+            venv_py = sys.executable
+        log_fd, log_path = _open_child_log("playwright_sidecar")
+        env = {**os.environ,
+               "PLAYWRIGHT_SIDECAR_HOST": host,
+               "PLAYWRIGHT_SIDECAR_PORT": str(port)}
+        cmd = [venv_py, "-m", "auxiliaries.playwright_sidecar"]
+        try:
+            logger.info("[+] Starting Playwright sidecar on %s:%s (log: %s)",
+                        host, port, log_path or "<devnull>")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_fd,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            self.active_tasks.append(process)
+            if hasattr(log_fd, "close"):
+                self._child_log_fds = getattr(self, "_child_log_fds", {})
+                self._child_log_fds[id(process)] = log_fd
+            await self.wait_for_playwright(host, port, timeout=20)
+        except Exception as e:
+            logger.error("[!] Playwright sidecar failed to start: %s", e,
+                         exc_info=True)
+
+    async def wait_for_playwright(self, host="127.0.0.1", port=8484, timeout=20):
+        """Block until the sidecar /health endpoint responds."""
+        import requests as _requests
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                r = _requests.get(f"http://{host}:{port}/health", timeout=2)
+                if r.ok and r.json().get("ok"):
+                    logger.info("[+] Playwright sidecar is up at %s:%s",
+                                host, port)
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        logger.warning("[!] Playwright sidecar did not respond within %ss; "
+                       "playwright_* tools will return a not-reachable error "
+                       "until it does", timeout)
+        return False
+
     async def reload_module(self, module):
         """Reloads a given module and updates the tool registry."""
         try:
@@ -642,6 +706,17 @@ class FrameworkLoader:
         self.api_task = asyncio.create_task(self.start_api_server())
         self.active_tasks.append(self.api_task)
         self.active_tasks.append(asyncio.create_task(self.start_metasploit_mcp()))
+
+        # Playwright scope-enforcing recon sidecar (env-gated, opt-in).  Off
+        # by default — only starts when PLAYWRIGHT_SIDECAR=1, so a host
+        # without chromium installed never tries to launch it.  When on, it
+        # drives a headless Chromium that gates navigations + fetch/XHR/ws
+        # through the operator-armed scope gate (passive subresources
+        # allowed so pages render).  See auxiliaries/playwright_sidecar.py.
+        if os.getenv("PLAYWRIGHT_SIDECAR", "").lower() in ("1", "true", "yes"):
+            self.active_tasks.append(
+                asyncio.create_task(self.start_playwright_sidecar())
+            )
 
         # Wait for the ZAP API to answer before declaring launch complete;
         # the spider/ascan tools will otherwise fail their first call with

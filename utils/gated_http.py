@@ -87,4 +87,83 @@ def gated_get(
         session.close()
 
 
-__all__ = ["gated_get"]
+def gated_request(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    data: Any = None,
+    json: Any = None,
+    verify: bool = True,
+    timeout: Tuple[float, float] = (5.0, 15.0),
+    max_hops: int = 5,
+    allow_redirects: bool = True,
+) -> Tuple[requests.Response, List[Dict[str, Any]]]:
+    """Arbitrary-method HTTP request with per-hop scope-gate validation.
+
+    Generalises :func:`gated_get` to POST/PUT/PATCH/DELETE with a body.
+    Same redirect-bypass guarantee: every hop (initial URL + each 3xx
+    target) is ``check_scan``-validated before the request fires; a
+    cross-scope redirect raises :class:`ScopeGateError` (fail-closed).
+
+    Redirect method handling follows common practice: 303 See Other always
+    becomes GET with the body dropped; 307/308 preserve the original method
+    and body; 301/302 preserve the method (servers vary; preserving avoids
+    silently re-POSTing a payload to a redirect target the operator didn't
+    bless — when in doubt, the gate catches an out-of-scope hop anyway).
+
+    Set ``allow_redirects=False`` to send exactly one request and return the
+    3xx response (no hop-following) — useful for SSRF probes that want to
+    inspect a redirect body without following.
+
+    Returns ``(response, hops)``; ``hops`` is the ordered list of
+    ``{"url", "status", "method"}`` visited.
+    """
+    hops: List[Dict[str, Any]] = []
+    current = (url or "").strip()
+    if not current:
+        raise ScopeGateError("scope gate: empty URL")
+    cur_method = (method or "GET").upper()
+    cur_data, cur_json, cur_params = data, json, params
+    session = requests.Session()
+    try:
+        for _ in range(max_hops + 1):
+            ok, reason = check_scan(current)
+            if not ok:
+                where = "initial URL" if not hops else f"redirect hop {len(hops)}"
+                raise ScopeGateError(f"scope gate: {reason} ({where})")
+            resp = session.request(
+                cur_method,
+                current,
+                headers=headers,
+                params=cur_params,
+                data=cur_data,
+                json=cur_json,
+                verify=verify,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+            hops.append({"url": current, "status": resp.status_code, "method": cur_method})
+            if not allow_redirects or resp.status_code not in _REDIRECT_CODES:
+                return resp, hops
+            location = resp.headers.get("Location")
+            if not location:
+                return resp, hops
+            nxt = urljoin(current, location)
+            if nxt == current:
+                return resp, hops
+            current = nxt
+            # 303 -> GET + drop body; 307/308 -> preserve; 301/302 -> preserve.
+            if resp.status_code == 303:
+                cur_method = "GET"
+                cur_data, cur_json, cur_params = None, None, None
+        raise ScopeGateError(
+            f"scope gate: redirect chain exceeded {max_hops} hops; "
+            "stopped (all hops so far were in-scope)"
+        )
+    finally:
+        session.close()
+
+
+__all__ = ["gated_get", "gated_request"]
