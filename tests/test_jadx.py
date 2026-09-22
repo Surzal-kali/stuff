@@ -101,6 +101,18 @@ def _write_shim(path):
     - `-d DIR` runs: create sources/com/example/MainActivity.java +
       resources/AndroidManifest.xml, then bump $JADX_SHIM_COUNTER.
     - `--single-class CLS [--single-class-output DIR]`: write <cls>.java.
+
+    Env knobs (all optional):
+    - $JADX_SHIM_MODE=class_fail → single-class prints jadx's REAL stdout
+      error shape ('ERROR - Incorrect arguments: Input class not found:
+      <cls>') and exits 1 (verified on 1.5.6: this goes to STDOUT, stderr
+      stays empty; stderr-only surfaces would stay blind).
+    - $JADX_SHIM_MODE=class_silent_fail → single-class exits 1 with no
+      output at all (the pre-fix -q symptom).
+    - $JADX_SHIM_MODE=decompile_fail → `-d` writes one partial source then
+      exits 1 (cache must NOT be fingerprint-marked fresh).
+    - $JADX_SHIM_ARGV=<file> → appends the received argv (space-joined,
+      '|'-terminated) — regression guard that '-q' is never passed.
     """
     shim = """#!/usr/bin/env python3
 import os, sys
@@ -111,6 +123,16 @@ if "-d" in args:
 single = None
 if "--single-class" in args:
     single = args[args.index("--single-class") + 1]
+_argv_dump = os.environ.get("JADX_SHIM_ARGV")
+if _argv_dump:
+    with open(_argv_dump, "a") as afh:
+        afh.write(" ".join(args) + "|")
+_mode = os.environ.get("JADX_SHIM_MODE", "")
+if single is not None and _mode == "class_fail":
+    print("ERROR - Incorrect arguments: Input class not found: " + single)
+    sys.exit(1)
+if single is not None and _mode == "class_silent_fail":
+    sys.exit(1)
 if single is not None:
     sco = args[args.index("--single-class-output") + 1] if "--single-class-output" in args else "."
     os.makedirs(sco, exist_ok=True)
@@ -121,6 +143,10 @@ if not out:
     sys.exit(3)
 os.makedirs(os.path.join(out, "sources", "com", "example"), exist_ok=True)
 os.makedirs(os.path.join(out, "resources"), exist_ok=True)
+if _mode == "decompile_fail":
+    with open(os.path.join(out, "sources", "com", "example", "Partial.java"), "w") as fh:
+        fh.write("package com.example;")
+    sys.exit(1)
 with open(os.path.join(out, "sources", "com", "example", "MainActivity.java"), "w") as fh:
     fh.write("package com.example;\\npublic class MainActivity {\\n    String API_KEY = \\"hunter2\\";\\n}\\n")
 with open(os.path.join(out, "resources", "AndroidManifest.xml"), "w") as fh:
@@ -587,6 +613,128 @@ def test_class_pull_missing_binary_clean_error():
         assert res["status"] == "error" and "jadx not found" in res["error"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# failure diagnostics (the -q bug: jadx 1.5.6 logs to STDOUT, not stderr)
+# ---------------------------------------------------------------------------
+def test_class_failure_surfaces_jadx_stdout_diagnostics():
+    """Real jadx 1.5.6 prints 'Input class not found: <fqn>' on STDOUT and
+    keeps stderr empty; the class verb must surface that tail in the error
+    envelope (pre-fix, -q suppressed even stdout → opaque empty error)."""
+    r, root = _tmp_root()
+    tmp = tempfile.mkdtemp(prefix="jadx_test_fail_")
+    try:
+        _fake_apk(root)
+        shim = _write_shim(os.path.join(tmp, "jadx"))
+        with _Restore() as p:
+            p.patch(J, "resolve_jadx_bin", lambda: shim)
+            p.patch(J, "_java_available", lambda: True)
+            os.environ["JADX_SHIM_MODE"] = "class_fail"
+            try:
+                res = J.run_jadx("app.apk", "class", single_class="com.example.Ghost")
+            finally:
+                os.environ.pop("JADX_SHIM_MODE", None)
+        assert res["status"] == "error", res
+        assert "Input class not found" in res["error"]
+        assert "exit 1" in res["summary"]
+        # the diagnostic was on STDOUT; stderr is (correctly) empty and the
+        # envelope must say so explicitly instead of implying a blind spot
+        assert "Input class not found" in (res["stdout_tail"] or "")
+        assert res["stderr_tail"] == ""
+        assert "absent from this artifact" in (res.get("note") or "")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_class_silent_failure_still_actionable():
+    """Exit 1 with zero output (the exact pre-fix -q symptom): the envelope
+    must stay honest ('no diagnostics') yet tell the model how to verify the
+    FQN independently instead of dead-ending."""
+    r, root = _tmp_root()
+    tmp = tempfile.mkdtemp(prefix="jadx_test_fail_")
+    try:
+        _fake_apk(root)
+        shim = _write_shim(os.path.join(tmp, "jadx"))
+        with _Restore() as p:
+            p.patch(J, "resolve_jadx_bin", lambda: shim)
+            p.patch(J, "_java_available", lambda: True)
+            os.environ["JADX_SHIM_MODE"] = "class_silent_fail"
+            try:
+                res = J.run_jadx("app.apk", "class", single_class="com.example.Ghost")
+            finally:
+                os.environ.pop("JADX_SHIM_MODE", None)
+        assert res["status"] == "error", res
+        assert "no diagnostics" in res["error"]
+        assert res["stdout_tail"] == "" and res["stderr_tail"] == ""
+        assert "absent from this artifact" in (res.get("note") or "")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_decompile_failure_surfaces_diagnostics_keeps_cache_stale():
+    """A crashing jadx run: the envelope carries the binary's diagnostics
+    (STDOUT on 1.5.6) and the workspace is NOT fingerprint-marked fresh —
+    the next decompile must re-run instead of reusing a partial tree."""
+    r, root = _tmp_root()
+    tmp = tempfile.mkdtemp(prefix="jadx_test_dcfail_")
+    try:
+        _fake_apk(root)
+        shim = _write_shim(os.path.join(tmp, "jadx"))
+        with _Restore() as p:
+            p.patch(J, "resolve_jadx_bin", lambda: shim)
+            p.patch(J, "_java_available", lambda: True)
+            os.environ["JADX_SHIM_MODE"] = "decompile_fail"
+            try:
+                res = J.run_jadx("app.apk", "decompile")
+            finally:
+                os.environ.pop("JADX_SHIM_MODE", None)
+        assert res["status"] == "error", res
+        assert "exit 1" in res["summary"]
+        assert J._read_meta(res["workspace"]) is None  # partial tree stays stale
+        # retry with a healthy binary → clean full run
+        with _Restore() as p:
+            p.patch(J, "resolve_jadx_bin", lambda: shim)
+            p.patch(J, "_java_available", lambda: True)
+            res2 = J.run_jadx("app.apk", "decompile")
+        assert res2["status"] == "ok" and res2["cached"] is False, res2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_class_argv_drops_quiet_flag():
+    """Regression for the reported bug: '-q' maps to --log-level QUIET on
+    jadx 1.5.6 and deletes jadx's error text (verified live 2026-09-22:
+    not-found pull → exit 1, 0 bytes on both streams).  The verb must pass
+    --log-level ERROR instead."""
+    r, root = _tmp_root()
+    tmp = tempfile.mkdtemp(prefix="jadx_test_argv_")
+    try:
+        _fake_apk(root)
+        shim = _write_shim(os.path.join(tmp, "jadx"))
+        dump = os.path.join(tmp, "argv")
+        with _Restore() as p:
+            p.patch(J, "resolve_jadx_bin", lambda: shim)
+            p.patch(J, "_java_available", lambda: True)
+            os.environ["JADX_SHIM_ARGV"] = dump
+            try:
+                res = J.run_jadx(
+                    "app.apk", "class", single_class="com.example.MainActivity"
+                )
+            finally:
+                os.environ.pop("JADX_SHIM_ARGV", None)
+        assert res["status"] == "ok", res
+        tokens = open(dump).read().split("|")[0].split()
+        assert "-q" not in tokens and "--quiet" not in tokens, tokens
+        assert "--single-class" in tokens
+        idx = tokens.index("--log-level")
+        assert tokens[idx + 1].upper() == "ERROR", tokens
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

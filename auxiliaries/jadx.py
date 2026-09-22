@@ -50,6 +50,17 @@ returns a clean envelope with the exact install hint (no reindex needed —
 preflight runs at call time, like the john/hashcat wrappers).  The version is
 probed once per process and cached.
 
+Diagnostics
+-----------
+jadx 1.5.6 routes ALL of its log output — including fatal errors such as
+``ERROR - Incorrect arguments: Input class not found: <fqn>`` — to STDOUT;
+stderr is normally empty.  Never run the binary with ``-q``: it maps to
+``--log-level QUIET``, which suppresses even that error text (verified
+2026-09-22: a not-found single-class pull then exits 1 with 0 bytes on both
+streams, leaving the failure unexplainable in the envelope).  Every
+jadx-spawning verb uses ``--log-level ERROR`` instead, and failure envelopes
+carry bounded ``stderr_tail`` / ``stdout_tail`` fields.
+
 Verb set
 --------
 - ``decompile`` — full decompile into the per-target workspace
@@ -431,6 +442,23 @@ def _run_jadx_argv(argv: List[str]) -> tuple:
         return None, f"jadx launch failed: {exc}"
 
 
+def _proc_tails(proc) -> Tuple[str, str]:
+    """Bounded ``(stderr_tail, stdout_tail)`` from a finished jadx run.
+
+    Empirical jadx 1.5.6 fact (verified 2026-09-22): ALL log output —
+    including fatal errors such as ``ERROR - Incorrect arguments: Input
+    class not found: <fqn>`` — is written to STDOUT; STDERR is normally
+    empty, even on failure.  Diagnostic surfaces must therefore fall back
+    to stdout, and the binary must never run under ``-q`` (which maps to
+    ``--log-level QUIET`` and suppresses even that error text: a not-found
+    single-class pull then exits 1 with 0 bytes on BOTH streams).
+    """
+    return (
+        (proc.stderr or "").strip()[-2000:],
+        (proc.stdout or "").strip()[-2000:],
+    )
+
+
 # ---------------------------------------------------------------------------
 # The discovery tool
 # ---------------------------------------------------------------------------
@@ -535,7 +563,10 @@ def _verb_decompile(
         if preflight:
             return preflight
     os.makedirs(ws, exist_ok=True)
-    argv = [resolve_jadx_bin(), "-q", "-d", ws]
+    # --log-level ERROR (NOT -q): -q maps to --log-level QUIET on jadx 1.5.6
+    # and deletes the very failure diagnostics this envelope surfaces (see
+    # _proc_tails).  Errors stay visible; progress noise is suppressed.
+    argv = [resolve_jadx_bin(), "--log-level", "ERROR", "-d", ws]
     if no_res:
         argv.append("-r")
     if deobf:
@@ -552,20 +583,29 @@ def _verb_decompile(
         return _err_verb(target, "decompile", err)
     n_java = _count_by_ext(ws, ".java")
     n_res = _count_all(ws, skip="sources") - n_java
-    _write_meta(ws, target, _jadx_version())
-    stderr_tail = (proc.stderr or "").strip()[-2000:]
-    return {
+    if proc.returncode == 0:
+        _write_meta(ws, target, _jadx_version())  # a failed run stays stale
+    stderr_tail, stdout_tail = _proc_tails(proc)
+    summary = (
+        f"decompiled → {n_java} .java source(s), {max(0, n_res)} other file(s) "
+        f"in {ws} (exit {proc.returncode})"
+    )
+    if proc.returncode != 0:
+        summary = (
+            f"decompile failed (exit {proc.returncode}): "
+            f"{stderr_tail or stdout_tail or 'jadx emitted no diagnostics'} "
+            f"— {n_java} .java source(s) written (may be partial) in {ws}"
+        )
+    result: Dict[str, Any] = {
         "status": "ok" if proc.returncode == 0 else "error",
         "verb": "decompile",
-        "summary": (
-            f"decompiled → {n_java} .java source(s), {max(0, n_res)} other file(s) "
-            f"in {ws} (exit {proc.returncode})"
-        ),
+        "summary": summary,
         "workspace": ws,
         "cached": False,
         "java_source_count": n_java,
         "exit_code": proc.returncode,
         "stderr_tail": stderr_tail,
+        "stdout_tail": stdout_tail,
         "stale": False,
         "output": "",
         "truncated": False,
@@ -580,6 +620,9 @@ def _verb_decompile(
         ],
         "delta": f"fresh decompile ({n_java} sources); exit {proc.returncode}",
     }
+    if proc.returncode != 0:
+        result["error"] = summary
+    return result
 
 
 def _verb_manifest(target: str) -> Dict[str, Any]:
@@ -594,15 +637,21 @@ def _verb_manifest(target: str) -> Dict[str, Any]:
         if state["exists"] and state["stale"]:
             shutil.rmtree(ws, ignore_errors=True)
         os.makedirs(ws, exist_ok=True)
-        argv = [resolve_jadx_bin(), "-q", "-s", "-d", ws, target]
+        argv = [resolve_jadx_bin(), "--log-level", "ERROR", "-s", "-d", ws, target]
         proc, err = _run_jadx_argv(argv)
         if err:
             return _err_verb(target, "manifest", err)
         if proc.returncode != 0:
+            stderr_tail, stdout_tail = _proc_tails(proc)
             return _err_verb(
                 target, "manifest",
                 f"jadx resources-only pass failed (exit {proc.returncode}): "
-                f"{(proc.stderr or '').strip()[-1500:]}",
+                f"{stderr_tail or stdout_tail or 'jadx emitted no diagnostics'}",
+                extra={
+                    "exit_code": proc.returncode,
+                    "stderr_tail": stderr_tail,
+                    "stdout_tail": stdout_tail,
+                },
             )
         _write_meta(ws, target, _jadx_version())
     safe = _safe_ws_child(ws, _MANIFEST_REL)
@@ -647,8 +696,13 @@ def _verb_class(target: str, single_class: Optional[str]) -> Dict[str, Any]:
     jadx_bin = resolve_jadx_bin()
     tmp_dir = tempfile.mkdtemp(prefix="jadxclass_")
     try:
+        # --log-level ERROR (NOT -q): on jadx 1.5.6, -q maps to
+        # --log-level QUIET and suppresses ALL output — a not-found FQN then
+        # exits 1 with 0 bytes on stdout AND stderr, leaving the failure
+        # unexplainable.  With ERROR the real cause survives on stdout:
+        # ``ERROR - Incorrect arguments: Input class not found: <fqn>``.
         argv = [
-            jadx_bin, "-q",
+            jadx_bin, "--log-level", "ERROR",
             "--single-class", single_class,
             "--single-class-output", tmp_dir,
             target,
@@ -660,10 +714,25 @@ def _verb_class(target: str, single_class: Optional[str]) -> Dict[str, Any]:
             os.path.join(tmp_dir, f) for f in sorted(os.listdir(tmp_dir))
         ]
         if proc.returncode != 0 or not produced:
+            stderr_tail, stdout_tail = _proc_tails(proc)
+            diag = stderr_tail or stdout_tail or "jadx emitted no diagnostics"
+            extra: Dict[str, Any] = {
+                "single_class": single_class,
+                "exit_code": proc.returncode,
+                "stderr_tail": stderr_tail,
+                "stdout_tail": stdout_tail,
+            }
+            if not produced:
+                extra["note"] = (
+                    "no output produced — the FQN may be absent from this "
+                    "artifact (BuildConfig is a classic case: R8 strips it "
+                    "from release builds); verify independently via "
+                    "run_jadx('<name>', 'decompile') then grep/tree for it"
+                )
             return _err_verb(
                 target, "class",
-                f"single-class pull failed (exit {proc.returncode}): "
-                f"{(proc.stderr or proc.stdout or '').strip()[-1500:]}",
+                f"single-class pull failed (exit {proc.returncode}): {diag}",
+                extra=extra,
             )
         out_file = produced[0]
         with open(out_file, "r", encoding="utf-8", errors="replace") as fh:
@@ -1231,10 +1300,17 @@ def run_jadx(
 
 
 def _err_verb(
-    target: Optional[str], command: Optional[str], error: str
+    target: Optional[str],
+    command: Optional[str],
+    error: str,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Consistent error envelope."""
-    return {
+    """Consistent error envelope.
+
+    ``extra`` merges verb-specific keys (e.g. ``stderr_tail``/``stdout_tail``
+    on jadx-spawn failures) into the base shape without changing it.
+    """
+    envelope: Dict[str, Any] = {
         "status": "error",
         "verb": command,
         "summary": error,
@@ -1248,3 +1324,6 @@ def _err_verb(
         "delta": "",
         "error": error,
     }
+    if extra:
+        envelope.update(extra)
+    return envelope
