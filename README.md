@@ -144,6 +144,7 @@ is in your `PATH`.
 | **OWASP Amass** | `auxiliaries/amass.py` | Subdomain enumeration (v5+; passive mode by default) |
 | **OWASP ZAP** | `auxiliaries/zap.py` | Web app scanning; launched in `-daemon` mode by `bootstrap.py` |
 | **Radare2** | `auxiliaries/radare2.py` | Static binary analysis; `r2pm -ci r2ghidra` for decompilation |
+| **jadx** | `auxiliaries/jadx.py` | APK/dex/jar decompilation (`apk/` drop folder, cached workspaces, grep/read over decompiled sources) |
 | **Metasploit Framework** | `payloads/metasploiting.py` | MSF RPC integration (MCP sidecar started by `bootstrap.py`) |
 | **ffuf** | `payloads/ffuf.py` | Web content fuzzing |
 | **Hydra** | `payloads/hydra.py` | Credential brute-force |
@@ -518,6 +519,9 @@ values; see `.env.example` for the full key list):
 | `COLLAB_DNS_PORT` | `53` | OOB collaborator DNS port |
 | `COLLAB_PUBLIC_URL` | *(empty)* | Public HTTPS base URL for the collaborator (e.g. Tailscale Funnel `https://<host>.ts.net`); set = public path-based callback URLs + `/r/<id>?to=` 302 endpoint live |
 | `R2_BINARY_TARGETS_ROOT` | `binaries/` | Radare2 binary drop folder |
+| `JADX_APK_TARGETS_ROOT` | `apk/` | jadx apk drop folder |
+| `JADX_BIN` | — | jadx launcher path (falls back to PATH; requires Java 11+ JRE) |
+| `JADX_TIMEOUT` | `900` | jadx subprocess wall-clock cap (seconds) |
 | `WORDLISTS_ROOT` | `/usr/share/wordlists` | Wordlist tree root |
 | `SECRETARY_MAX_APPROVAL_ROUNDS` | `5` | Max approval rounds per secretary turn |
 | `SECRETARY_TURN_TIMEOUT` | `600` | Secretary turn wall-clock cap (seconds) |
@@ -682,6 +686,7 @@ auxiliaries/
   amass.py              OWASP Amass v5 subdomain enumeration
   zap.py                OWASP ZAP HTTP API client
   radare2.py            Radare2 static binary analysis
+  jadx.py               jadx APK/dex decompilation (run_jadx composite + list_apk_targets)
   program_scope.py      HackerOne scope integration
   impacket_suite.py     Impacket: SMB/psexec/wmiexec/atexec/secretsdump
   ssh_exec.py           SSH batch command execution
@@ -702,6 +707,7 @@ utils/
   plugins/              C/C++ shared objects + TLS certs
 encoders/               Encoder plugins (C/C++)
 binaries/               Radare2 binary drop folder (gitignored)
+apk/                    jadx apk drop folder (gitignored; decompiled workspaces under apk/decompiled/<name>/)
 scope/                  Cached program scope manifests + .armed_packet_scope.json gate state (gitignored)
 findings_md/            Rendered markdown finding reports (gitignored)
 chroma-data/            ChromaDB persistence (gitignored)

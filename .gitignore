@@ -18,6 +18,9 @@ scope/
 /binaries/*
 !/binaries/.gitkeep
 !/binaries/README.md
+/apk/*
+!/apk/.gitkeep
+!/apk/README.md
 bugcheck_ledger.md
 ledger_archive/*
 briefs/*
