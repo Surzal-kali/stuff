@@ -38,6 +38,14 @@ class ToolManifest(BaseModel):
     # description.  Examples: secretsdump -> "psexec_exec with -hashes
     # :<NTLM>", zap_alerts -> "report_finding".
     next: List[str] = Field(default_factory=list)
+    # Category tags from the canonical vocabulary in daharness/tool_tags.py.
+    # Populated from the @framework_tool(..., tags=[...]) decorator or the
+    # bulk TOOL_TAGS map, appended to the embedded capability text
+    # ("Categories: ...") so category keywords match semantically, and
+    # persisted in ChromaDB metadata (tags_json) so they survive re-indexing.
+    # Surfaced in describe_manifest so the secretary sees the category next
+    # to every search hit.
+    tags: Tuple[str, ...] = Field(default_factory=tuple)
 
     @classmethod
     def from_output(cls, payload: Any) -> Union["ToolManifest", List["ToolManifest"]]:

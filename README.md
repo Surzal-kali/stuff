@@ -109,6 +109,34 @@ becomes the semantic capability description that the registry embeds.
 - **`listeners/raw_scan.py`** — **BRAIN_DISPATCH**: Raw SYN port scanner (C++ plugin via ctypes)
 - **`memories.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember/search/recall/get/forget)
 
+### Tool Categories (`daharness/tool_tags.py`)
+
+With 150+ tools, not every tool surfaces for every reasonable phrasing. Each
+tool carries category tags from a canonical 13-bucket vocabulary that are
+appended to its embedded capability text (`...\n\nCategories: web.fuzz`), so a
+search that uses category language ("recon", "fuzz", "brute", "packet")
+surfaces the tagged tools even when the tool's own prose never used that word.
+
+- Vocabulary (`CANONICAL_TAGS`): `recon.subdomain`, `recon.web`,
+  `recon.dns-certs`, `recon.scope`, `web.fuzz`, `web.probe`, `web.auth`,
+  `exploit.web`, `exploit.msf`, `brute.crack`, `net.raw`, `net.services`,
+  `infra` (infra = main framework tooling and internals; net.services =
+  non-HTTP network-service tooling — SSH/SMB/FTP access, remote exec, secrets
+  dump, callback listeners — and the landing bucket for tool-nursery
+  candidates from model suggestions during lab runs).
+- Bulk assignment for existing tools: the `TOOL_TAGS` map in
+  `daharness/tool_tags.py`, keyed by exact tool_id — one reviewable table.
+- New tools: tag inline via the decorator — `@framework_tool(doc, ...,
+  tags=["web.fuzz"])` (decorator tags win over the map for the same id).
+- Tags persist in ChromaDB metadata (`tags_json`), surface in
+  `describe_manifest` (the secretary sees the category beside every search
+  hit), and a tag change re-embeds the tool automatically on the next
+  `python -m daharness.core` (the doc changes, which is the change signal).
+- Non-canonical tags are warned about (bootstrap/reindex log) but kept.
+- All 153 registry tools are tagged as of 2026-09-22 (`net.services` closed
+  the non-HTTP-service gap; port scanners stay `net.raw` — the scan lane —
+  while `net.services` is for interacting with a discovered service).
+
 ### Background Job Pattern
 
 Long-running CLI tools (nmap, masscan, amass, ffuf, hydra, sqlmap) use the

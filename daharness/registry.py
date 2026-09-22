@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from constants import TransportType
 
 from ._param_docs import parse_param_docs, annotation_to_schema_type, annotation_to_schema_extras
+from .tool_tags import CANONICAL_TAGS, TOOL_TAGS, resolve_tags, tagged_doc
 from .models import ToolManifest
 from .executor import ExecutorMixin
 from .agent import (
@@ -288,6 +289,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                             list(m.accepted_handle_kinds or [])
                         ),
                         "next_hints": json.dumps(list(m.next or [])),
+                        "tags_json": json.dumps(list(m.tags or [])),
                     }
                 ],
                 documents=[m.internal_semantic_capability],
@@ -511,6 +513,20 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                     for tool_id, func, is_method in candidates:
                         doc = getattr(func, "_tool_doc", "No description")
 
+                        # Category tags (daharness/tool_tags.py): decorator
+                        # tags win, the bulk TOOL_TAGS map fills the rest.
+                        # The tags are appended to the doc ("Categories: ...")
+                        # BEFORE embedding so category keywords match
+                        # semantically, and carried on the manifest so they
+                        # persist in ChromaDB metadata + describe_manifest.
+                        tags = resolve_tags(
+                            tool_id,
+                            getattr(func, "_tool_tags", ()) or (),
+                            warn=logger.warning,
+                        )
+                        if tags:
+                            doc = tagged_doc(doc, tags)
+
                         # Extract per-parameter descriptions from the function
                         # docstring (Google/NumPy Args: sections) and type
                         # annotations so the manifest schema is informative
@@ -572,6 +588,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                                 transport=tool_transport,
                                 accepted_handle_kinds=tuple(handle_kinds),
                                 next=list(next_hints),
+                                tags=tags,
                             )
                         )
                 except Exception as e:
@@ -625,6 +642,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 meta.get("accepted_handle_kinds")
             ),
             next=list(self._safe_parse_kinds(meta.get("next_hints"))),
+            tags=self._safe_parse_kinds(meta.get("tags_json")),
         )
 
     def _safe_parse_tool_args(self, raw: Any) -> dict:
@@ -713,6 +731,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         meta.get("accepted_handle_kinds")
                     ),
                     next=list(self._safe_parse_kinds(meta.get("next_hints"))),
+                    tags=self._safe_parse_kinds(meta.get("tags_json")),
                     distance=round(float(dist), 4) if dist is not None else None,
                 )
             )
@@ -781,6 +800,11 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                 entry["accepted_handle_kinds"] = list(manifest.accepted_handle_kinds)
             if manifest.next:
                 entry["next"] = list(manifest.next)
+            if manifest.tags:
+                # Category tags (daharness/tool_tags.py): lets the secretary
+                # see the bucket (web.fuzz, brute.crack, ...) beside every hit
+                # and reason about tool choice beyond the raw capability text.
+                entry["tags"] = list(manifest.tags)
             return entry
         return {
             "tool_id": manifest.module_id,
@@ -791,6 +815,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
             "parameters": manifest.parameters,
             "internal_semantics": manifest.internal_semantics,
             "next": list(manifest.next) if manifest.next else [],
+            "tags": list(manifest.tags) if manifest.tags else [],
         }
 
     def validate_arguments(
