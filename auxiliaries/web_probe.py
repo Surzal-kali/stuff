@@ -39,7 +39,20 @@ import urllib3
 
 from constants import framework_tool
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def _silence_insecure_warn(insecure: bool) -> None:
+    """Suppress urllib3's InsecureRequestWarning — at the CALL SITE, gated.
+
+    Was a process-global ``urllib3.disable_warnings()`` at module import,
+    which muted TLS-verification warnings for the ENTIRE process (any module
+    that imported web_probe, and everything else running in it). Now the
+    suppression is only flipped when an actual ``insecure=True`` probe runs
+    (idempotent, additive filter). Accepted residual trade: once flipped it
+    stays for the process — but only a deliberate insecure probe can flip
+    it, and the noise it silences is exactly its own.
+    """
+    if insecure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _MAX_TARGETS = 256
 _MAX_PORTS = 8
@@ -92,6 +105,7 @@ def _fetch_one(
     from utils.gated_http import gated_get
     from utils.scope_gate import ScopeGateError
 
+    _silence_insecure_warn(insecure)
     try:
         r, hops = gated_get(
             url,

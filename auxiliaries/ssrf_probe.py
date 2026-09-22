@@ -44,6 +44,15 @@ Scope (the important distinction):
   that is the vulnerability we are detecting, not traffic we are sending.
   Gating the payload values would make the test meaningless.
 
+  The OOB CALLBACK BASE is likewise deliberately NEVER a ``check_scan``
+  target: the collaborator endpoint itself (its /c/ callback paths and the
+  /r/ redirect endpoint, lab or COLLAB_PUBLIC_URL public mode) is
+  out-of-scope BY DEFINITION — it is ours, not the target's. Our egress is
+  exactly: the target URL + the collaborator callback base, nothing else.
+  Do not "harden" this into a gate — a scope check on the callback base
+  silently kills blind/OOB detection. This is a deliberate design lock,
+  documented here so a future hardening pass cannot undo it silently.
+
 Honest limits (docstring is the contract):
   - Semi-blind heuristics (status/length/timing/error) are inferential and
     false-positive-prone; the blind collaborator callback is the only hard
@@ -353,12 +362,25 @@ def scan_ssrf(
                 if gen.get("mode") == "public":
                     collab_public_base = (gen.get("base") or "").rstrip("/")
                 else:
-                    collab_domain = gen.get("dns_name", "").split(".", 1)[1] \
-                        if "." in gen.get("dns_name", "") else "oob.lab"
+                    _dom = gen.get("dns_name", "")
+                    collab_domain = (_dom.split(".", 1)[1] if "." in _dom
+                                     else (getattr(collab, "_COLLAB_DOMAIN", "")
+                                           or "oob.lab"))
             except Exception:
                 collab = None
         else:
-            collab_domain = "oob.lab"
+            # Pre-supplied collab_id: mirror the LIVE listener mode instead of
+            # assuming lab subdomain mode. A hardcoded *.oob.lab payload is
+            # stale/unreachable when the collaborator runs in PUBLIC
+            # (COLLAB_PUBLIC_URL / funnel) mode — public DNS cannot resolve
+            # oob.lab subdomains; path-based /c/ callbacks are the only
+            # signal there. Read the module's env-resolved constants.
+            base = (getattr(collab, "_PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+            if base:
+                collab_public_base = base
+            else:
+                collab_domain = (getattr(collab, "_COLLAB_DOMAIN", "")
+                                 or "oob.lab")
     if collab is not None and collab_id:
         sub_http = f"{collab_id}h"
         sub_dns = f"{collab_id}d"
@@ -370,7 +392,8 @@ def scan_ssrf(
             )
         else:
             if not collab_domain:
-                collab_domain = "oob.lab"
+                collab_domain = (getattr(collab, "_COLLAB_DOMAIN", "")
+                                 or "oob.lab")
             blind = (
                 (sub_http, f"http://{sub_http}.{collab_domain}/ssrf"),
                 (sub_dns, f"http://{sub_dns}.{collab_domain}/"),
@@ -382,7 +405,7 @@ def scan_ssrf(
             rid = f"{collab_id}r"
             r_url = (f"{collab_public_base}/r/{rid}?to={urlencode({'to': redirect_to})}"
                      if collab_public_base else
-                     f"http://{rid}.{collab_domain or 'oob.lab'}/r/{rid}"
+                     f"http://{rid}.{collab_domain}/r/{rid}"
                      f"?to={urlencode({'to': redirect_to})}")
             _add("redirect_oob", r_url, pid=rid)
             blind_payloads.append((rid, r_url))

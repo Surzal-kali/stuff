@@ -154,3 +154,78 @@ def test_ssrf_scan_config_fallback(monkeypatch):
     headers, rate = ssrf_probe._scan_config()
     assert headers == {"User-Agent": "framework-ssrfprobe/1.0"}
     assert rate is None
+
+
+# --- scan_ssrf blind payloads mirror the LIVE listener mode -----------------
+# The pre-supplied-collab_id path used to hardcode *.oob.lab payloads, which
+# is stale/unreachable when the collaborator runs in PUBLIC (funnel) mode.
+
+
+class _FakeResp:
+    status_code = 200
+    encoding = "utf-8"
+    text = "ok"
+    content = b"ok"
+
+
+def _stub_scan_env(monkeypatch, public_base, collab_domain):
+    """Offline scan_ssrf harness: no listener, no network, no sleeps."""
+    from types import SimpleNamespace
+
+    import utils.gated_http as gh
+    import utils.scope_gate as sg
+    from auxiliaries import ssrf_probe
+
+    fake_collab = SimpleNamespace(
+        _PUBLIC_BASE_URL=public_base,
+        _COLLAB_DOMAIN=collab_domain,
+        collab_poll=lambda since, id="": "[]",
+    )
+    monkeypatch.setattr(ssrf_probe, "_try_collab", lambda: fake_collab)
+    monkeypatch.setattr(sg, "check_scan", lambda t: (True, "ok"))
+    monkeypatch.setattr(gh, "gated_request",
+                        lambda method, url, **kw: (_FakeResp(), []))
+    monkeypatch.setattr("auxiliaries.program_scope.get_armed_scan_config",
+                        lambda: None, raising=False)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    return ssrf_probe
+
+
+def test_scan_ssrf_presupplied_id_public_mode(monkeypatch):
+    """Pre-supplied collab_id + PUBLIC-mode collaborator: blind payload URLs
+    ride the public base (/c/<id>/) — never stale *.oob.lab subdomains."""
+    sp = _stub_scan_env(monkeypatch, "https://fun.example.ts.net", "oob.lab")
+    res = sp.scan_ssrf("https://target.example/fetch?url=FUZZ",
+                       collab_id="abcd1234")
+    blind = [r["payload"] for r in res["results"] if r["category"] == "blind"]
+    assert blind == [
+        "https://fun.example.ts.net/c/abcd1234h/",
+        "https://fun.example.ts.net/c/abcd1234d/",
+    ]
+    assert not any("oob.lab" in u for u in blind)
+
+
+def test_scan_ssrf_presupplied_id_lab_mode_respects_collab_domain(monkeypatch):
+    """Pre-supplied collab_id + lab mode: subdomain payloads use the LIVE
+    COLLAB_DOMAIN (env-resolved module constant), never a hardcoded literal."""
+    sp = _stub_scan_env(monkeypatch, "", "lab.example")
+    res = sp.scan_ssrf("https://target.example/fetch?url=FUZZ",
+                       collab_id="abcd1234")
+    blind = [r["payload"] for r in res["results"] if r["category"] == "blind"]
+    assert blind == [
+        "http://abcd1234h.lab.example/ssrf",
+        "http://abcd1234d.lab.example/",
+    ]
+
+
+def test_scan_ssrf_redirect_to_public_mode(monkeypatch):
+    """redirect_to + pre-supplied id in public mode: the /r/ payload rides
+    the public base with the derived rid."""
+    sp = _stub_scan_env(monkeypatch, "https://fun.example.ts.net", "oob.lab")
+    res = sp.scan_ssrf("https://target.example/fetch?url=FUZZ",
+                       collab_id="abcd1234",
+                       redirect_to="http://169.254.169.254/latest/meta-data/")
+    roob = [r["payload"] for r in res["results"]
+            if r["category"] == "redirect_oob"]
+    assert len(roob) == 1
+    assert roob[0].startswith("https://fun.example.ts.net/r/abcd1234r?to=")
