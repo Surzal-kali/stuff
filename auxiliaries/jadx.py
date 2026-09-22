@@ -428,11 +428,12 @@ def _run_jadx_argv(argv: List[str]) -> tuple:
 # The discovery tool
 # ---------------------------------------------------------------------------
 @framework_tool(
-    "List APKs/dex/jars available for decompilation in the framework's apk "
-    "drop folder (apk/). Returns each file's name, detected format (APK, DEX, "
-    "JAR, XAPK, AAB, etc.), size, and relative path. Drop new targets into "
-    "apk/ (gitignored) and re-call this; run_jadx auto-resolves bare names "
-    "from this folder, so you only need the filename.",
+    "List APKs/dex/jars available for apk disassembly and decompilation in "
+    "the framework's apk drop folder (apk/). Returns each file's name, "
+    "detected format (APK, DEX, JAR, XAPK, AAB, etc.), size, and relative "
+    "path. Drop new targets into apk/ (gitignored) and re-call this; "
+    "run_jadx auto-resolves bare names from this folder, so you only need "
+    "the filename.",
     next_hints=["run_jadx"],
 )
 def list_apk_targets() -> Dict[str, Any]:
@@ -898,14 +899,16 @@ def _count_all(ws: str, skip: Optional[str] = None) -> int:
 # The composite tool
 # ---------------------------------------------------------------------------
 @framework_tool(
-    "Static Android/Java analysis with jadx: decompile APK/dex/jar/aab/xapk "
-    "into a cached workspace, decode AndroidManifest.xml, pull a single class "
-    "via --single-class, grep the decompiled sources with a regex, read one "
-    "decompiled file, or list the tree. One composite tool — pass a verb "
-    "(decompile, manifest, class, grep, read, tree) from the allowlist plus "
-    "verb-specific params. Targets auto-resolve by bare name from the apk/ "
-    "drop folder. Runs offline (no network, no scope gate); the decompile is "
-    "cached per target and reused until the apk changes.",
+    "Static Android APK analysis with jadx — apk disassembly and "
+    "decompilation: disassemble and decompile an APK/dex/jar/aab/xapk into "
+    "readable Java sources, decode AndroidManifest.xml, pull a single class "
+    "via --single-class, grep the decompiled apk sources with a regex, read "
+    "one decompiled file, or list the tree. This is the apk decompiler / "
+    "disassembler for Android reverse engineering. One composite tool — "
+    "pass a verb (decompile, manifest, class, grep, read, tree) from the "
+    "allowlist plus verb-specific params. Targets auto-resolve by bare name "
+    "from the apk/ drop folder. Runs offline (no network, no scope gate); "
+    "the decompile is cached per target and reused until the apk changes.",
     next_hints=["report_finding"],
 )
 def run_jadx(
