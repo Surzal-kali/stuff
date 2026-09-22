@@ -467,6 +467,116 @@ def test_tree_cap_and_glob():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_grep_paging_offset_and_max_matches():
+    """max_matches raises the cap; offset pages — the two fixes for the
+    '200-match wall' gap (agent_ledger 2026-09-22)."""
+    r, root = _tmp_root()
+    try:
+        _fake_apk(root)
+        src, ws, _ = _fresh_workspace(root, sources=6)  # 6 files, 1 TOKEN each
+        with _Restore() as p:
+            p.patch(J, "_GREP_MAX_MATCHES", 3)
+            # default cap: only _GREP_MAX_MATCHES of the 6
+            res0 = J.run_jadx("app.apk", "grep", pattern="TOKEN")
+            assert res0["status"] == "ok" and len(res0["matches"]) == 3
+            # total_matches is a lower bound — the walk stops at the page
+            # window (3), it never sees matches 4-6 to count them
+            assert res0["total_matches"] == 3
+            assert res0["total_is_lower_bound"] is True
+            assert res0["truncated"] is True and res0["next_offset"] == 3
+            # offset pages to the rest; the next page comes back empty and
+            # settles truncation (exactly-at-cap stays conservative)
+            res1 = J.run_jadx("app.apk", "grep", pattern="TOKEN", offset=3)
+            assert res1["status"] == "ok" and res1["offset"] == 3
+            assert len(res1["matches"]) == 3
+            res1b = J.run_jadx("app.apk", "grep", pattern="TOKEN", offset=6)
+            assert res1b["status"] == "ok" and res1b["matches"] == []
+            assert res1b["truncated"] is False and res1b["next_offset"] is None
+            # pages are disjoint and contiguous
+            first = {(m["file"], m["line"]) for m in res0["matches"]}
+            second = {(m["file"], m["line"]) for m in res1["matches"]}
+            assert not (first & second)
+            # raise the cap past the default — everything fits in one page
+            res2 = J.run_jadx("app.apk", "grep", pattern="TOKEN", max_matches=10)
+            assert res2["status"] == "ok" and len(res2["matches"]) == 6
+            assert res2["truncated"] is False
+            # hard ceiling clamps an absurd raise, and says so
+            res3 = J.run_jadx(
+                "app.apk", "grep", pattern="TOKEN",
+                max_matches=J._GREP_MATCHES_CEILING + 1,
+            )
+            assert res3["status"] == "ok"
+            assert "ceiling" in (res3["truncation_policy"] or "")
+            # validation: junk offset / max_matches / negative
+            res4 = J.run_jadx("app.apk", "grep", pattern="TOKEN", offset=-1)
+            assert res4["status"] == "error" and "offset" in res4["error"]
+            res5 = J.run_jadx("app.apk", "grep", pattern="TOKEN", max_matches=0)
+            assert res5["status"] == "error" and "max_matches" in res5["error"]
+            res6 = J.run_jadx("app.apk", "grep", pattern="TOKEN", offset="nope")
+            assert res6["status"] == "error" and "offset" in res6["error"]
+            # max_files raises the file-scan cap; ceiling clamps and says so
+            res7 = J.run_jadx("app.apk", "grep", pattern="TOKEN", max_files=2)
+            assert res7["status"] == "ok" and res7["files_scanned"] == 2
+            assert res7["files_capped"] is True
+            assert "max_files" in (res7["truncation_policy"] or "")
+            res8 = J.run_jadx(
+                "app.apk", "grep", pattern="TOKEN",
+                max_files=J._GREP_FILES_CEILING + 1,
+            )
+            assert res8["status"] == "ok"
+            assert "max_files" in (res8["truncation_policy"] or "")
+            res9 = J.run_jadx("app.apk", "grep", pattern="TOKEN", max_files=0)
+            assert res9["status"] == "error" and "max_files" in res9["error"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_tree_dirs_mode_and_paging():
+    """tree_mode='dirs' rollup + offset/limit paging — the fix for the flat
+    500-path wall that pushed models into read+glob combos."""
+    r, root = _tmp_root()
+    try:
+        _fake_apk(root)
+        src, ws, _ = _fresh_workspace(root)
+        # nested package tree: sources/com/example/{a,b}, each with 2 files
+        for pkg in ("a", "b"):
+            d = os.path.join(ws, "sources", "com", "example", pkg)
+            os.makedirs(d, exist_ok=True)
+            for i in range(2):
+                with open(os.path.join(d, f"X{i}.java"), "w") as fh:
+                    fh.write("x")
+        res = J.run_jadx("app.apk", "tree", tree_mode="dirs")
+        assert res["status"] == "ok" and res["tree_mode"] == "dirs"
+        by_dir = {e["dir"]: e for e in res["dirs"]}
+        assert "sources/com/example" in by_dir
+        # rollup counts descendants: example holds C0,C1 + a/2 + b/2
+        assert by_dir["sources/com/example"]["total_files"] == 6
+        assert by_dir["sources/com/example"]["files"] == 2
+        assert set(by_dir["sources/com/example"]["subdirs"]) == {"a", "b"}
+        # glob filters dir rollups by the files inside them
+        res_g = J.run_jadx("app.apk", "tree", tree_mode="dirs", glob="sources/*")
+        assert res_g["status"] == "ok"
+        assert all(e["dir"].startswith("sources") for e in res_g["dirs"])
+        # files mode: offset/limit paging, disjoint pages
+        with _Restore() as p:
+            p.patch(J, "_TREE_LIST_CAP", 4)
+            f1 = J.run_jadx("app.apk", "tree", limit=4)
+            assert f1["status"] == "ok" and len(f1["files"]) == 4
+            assert f1["truncated"] is True and f1["next_offset"] == 4
+            f2 = J.run_jadx("app.apk", "tree", limit=4, offset=4)
+            assert f2["status"] == "ok" and f2["offset"] == 4
+            assert not set(f1["files"]) & set(f2["files"])
+        # validation: junk mode / limit / offset
+        bad = J.run_jadx("app.apk", "tree", tree_mode="json")
+        assert bad["status"] == "error" and "tree_mode" in bad["error"]
+        bad2 = J.run_jadx("app.apk", "tree", limit=0)
+        assert bad2["status"] == "error" and "limit" in bad2["error"]
+        bad3 = J.run_jadx("app.apk", "tree", offset=-2)
+        assert bad3["status"] == "error" and "offset" in bad3["error"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_class_pull_missing_binary_clean_error():
     r, root = _tmp_root()
     try:

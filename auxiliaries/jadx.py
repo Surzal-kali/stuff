@@ -92,9 +92,9 @@ _VERB_TABLE: Dict[str, str] = {
     "decompile": "full decompile into the per-target workspace (cached; params: deobf/show_bad_code/mode/threads/no_res/force)",
     "manifest":  "decode AndroidManifest.xml only (fast resources-only pass; returns the XML)",
     "class":     "pull ONE class's decompiled source via --single-class (params: single_class='com.example.Foo')",
-    "grep":      "regex search over the decompiled workspace (params: pattern, glob, case_insensitive)",
+    "grep":      "regex search over the decompiled workspace (params: pattern, glob, case_insensitive, max_matches — raise the 200-match cap, ceiling 2000, offset to page, max_files — raise the 4000-file scan cap, ceiling 50000)",
     "read":      "read one decompiled file, bounded (param: path, relative to the workspace)",
-    "tree":      "list workspace files, bounded, optional glob filter (param: glob)",
+    "tree":      "list the workspace: tree_mode='files' flat paths (offset/limit paging) or tree_mode='dirs' per-directory rollup with file counts (param: glob)",
     # slots 7-8: reserved for practice-found gaps (candidate: --call-graph dot/json export)
 }
 
@@ -112,10 +112,17 @@ _TRUNCATION_NOTE: str = (
 )
 _JADX_TIMEOUT: float = float(os.getenv("JADX_TIMEOUT", "900"))
 _PATTERN_CAP: int = 256
-_GREP_MAX_MATCHES: int = 200
-_GREP_MAX_FILES: int = 4000
+_GREP_MAX_MATCHES: int = int(os.getenv("JADX_GREP_MAX_MATCHES", "200"))
+_GREP_MAX_FILES: int = int(os.getenv("JADX_GREP_MAX_FILES", "4000"))
 _GREP_MAX_FILE_BYTES: int = 2 * 1024 * 1024
-_TREE_LIST_CAP: int = 500
+# Hard ceiling on a caller-raised ``max_matches`` — env-overridable so an
+# operator can lift it for a big obfuscated tree, but never unbounded: the
+# result goes into LLM context, and an unbounded match list is a context bomb.
+_GREP_MATCHES_CEILING: int = int(os.getenv("JADX_GREP_MATCHES_CEILING", "2000"))
+# Same shape for the file-scan cap: on a 24k-file decompiled tree the 4000
+# default binds before the match cap does, silently truncating the sweep.
+_GREP_FILES_CEILING: int = int(os.getenv("JADX_GREP_FILES_CEILING", "50000"))
+_TREE_LIST_CAP: int = int(os.getenv("JADX_TREE_LIST_CAP", "500"))
 _THREADS_MIN, _THREADS_MAX = 1, 16
 _CLASS_RE: re.Pattern = re.compile(r"^[A-Za-z0-9_.$-]{1,256}$")
 _GLOB_RE: re.Pattern = re.compile(r"^[A-Za-z0-9_*?.\-/]{1,256}$")
@@ -690,6 +697,8 @@ def _verb_class(target: str, single_class: Optional[str]) -> Dict[str, Any]:
 def _verb_grep(
     target: str, pattern: Optional[str], glob: Optional[str],
     case_insensitive: bool,
+    max_matches: Optional[int] = None, offset: int = 0,
+    max_files: Optional[int] = None,
 ) -> Dict[str, Any]:
     ws = _workspace_for(target)
     if not os.path.isdir(ws):
@@ -714,17 +723,61 @@ def _verb_grep(
             target, "grep",
             f"glob {glob!r} contains characters outside [A-Za-z0-9_*?.-/]; rejected",
         )
+    # --- paging params: cap raise + offset ---------------------------------
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        return _err_verb(target, "grep", f"offset must be an integer, got {offset!r}")
+    if offset < 0:
+        return _err_verb(target, "grep", f"offset must be >= 0, got {offset}")
+    cap = _GREP_MAX_MATCHES
+    cap_raised = False
+    if max_matches is not None:
+        try:
+            requested = int(max_matches)
+        except (TypeError, ValueError):
+            return _err_verb(
+                target, "grep",
+                f"max_matches must be an integer, got {max_matches!r}",
+            )
+        if requested < 1:
+            return _err_verb(
+                target, "grep", f"max_matches must be >= 1, got {requested}",
+            )
+        if requested > _GREP_MATCHES_CEILING:
+            cap = _GREP_MATCHES_CEILING
+            cap_raised = True   # clamped down — say so in the envelope
+        else:
+            cap = requested
+            cap_raised = requested != _GREP_MAX_MATCHES
+    # Collect ``offset + cap`` hits, then slice the page — so offset pages
+    # through a large result without re-walking or losing the earlier hits.
+    want = offset + cap
+    # Effective file-scan cap: default or caller-raised (clamped to ceiling).
+    file_cap = _GREP_MAX_FILES
+    if max_files is not None:
+        try:
+            requested_files = int(max_files)
+        except (TypeError, ValueError):
+            return _err_verb(
+                target, "grep", f"max_files must be an integer, got {max_files!r}"
+            )
+        if requested_files < 1:
+            return _err_verb(
+                target, "grep", f"max_files must be >= 1, got {requested_files}"
+            )
+        file_cap = min(requested_files, _GREP_FILES_CEILING)
     import fnmatch
-    matches: List[Dict[str, Any]] = []
+    collected: List[Dict[str, Any]] = []
     files_scanned = 0
     files_skipped = 0
     real_ws = os.path.realpath(ws)
     for dirpath, dirnames, filenames in os.walk(ws):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        if files_scanned >= _GREP_MAX_FILES:
+        if files_scanned >= file_cap:
             break
         for fname in sorted(filenames):
-            if files_scanned >= _GREP_MAX_FILES:
+            if files_scanned >= file_cap:
                 break
             rel = os.path.relpath(os.path.join(dirpath, fname), ws)
             if glob and not fnmatch.fnmatch(rel, glob):
@@ -745,18 +798,50 @@ def _verb_grep(
             text = blob.decode("utf-8", errors="replace")
             for line_no, line in enumerate(text.splitlines(), start=1):
                 if rx.search(line):
-                    matches.append({
+                    collected.append({
                         "file": os.path.relpath(fpath, real_ws),
                         "line": line_no,
                         "text": line.strip()[:200],
                     })
-                    if len(matches) >= _GREP_MAX_MATCHES:
+                    if len(collected) >= want:
                         break
-            if len(matches) >= _GREP_MAX_MATCHES:
+            if len(collected) >= want:
                 break
-        if len(matches) >= _GREP_MAX_MATCHES:
+        if len(collected) >= want:
             break
-    truncated = len(matches) >= _GREP_MAX_MATCHES
+    matches = collected[offset:want]
+    # Conservative: exactly-at-cap counts as truncated — an exact fit cannot
+    # be distinguished from "walk stopped at the cap with more matches left".
+    # The next page comes back empty and settles it.
+    truncated = len(collected) >= want or files_scanned >= file_cap
+    next_offset = want if (truncated and len(collected) >= want) else None
+    policy_bits = []
+    if max_files is not None and file_cap < int(max_files):
+        policy_bits.append(
+            f"max_files {max_files} clamped to the hard ceiling "
+            f"{_GREP_FILES_CEILING} (JADX_GREP_FILES_CEILING env)"
+        )
+    if cap_raised and max_matches is not None and int(max_matches) > _GREP_MATCHES_CEILING:
+        policy_bits.append(
+            f"max_matches {max_matches} clamped to the hard ceiling "
+            f"{_GREP_MATCHES_CEILING} (JADX_GREP_MATCHES_CEILING env)"
+        )
+    if truncated:
+        policy_bits.append(
+            f"at least {len(collected)} match(es) seen — showing {offset}..{want - 1}; "
+            f"pass offset={next_offset} for the next page or raise max_matches "
+            f"(cap {cap}, ceiling {_GREP_MATCHES_CEILING})"
+            if len(collected) >= want
+            else
+            f"file-scan cap {file_cap} reached before the match cap — "
+            f"results may be incomplete; narrow with glob to go deeper or "
+            f"raise max_files (ceiling {_GREP_FILES_CEILING})"
+        )
+    elif cap_raised:
+        policy_bits.append(
+            f"cap raised to {cap} (default {_GREP_MAX_MATCHES}) — "
+            f"all {len(collected)} match(es) fit"
+        )
     return {
         "status": "ok",
         "verb": "grep",
@@ -764,21 +849,34 @@ def _verb_grep(
             f"{len(matches)} match(es) in {len(set(m['file'] for m in matches))} "
             f"file(s) — {files_scanned} file(s) scanned, {files_skipped} skipped "
             f"(non-text/ext), pattern {pattern!r}"
+            + (f", offset {offset}" if offset else "")
         ),
         "matches": matches,
+        "offset": offset,
+        "returned": len(matches),
+        # Matches seen within the scan window. When ``truncated`` this is a
+        # LOWER BOUND — the walk stops at offset+cap and never counts the
+        # tail (walking past the page window would defeat the cap).
+        "total_matches": len(collected),
+        "total_is_lower_bound": truncated,
         "files_scanned": files_scanned,
         "files_skipped": files_skipped,
+        "files_capped": files_scanned >= file_cap,
         "workspace": ws,
         "truncated": truncated,
-        "truncation_policy": (
-            f"match cap {_GREP_MAX_MATCHES} reached — narrow pattern/glob"
-            if truncated else None
-        ),
+        "next_offset": next_offset,
+        "truncation_policy": ("; ".join(policy_bits) if policy_bits else None),
         "target": target,
         "jadx_version": _jadx_version(),
         "next_hints": [
             "run_jadx('<name>', 'read', path='<match file>') to read context",
-            "report_finding to record a hard-coded secret / route / endpoint",
+            f"run_jadx('<name>', 'grep', pattern=..., offset={next_offset}) to page"
+            if truncated and len(collected) >= want
+            else (
+                "report_finding to record a hard-coded secret / route / endpoint"
+                if not truncated
+                else "narrow with glob, or raise max_files to scan deeper"
+            ),
         ],
         "delta": f"{len(matches)} grep hits",
     }
@@ -829,7 +927,11 @@ def _verb_read(target: str, path: Optional[str]) -> Dict[str, Any]:
     }
 
 
-def _verb_tree(target: str, glob: Optional[str]) -> Dict[str, Any]:
+def _verb_tree(
+    target: str, glob: Optional[str],
+    tree_mode: str = "files", offset: int = 0,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
     ws = _workspace_for(target)
     if not os.path.isdir(ws):
         return _err_verb(
@@ -842,7 +944,99 @@ def _verb_tree(target: str, glob: Optional[str]) -> Dict[str, Any]:
             target, "tree",
             f"glob {glob!r} contains characters outside [A-Za-z0-9_*?.-/]; rejected",
         )
+    if tree_mode not in ("files", "dirs"):
+        return _err_verb(
+            target, "tree",
+            f"tree_mode {tree_mode!r} not in (files, dirs); rejected — 'files' is "
+            f"the flat path listing, 'dirs' rolls the workspace up per directory "
+            f"with file counts so a big tree stays navigable",
+        )
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        return _err_verb(target, "tree", f"offset must be an integer, got {offset!r}")
+    if offset < 0:
+        return _err_verb(target, "tree", f"offset must be >= 0, got {offset}")
+    page_cap = _TREE_LIST_CAP
+    if limit is not None:
+        try:
+            requested = int(limit)
+        except (TypeError, ValueError):
+            return _err_verb(target, "tree", f"limit must be an integer, got {limit!r}")
+        if requested < 1:
+            return _err_verb(target, "tree", f"limit must be >= 1, got {requested}")
+        page_cap = min(requested, _TREE_LIST_CAP)
     import fnmatch
+    if tree_mode == "dirs":
+        # Per-directory rollup: the model navigates a big workspace by
+        # directory counts instead of a flat 500-path wall of text.
+        counts: Dict[str, Dict[str, Any]] = {}
+        for dirpath, dirnames, filenames in os.walk(ws):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            dir_rel = os.path.relpath(dirpath, ws)
+            if dir_rel == ".":
+                continue
+            entry = counts.setdefault(
+                dir_rel, {"files": 0, "subdirs": [], "total_files": 0}
+            )
+            for fname in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, fname), ws)
+                if glob and not fnmatch.fnmatch(rel, glob):
+                    continue
+                entry["files"] += 1
+            entry["subdirs"] = sorted(d for d in dirnames if not d.startswith("."))
+        # total_files per dir = own files + every descendant's files
+        for dir_rel in list(counts):
+            total = counts[dir_rel]["files"]
+            prefix = dir_rel.rstrip(os.sep) + os.sep
+            for other, other_entry in counts.items():
+                if other.startswith(prefix):
+                    total += other_entry["files"]
+            counts[dir_rel]["total_files"] = total
+        # With a glob, dirs holding zero matching files are pure noise — drop
+        # them. Unfiltered, keep them: a 0-file dir with subdirs is structure.
+        if glob:
+            ordered = [d for d in sorted(counts) if counts[d]["files"] > 0]
+        else:
+            ordered = sorted(counts)
+        total_dirs = len(ordered)
+        page = [
+            {"dir": d, **counts[d]} for d in ordered[offset:offset + page_cap]
+        ]
+        truncated = total_dirs > offset + page_cap
+        next_offset = offset + page_cap if truncated else None
+        return {
+            "status": "ok",
+            "verb": "tree",
+            "tree_mode": "dirs",
+            "summary": (
+                f"{total_dirs} director(ies) in workspace"
+                + (f", {sum(c['total_files'] for c in counts.values())} file(s)"
+                   if not glob else "")
+                + (f" (showing {len(page)} from offset {offset})" if page_cap else "")
+            ),
+            "dirs": page,
+            "total_dirs": total_dirs,
+            "offset": offset,
+            "returned": len(page),
+            "next_offset": next_offset,
+            "workspace": ws,
+            "truncated": truncated,
+            "truncation_policy": (
+                f"dir listing capped at {page_cap} — pass offset={next_offset} "
+                f"for the next page, or narrow with glob"
+                if truncated else None
+            ),
+            "target": target,
+            "jadx_version": _jadx_version(),
+            "next_hints": [
+                "run_jadx('<name>', 'tree', tree_mode='files', glob='<dir>/*') "
+                "to enumerate one package",
+                "run_jadx('<name>', 'grep', pattern='<regex>', glob='<dir>/*.java')",
+            ],
+            "delta": f"listed {len(page)}/{total_dirs} dirs",
+        }
+    # --- flat files listing (default; backward compatible) ------------------
     all_files: List[str] = []
     for dirpath, dirnames, filenames in os.walk(ws):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
@@ -852,18 +1046,25 @@ def _verb_tree(target: str, glob: Optional[str]) -> Dict[str, Any]:
     if glob:
         import fnmatch as _fm
         all_files = [f for f in all_files if _fm.fnmatch(f, glob)]
-    listing = all_files[:_TREE_LIST_CAP]
-    truncated = len(all_files) > _TREE_LIST_CAP
+    total_files = len(all_files)
+    listing = all_files[offset:offset + page_cap]
+    truncated = total_files > offset + page_cap
+    next_offset = offset + page_cap if truncated else None
     return {
         "status": "ok",
         "verb": "tree",
-        "summary": f"{len(all_files)} file(s) in workspace (showing {len(listing)})",
+        "tree_mode": "files",
+        "summary": f"{total_files} file(s) in workspace (showing {len(listing)})",
         "files": listing,
-        "total_files": len(all_files),
+        "total_files": total_files,
+        "offset": offset,
+        "returned": len(listing),
+        "next_offset": next_offset,
         "workspace": ws,
         "truncated": truncated,
         "truncation_policy": (
-            f"listing capped at {_TREE_LIST_CAP} — narrow with glob"
+            f"listing capped at {page_cap} — pass offset={next_offset} for the "
+            f"next page, narrow with glob, or tree_mode='dirs' for a rollup"
             if truncated else None
         ),
         "target": target,
@@ -872,7 +1073,7 @@ def _verb_tree(target: str, glob: Optional[str]) -> Dict[str, Any]:
             "run_jadx('<name>', 'read', path='<file from list>')",
             "run_jadx('<name>', 'grep', pattern='<regex>')",
         ],
-        "delta": f"listed {len(all_files)} files",
+        "delta": f"listed {total_files} files",
     }
 
 
@@ -927,8 +1128,14 @@ def run_jadx(
     pattern: Optional[str] = None,
     glob: Optional[str] = None,
     case_insensitive: bool = False,
+    max_matches: Optional[int] = None,
+    max_files: Optional[int] = None,
     # --- read verb param ---
     path: Optional[str] = None,
+    # --- shared paging / tree params ---
+    offset: int = 0,
+    tree_mode: str = "files",
+    limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Drive jadx against a target from the apk drop folder.
 
@@ -951,7 +1158,19 @@ def run_jadx(
         pattern: grep verb — Python regex, compiled in-process (never shell).
         glob: grep/tree verb — fnmatch filter on workspace-relative paths.
         case_insensitive: grep verb — regex flag.
+        max_matches: grep verb — raise the match cap (default 200, hard
+            ceiling 2000 via ``JADX_GREP_MATCHES_CEILING``). Combine with
+            ``offset`` to page instead of raising when the tree is huge.
+        max_files: grep verb — raise the file-scan cap (default 4000, hard
+            ceiling 50000 via ``JADX_GREP_FILES_CEILING``). On a big
+            decompiled tree this cap binds before ``max_matches`` does.
         path: read verb — workspace-relative file path (traversal-guarded).
+        offset: grep/tree verb — 0-based index of the first result to return
+            (paging through a large result set).
+        tree_mode: tree verb — ``files`` (default; flat path listing) |
+            ``dirs`` (per-directory rollup: file counts + subdirs, the way to
+            map a big decompiled tree without a wall of paths).
+        limit: tree verb — page size for the listing (default/cap 500).
 
     Returns:
         Dict envelope: ``status, verb, summary, workspace, target,
@@ -1000,11 +1219,14 @@ def run_jadx(
     if command == "class":
         return _verb_class(target, single_class)
     if command == "grep":
-        return _verb_grep(target, pattern, glob, bool(case_insensitive))
+        return _verb_grep(
+            target, pattern, glob, bool(case_insensitive),
+            max_matches=max_matches, offset=offset, max_files=max_files,
+        )
     if command == "read":
         return _verb_read(target, path)
     if command == "tree":
-        return _verb_tree(target, glob)
+        return _verb_tree(target, glob, tree_mode=tree_mode, offset=offset, limit=limit)
     return _err_verb(target, command, "unreachable verb dispatch")  # belt+braces
 
 
