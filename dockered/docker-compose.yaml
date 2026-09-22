@@ -132,42 +132,6 @@ services:
 
     restart: unless-stopped
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # JupyterLab — tool nursery, localhost-only, token-gated.
-  # Shares the live framework tree so notebooks import/extend the framework and
-  # reach the gateway on the workbench subnet. With the cage removed
-  # (2026-09-17, decision "C") it runs as jovyan with the stock notebook
-  # entrypoint - no custom entrypoint, no NET_ADMIN - and can be proxied for
-  # remote access. JUPYTER_TOKEN is required from env.
-  # ─────────────────────────────────────────────────────────────────────────
-  jupyter:
-    build:
-      context: ..
-      dockerfile: dockered/jupyter.Dockerfile
-    ports:
-      - "127.0.0.1:8888:8888"
-    networks:
-      workbench:
-        ipv4_address: 172.28.0.40
-    volumes:
-      - /home/jovyan/framework
-    working_dir: /home/jovyan/framework
-    environment:
-      - JUPYTER_TOKEN=${JUPYTER_TOKEN}
-      - CHROMA_HOST=chroma
-      - CHROMA_PORT=8000
-      - OLLAMA_HOST=10.0.0.245
-      - OLLAMA_PORT=11434
-    restart: unless-stopped
-
-networks:
-  workbench:
-    name: workbench
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
-
 volumes:
   terminal-workspace:
   open-webui-data:
