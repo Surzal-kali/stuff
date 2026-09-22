@@ -70,6 +70,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iputils-ping \
         perl \
         git \
+        curl \
+        default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 # searchsploit (exploitdb) — clone DB + symlink the Perl script
@@ -88,6 +90,23 @@ COPY --from=builder /opt/framework-venv /opt/framework-venv
 
 # NOTE: framework source is NOT copied here — it is bind-mounted at runtime
 # from the host (.. -> /opt/framework) in docker-compose.yaml for live edits.
+
+# jadx 1.5.6 — batch APK/Dex decompiler for auxiliaries/jadx.py (run_jadx).
+# Needs Java 11+: default-jre-headless is the lean CLI choice (no X11 libs;
+# the jadx-gui companion is unused by the framework tool). Zip layout is
+# top-level bin/ + lib/ (verified 2026-09-22), so -d /opt/jadx yields
+# /opt/jadx/bin/jadx — exactly the _COMMON_JADX_PATHS entry in
+# auxiliaries/jadx.py; the /usr/local/bin symlink also puts it on PATH
+# (same pattern as searchsploit). Pinned 1.5.6 = the version the verb
+# schema was verified against. The trailing --version fails the build if
+# java or the install is broken.
+RUN curl -fsSL -o /tmp/jadx.zip \
+        https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && chmod +x /opt/jadx/bin/jadx \
+    && ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx \
+    && rm -f /tmp/jadx.zip \
+    && /opt/jadx/bin/jadx --version
 
 # Minimal service bootstrap: starts the Brain sidecar + API gateway, then
 # execs the open-terminal server as `user`. NO firewall, NO NET_ADMIN.
