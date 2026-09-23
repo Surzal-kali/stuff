@@ -3,8 +3,9 @@
 A headless, MCP-capable orchestration harness for security research and
 bug-bounty automation. A small local LLM (the "tool secretary") semantically
 searches a vector-indexed tool registry, selects the right module for a
-natural-language request, and executes it — with a human-in-the-loop approval
-gate on every execution.
+natural-language request, and executes it. An optional human-in-the-loop
+approval gate can be toggled on so every execution pauses for operator
+sign-off; the framework runs without it by default.
 
 The framework follows a "hybrid glue" architecture: Python handles
 orchestration, agent loops, and API surfaces; C/C++ handles performance-critical
@@ -20,15 +21,16 @@ secretary model and gated by scope-compliance and reportability checks.
 ### Tool Secretary (`daharness/`)
 
 The core of the framework. A local LLM (Ollama; `SECRETARY_MODEL`, default
-`hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`) acts as a
-conversational agent with two tools:
+'Qwen3.8:27b') acts as a conversational agent with two tools:
 
 1. **`search_tools`** — semantic search over the tool registry (ChromaDB,
    `nomic-embed-text` embeddings, HNSW cosine similarity). Returns full tool
    manifests.
-2. **`execute_tool`** — runs a surfaced tool. **Requires human approval**:
-   the run pauses, the operator sees the full manifest + arguments, and
-   approves or denies before anything executes.
+2. **`execute_tool`** — runs a surfaced tool. An **opt-in human approval**
+   gate (`requires_approval=True` on the tool) can pause the run so the
+   operator sees the full manifest + arguments and approves or denies before
+   execution proceeds. The gate is off by default; toggle it on per-tool or
+   globally when you want sign-off on every execution.
 
 **Grounding rule:** the secretary can only execute tools it has seen returned
 by `search_tools` in the current conversation. A tool_id that was never
@@ -113,7 +115,7 @@ becomes the semantic capability description that the registry embeds.
 ### Tool Categories (`daharness/tool_tags.py`)
 
 With 150+ tools, not every tool surfaces for every reasonable phrasing. Each
-tool carries category tags from a canonical 13-bucket vocabulary that are
+tool carries category tags from a canonical 14-bucket vocabulary that are
 appended to its embedded capability text (`...\n\nCategories: web.fuzz`), so a
 search that uses category language ("recon", "fuzz", "brute", "packet")
 surfaces the tagged tools even when the tool's own prose never used that word.
@@ -246,20 +248,48 @@ scope gate at the browser request-routing layer; passive subresources
 ### Docker deployment (`dockered/`)
 
 A containerized workbench lives in `dockered/` and bind-mounts the live
-source tree (code edits on the host need no rebuild). Start with
-`cd dockered && ./up.sh` (removes a legacy standalone `chroma` container
-first). Services:
+source tree (code edits on the host need no rebuild). Start with:
+
+```bash
+cd dockered
+docker rm -f chroma          # remove a legacy standalone chroma container if present
+docker compose up -d --build
+```
+
+Services:
 
 | Service | Host port | Notes |
 |---|---|---|
 | ChromaDB (`chroma`) | `9000` | Reuses the existing `chroma-data/` volume |
-| Open Terminal | `8000` | Agent shell + file browser; hosts the framework gateway |
-| Framework gateway (in Open Terminal) | `6000` | REST + MCP — container lane; bare-metal host lane is `5000` |
-| Open WebUI | `3000` | Chat front end; calls the framework API routes |
-| JupyterLab | `8888` | Tool nursery; localhost-only, `JUPYTER_TOKEN`-gated |
+| Open Terminal | `8000` | Codebase workbench: agent shell + file browser; hosts the framework gateway + Brain sidecar |
+| Open WebUI | `3000` | Chat front end; calls the framework via the tool wrappers in `owui-tools/` |
+| BloodHound CE (`bloodhound`) | `127.0.0.1:${BLOODHOUND_PORT}` | AD attack-path graph analysis (backed by `postgres` + `neo4j`) |
 
-Keys come from `dockered/.env`: `GATEWAY_API_KEY`, `OPEN_TERMINAL_API_KEY`,
-`JUPYTER_TOKEN`.
+**Open Terminal** is the codebase workbench. The framework source is
+bind-mounted at `/opt/framework` (host `..` → container).The
+Dockerfile (`dockered/open-terminal.Dockerfile`) bakes in the Python venv,
+Go-built CLI tools (ffuf, amass), radare2, jadx, searchsploit, and
+apt-available security tools; the framework source is never copied.
+
+**Open WebUI** is the chat front end. It reaches the framework through the
+Open WebUI tool wrappers in `owui-tools/owui-wrapper.py` (v0.3.2): four
+tools — `framework_search_tools`, `framework_run_tool`,
+`framework_memory_search`, `framework_health` — that call the gateway's
+`/tools/search`, `/tools/execute`, `/memory/search`, and `/health` routes
+with per-chat session isolation (Brain sessions auto-named
+`owui-<model>-<chat>`). Install the wrapper as an Open WebUI tool and point
+its `gateway_url` valve at `http://localhost:6000` (from the host). There is no
+approval gate in this lane by default — tool calls execute directly through the
+gateway. The same can be said of the MCP server.
+
+**BloodHound CE** runs as a three-container stack (`bloodhound` +
+`postgres` + `neo4j`) on the `workbench` network. The framework's
+`auxiliaries/bloodhound.py` tools connect to it via `BLOODHOUND_URL`. See
+the user memory notes for setup details (Postgres 18, field-based env
+vars, randomized initial admin password in container logs).
+
+Keys come from `dockered/.env`: `GATEWAY_API_KEY`,
+`OPEN_TERMINAL_API_KEY`, `POSTGRES_PASSWORD`, `NEO4J_PASSWORD`.
 
 ## Supporting Services
 
@@ -509,7 +539,9 @@ otherwise the gateway runs in unauthenticated dev mode.
 
 - Python 3.12+ (3.13 supported)
 - [Ollama](https://ollama.ai) running with `nomic-embed-text` and a chat
-  model (default: `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`)
+  model (default: `Qwen3.8:27b`) — the secretary LLM uses Ollama for semantic search and
+  reasoning. The framework auto-discovers the Ollama API endpoint on the LAN
+  (default: `10.0.0.x:11434`) but you can override it with `OLLAMA_BASE_URL` in `.env`.
 - ChromaDB server (default: `localhost:9000`; used by the tool registry —
   the memory service `memories.py` uses its own embedded store at
   `.memory/chroma`)
@@ -530,7 +562,7 @@ values; see `.env.example` for the full key list):
 | `OLLAMA_BASE_URL` | LAN fallback (`10.0.0.x`) | Ollama API endpoint — set explicitly in `.env` |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
-| `SECRETARY_MODEL` | `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M` | LLM model for the tool secretary (non-thinking chat model recommended) |
+| `SECRETARY_MODEL` | `Qwen3.8:27b` | LLM model for the tool secretary (non-thinking chat model recommended) |
 | `MSGRPC_PASSWORD` | — | Metasploit RPC password |
 | `MSF_RPC_PORT` | `55553` | Metasploit RPC port |
 | `MCP_ENDPOINT` | `http://127.0.0.1:55553` | Metasploit MCP sidecar endpoint |
@@ -562,8 +594,11 @@ values; see `.env.example` for the full key list):
 | `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |
 | `INTIGRITI_API_TOKEN` | — | Intigriti API token (scope integration) |
 | `BLOODHOUND_URL` | `http://bloodhound:8080` | BloodHound CE API URL (workbench network) |
+| `BLOODHOUND_PORT` | `18080` | BloodHound CE host port (bound to `127.0.0.1`) |
 | `BLOODHOUND_ADMIN_PRINCIPAL` | `admin` | BloodHound CE admin principal name |
 | `BLOODHOUND_ADMIN_PASSWORD` | — | BloodHound CE admin password (find initial password in container logs) |
+| `POSTGRES_PASSWORD` | — | BloodHound CE Postgres 18 password (docker compose) |
+| `NEO4J_PASSWORD` | — | BloodHound CE Neo4j password (docker compose) |
 
 ### Running
 
@@ -588,7 +623,8 @@ pytest tests/
 In both modes, `bootstrap.py` starts the Brain sidecar, the ZAP daemon, the
 Metasploit MCP sidecar, and the API gateway (with MCP handlers). The
 Metasploit MCP sidecar is also vectorized, but the full index is only
-searchable from the secretary chat loop, and then executed with human approval.
+searchable from the secretary chat loop, and then executed (with operator
+approval if the gate is toggled on).
 
 ## Adding a New Tool
 
@@ -625,8 +661,10 @@ searchable from the secretary chat loop, and then executed with human approval.
 
 ## Safety Notes
 
-- **Human-in-the-loop:** every tool execution requires explicit approval.
-  The confirmer sees the full manifest and arguments before approving.
+- **Human-in-the-loop (opt-in):** an approval gate can be toggled on so
+  every tool execution pauses for explicit operator sign-off — the
+  confirmer sees the full manifest and arguments before approving. It is
+  off by default; the framework executes tools directly when disarmed.
 - **Scope compliance:** `check_scope` gates every scan against the loaded
   HackerOne program scope before execution — out-of-scope assets are
   rejected, and explicit out-of-scope entries override in-scope wildcards.
@@ -749,6 +787,7 @@ schema.md               SQLite database schema
 AGENTS.md               AI agent development guide
 docs/                   Target dossiers (local-only, gitignored)
 ledger_archive/         Rotated-out ledger snapshots (local-only, gitignored)
-dockered/               Docker workbench: compose, Dockerfiles, start_gateway.py
+dockered/               Docker workbench: compose, Dockerfiles, start_gateway.py, entrypoint
+owui-tools/             Open WebUI tool wrappers (framework bridge: search/run/memory/health)
 .env.example            Configuration template (copy to .env; .env is not tracked)
 ```
