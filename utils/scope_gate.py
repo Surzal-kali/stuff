@@ -316,6 +316,18 @@ def _check_one(checkable: Optional[str], state: Dict[str, Any]) -> Tuple[bool, s
     if checkable in allowlist:
         host = allowlist.get(checkable) or ""
         return True, f"in operator allowlist ({host})" if host else "in operator allowlist"
+    # CIDR blessings (lab subnets): any blessed network containing the
+    # target IP counts as an allowlist hit.
+    try:
+        _check_ip = ipaddress.ip_address(checkable)
+        for _net_str, _net_host in allowlist.items():
+            if "/" in _net_str and _check_ip in ipaddress.ip_network(_net_str):
+                return True, (
+                    f"in operator allowlist CIDR {_net_str}"
+                    + (f" ({_net_host})" if _net_host else "")
+                )
+    except ValueError:
+        pass  # checkable isn't an IP; fall through to hostname tiers
 
     # Tier 1b: operator-blessed hostnames (vhost lanes).  The operator asserts
     # the hostname->IP mapping explicitly via add_host (REPL-only); the gate
@@ -684,6 +696,9 @@ def add_ip(ip: str, hostname: str = "") -> Dict[str, Any]:
 
     Use this after confirming via recon (amass/dns forward-resolution) that
     ``ip`` belongs to an in-scope host.  Requires the gate to be armed.
+    Accepts single IPs ('10.0.0.1') or CIDR blocks ('192.168.1.0/24').
+    A CIDR blessing covers every address in the network -- use for lab
+    subnets where the operator owns the whole range.
     """
     state = _load_state()
     if state is None:
@@ -691,16 +706,25 @@ def add_ip(ip: str, hostname: str = "") -> Dict[str, Any]:
     ip = (ip or "").strip()
     if not ip:
         return {"ok": False, "error": "ip is required"}
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        return {
-            "ok": False,
-            "error": (
-                f"{ip!r} is not a valid IP address; to bless a hostname "
-                f"(vhost lane) use 'scope add-host <hostname> <blessed-ip>'"
-            ),
-        }
+    if "/" in ip:
+        # CIDR block: normalize via ip_network (strict=False zeroes host
+        # bits, so 192.168.1.5/24 and 192.168.1.0/24 both land as
+        # 192.168.1.0/24).
+        try:
+            ip = str(ipaddress.ip_network(ip, strict=False))
+        except ValueError:
+            return {"ok": False, "error": f"{ip!r} is not a valid CIDR network"}
+    else:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return {
+                "ok": False,
+                "error": (
+                    f"{ip!r} is not a valid IP address; to bless a hostname "
+                    f"(vhost lane) use 'scope add-host <hostname> <blessed-ip>'"
+                ),
+            }
     state.setdefault("allowlist", {})[ip] = (hostname or "").strip()
     _write_state(state)
     return {
