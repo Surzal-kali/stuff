@@ -46,3 +46,4 @@ WIP_*.*
 *.txt
 !requirements.txt
 todo.md
+dockered/.env.save

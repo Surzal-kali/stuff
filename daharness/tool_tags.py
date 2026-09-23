@@ -73,6 +73,7 @@ CANONICAL_TAGS: Tuple[str, ...] = (
     "brute.crack",
     "net.raw",
     "net.services",
+    "recon.ad",
     "infra",
 )
 
@@ -249,6 +250,19 @@ TOOL_TAGS: Dict[str, Tuple[str, ...]] = {
     "listeners.listening.TCPListener.read_listener": ("net.services",),
     "listeners.listening.TCPListener.send_to_listener": ("net.services",),
     "listeners.listening.TCPListener.clear_listener_data": ("net.services",),
+    # --- recon.ad (BloodHound CE AD graph analysis; operator-added 09/22) ----
+    "auxiliaries.bloodhound.bh_login": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_ingest": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_query": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_query_template": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_list_templates": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_analysis_status": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_start_analysis": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_list_domains": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_get_entity": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_get_controllers": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_get_controllables": ("recon.ad",),
+    "auxiliaries.bloodhound.bh_graph_search": ("recon.ad",),
 }
 
 

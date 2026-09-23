@@ -89,7 +89,8 @@ becomes the semantic capability description that the registry embeds.
 - **`auxiliaries/ssh_exec.py`** — **BRAIN_DISPATCH**: SSH batch command execution on a persistent connection
 - **`auxiliaries/smb_scanner.py`** — **BRAIN_DISPATCH**: SMB null session vulnerability scanning
 - **`auxiliaries/cert_tools.py`** — **BRAIN_DISPATCH**: TLS certificate generation/clearing for the OOB collaborator
-- **`auxiliaries/framework_status.py`** — **BRAIN_DISPATCH**: Framework operational health check (Brain, Ollama, ChromaDB, ZAP)
+- **`auxiliaries/framework_status.py`** — **BRAIN_DISPATCH**: Framework operational health check (Brain, Ollama, ChromaDB, ZAP, BloodHound)
+- **`auxiliaries/bloodhound.py`** — **BRAIN_DISPATCH**: BloodHound CE AD graph analysis (login, ingest, Cypher query, query templates, entity lookup, attack path discovery)
 - **`payloads/metasploiting.py`** — **BRAIN_DISPATCH / MCP_RPC**: Metasploit module search, execution, session polling, interaction
 - **`payloads/ffuf.py`** — **BRAIN_DISPATCH**: ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel)
 - **`payloads/hydra.py`** — **BRAIN_DISPATCH**: Hydra credential brute-force / password-spray (launch/poll/cancel)
@@ -181,6 +182,7 @@ is in your `PATH`.
 | **Impacket** | `auxiliaries/impacket_suite.py` | Windows post-exploitation (SMB, psexec, wmiexec, atexec, secretsdump) |
 | **Scapy** | `utils/packetcraft.py` | Packet crafting, send, send-and-receive probes (sr1/srp1), sniffing (Python library) |
 | **Paramiko** | `utils/paramiko_client.py`, `auxiliaries/ssh_exec.py` | SSH client (Python library) |
+| **BloodHound CE** | `auxiliaries/bloodhound.py` | AD attack-path analysis (graph queries, Cypher, query templates); workbench container, no sidecar |
 
 ### OWASP ZAP
 
@@ -559,6 +561,9 @@ values; see `.env.example` for the full key list):
 | `ZAP_XMX` | `512m` | ZAP daemon JVM heap size |
 | `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |
 | `INTIGRITI_API_TOKEN` | — | Intigriti API token (scope integration) |
+| `BLOODHOUND_URL` | `http://bloodhound:8080` | BloodHound CE API URL (workbench network) |
+| `BLOODHOUND_ADMIN_PRINCIPAL` | `admin` | BloodHound CE admin principal name |
+| `BLOODHOUND_ADMIN_PASSWORD` | — | BloodHound CE admin password (find initial password in container logs) |
 
 ### Running
 

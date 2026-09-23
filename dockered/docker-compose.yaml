@@ -132,9 +132,80 @@ services:
 
     restart: unless-stopped
 
+  postgres:
+    image: postgres:18
+    container_name: bloodhound-postgres
+    networks:
+      - workbench
+    environment:
+      POSTGRES_USER: bloodhound
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: bloodhound
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bloodhound"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:4.4-community
+    container_name: bloodhound-neo4j
+    networks:
+      - workbench
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_memory_pagecache_size: 512M
+      NEO4J_dbms_memory_heap_initial__size: 512M
+      NEO4J_dbms_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bloodhound:
+    image: specterops/bloodhound:latest
+    container_name: bloodhound-server
+    networks:
+      - workbench
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    environment:
+      # BloodHound CE reads DB config via individual field env vars (see
+      # cmd/api/src/config/config_test.go in SpecterOps/BloodHound). Using
+      # the field vars (bhe_database_*, bhe_neo4j_*) instead of a full
+      # connection string avoids URL-encoding issues when the password
+      # contains URI-special characters like '@'.
+      bhe_database_addr: "postgres:5432"
+      bhe_database_username: "bloodhound"
+      bhe_database_secret: "${POSTGRES_PASSWORD}"
+      bhe_database_database: "bloodhound"
+      bhe_neo4j_addr: "neo4j:7687"
+      bhe_neo4j_username: "neo4j"
+      bhe_neo4j_secret: "${NEO4J_PASSWORD}"
+      bhe_neo4j_database: "neo4j"
+
+      # General settings
+      bhe_log_level: INFO
+      bhe_root_url: "http://localhost:${BLOODHOUND_PORT}"
+    ports:
+      # Pulls port variable dynamically while maintaining your safe port layout
+      - "127.0.0.1:${BLOODHOUND_PORT}:8080"
+    restart: always
 volumes:
   terminal-workspace:
   open-webui-data:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
 
 networks:
   workbench:

@@ -92,6 +92,7 @@ def framework_health() -> Dict[str, Any]:
     chroma_host = os.getenv("CHROMA_HOST", "localhost")
     chroma_port = int(os.getenv("CHROMA_PORT", "9000"))
     zap_port = int(os.getenv("ZAP_PORT", "8090"))
+    bh_url = os.getenv("BLOODHOUND_URL", "http://bloodhound:8080")
 
     workspace = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
     db_path = workspace / "ids.db"
@@ -142,6 +143,22 @@ def framework_health() -> Dict[str, Any]:
     subsystems["zap_daemon"] = {
         "up": zap_up,
         "detail": f"127.0.0.1:{zap_port}" if zap_up else f"not listening on 127.0.0.1:{zap_port}",
+    }
+
+    # BloodHound CE (workbench container; optional)
+    bh_host = "localhost"
+    bh_port = 8080
+    try:
+        from urllib.parse import urlparse
+        parsed_bh = urlparse(bh_url)
+        bh_host = parsed_bh.hostname or "localhost"
+        bh_port = parsed_bh.port or 8080
+    except Exception:
+        pass
+    bh_up = _check_tcp(bh_host, bh_port)
+    subsystems["bloodhound"] = {
+        "up": bh_up,
+        "detail": f"{bh_url}" if bh_up else f"unreachable at {bh_url}",
     }
 
     # SQLite findings DB

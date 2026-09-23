@@ -429,6 +429,43 @@ def _cap_tool_stdout(result: Dict[str, Any], limit: Optional[int] = None) -> Dic
 # schemas) because the whole point is to remove the model's ambiguity about
 # "is this string a tool id or an argument value?".
 _CHAIN_NEXT = {
+    # --- BloodHound CE chain (ingest → analyze → query → exploit) -----------
+    "auxiliaries.bloodhound.bh_ingest": (
+        "Next: call execute_tool with tool_id "
+        "'auxiliaries.bloodhound.bh_analysis_status' to check if the ingested "
+        "data has been processed. Once analysis completes, call "
+        "'auxiliaries.bloodhound.bh_query_template' with template='all_domains' "
+        "to verify the data landed."
+    ),
+    "auxiliaries.bloodhound.bh_query_template": (
+        "If the query returned attack path nodes (edges showing privilege "
+        "escalation): next call execute_tool with tool_id "
+        "'auxiliaries.bloodhound.bh_get_entity' or 'auxiliaries.bloodhound."
+        "bh_get_controllers' on the target node's object_id to get more "
+        "detail. If credentials were surfaced (e.g. kerberoastable users), "
+        "consider 'report_finding' to log the finding, or "
+        "'payloads.metasploiting.MetasploitClient.dispatch_metasploit' for "
+        "exploitation."
+    ),
+    "auxiliaries.bloodhound.bh_graph_search": (
+        "Next: call execute_tool with tool_id "
+        "'auxiliaries.bloodhound.bh_get_entity' or "
+        "'auxiliaries.bloodhound.bh_get_controllers' with the object_id from "
+        "the search results to drill into a specific node."
+    ),
+    "auxiliaries.bloodhound.bh_get_controllers": (
+        "If a controller principal has high-privilege access (AdminTo, "
+        "GenericAll, DCSync): next call 'report_finding' to log the attack "
+        "path, or 'payloads.metasploiting.MetasploitClient.dispatch_metasploit' "
+        "to exploit it (e.g. psexec with recovered hashes)."
+    ),
+    "auxiliaries.bloodhound.bh_get_controllables": (
+        "If the entity controls high-value targets (Domain Admins, DCs): "
+        "next call 'report_finding' to log the finding, or "
+        "'auxiliaries.bloodhound.bh_query_template' with "
+        "template='shortest_path_to_da' to find the full attack path."
+    ),
+    # ...existing code...
     "payloads.metasploiting.MetasploitClient.index_modules": (
         "Next: call execute_tool with tool_id "
         "'payloads.metasploiting.MetasploitClient.dispatch_metasploit', passing one "
