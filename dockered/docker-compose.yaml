@@ -105,8 +105,10 @@ services:
   # ─────────────────────────────────────────────────────────────────────────
   # Open WebUI — chat front end layered over the framework.
   # Reaches open-terminal at open-terminal:8000 (tools) and Ollama directly at
-  # 10.0.0.245:11434 (LLM). Not behind the open-terminal firewall — this is the
-  # open dev surface, not the gated agent surface.
+  # 10.10.10.134:11434 (LLM, host lane enp92s0 — the lab-switch lane is routed
+  # and SNATed downwind, so containers reach it through the host). Not behind
+  # the open-terminal firewall — this is the open dev surface, not the gated
+  # agent surface.
   # ─────────────────────────────────────────────────────────────────────────
   open-webui:
     # NOTE: pinned to :dev (not :main) because the interactive terminal shell
@@ -125,7 +127,7 @@ services:
     volumes:
       - open-webui-data:/app/backend/data
     environment:
-      - OLLAMA_BASE_URL=http://10.0.0.245:11434
+      - OLLAMA_BASE_URL=http://10.10.10.134:11434
       - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
       - WEBUI_URL_PREFIX=${WEBUI_URL_PREFIX}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}

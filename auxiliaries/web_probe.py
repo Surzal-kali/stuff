@@ -196,8 +196,8 @@ def probe_web(
 
     Args:
         targets: Space/comma-separated hosts or URLs, e.g.
-            ``"192.168.90.114,192.168.90.115"`` or
-            ``"https://192.168.90.115/ 192.168.90.114"``.
+            ``"10.10.10.114,10.10.10.115"`` or
+            ``"https://10.10.10.115/ 10.10.10.114"``.
         ports: Ports to probe for bare hosts (max 8).
         insecure: Skip TLS verification (self-signed lab certs).
         timeout: Per-request timeout in seconds.

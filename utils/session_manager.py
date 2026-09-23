@@ -43,7 +43,7 @@ class Session:
 
     sid: str
     kind: str  # "ssh", "msf_shell", "meterpreter", ...
-    target: str  # human-readable, e.g. "root@10.0.0.5:22"
+    target: str  # human-readable, e.g. "root@10.10.10.50:22"
     client: Any  # the live connection object (paramiko.SSHClient, MSF session, ...)
     created_at: float
     last_activity: float

@@ -176,7 +176,7 @@ class Tools:
         :param arguments: JSON object string of tool arguments, matching the
             parameters schema from the search menu. Unknown keys are rejected by
             the gateway with a 422 listing accepted keys. Example:
-            '{"target": "10.0.0.5", "ports": "1-1000"}'
+            '{"target": "10.10.10.50", "ports": "1-1000"}'
         :param agent_id: Optional explicit Brain session id. Leave empty to
             get an isolated per-chat session, auto-named from the running
             model id + chat id (owui-<model>-<chat>), so parallel bug-bounty
@@ -186,7 +186,7 @@ class Tools:
         try:
             args = json.loads(arguments or "{}")
             if not isinstance(args, dict):
-                return "ERROR: 'arguments' must be a JSON object string, e.g. '{\"target\": \"10.0.0.5\"}'"
+                return "ERROR: 'arguments' must be a JSON object string, e.g. '{\"target\": \"10.10.10.50\"}'"
         except json.JSONDecodeError as e:
             return f"ERROR: 'arguments' is not valid JSON ({e}). Pass a JSON object string."
         payload = {"tool_id": tool_id, "arguments": args}

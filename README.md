@@ -540,8 +540,9 @@ otherwise the gateway runs in unauthenticated dev mode.
 - Python 3.12+ (3.13 supported)
 - [Ollama](https://ollama.ai) running with `nomic-embed-text` and a chat
   model (default: `Qwen3.8:27b`) — the secretary LLM uses Ollama for semantic search and
-  reasoning. The framework auto-discovers the Ollama API endpoint on the LAN
-  (default: `10.0.0.x:11434`) but you can override it with `OLLAMA_BASE_URL` in `.env`.
+  reasoning. The framework auto-discovers the Ollama API endpoint on the lab
+  lane (default: `10.10.10.134:11434` on `enp92s0`, 10.10.10.0/24) but you can
+  override it with `OLLAMA_BASE_URL` in `.env`.
 - ChromaDB server (default: `localhost:9000`; used by the tool registry —
   the memory service `memories.py` uses its own embedded store at
   `.memory/chroma`)
@@ -559,7 +560,7 @@ values; see `.env.example` for the full key list):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_BASE_URL` | LAN fallback (`10.0.0.x`) | Ollama API endpoint — set explicitly in `.env` |
+| `OLLAMA_BASE_URL` | Lab lane fallback (`10.10.10.134`) | Ollama API endpoint — set explicitly in `.env` |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
 | `SECRETARY_MODEL` | `Qwen3.8:27b` | LLM model for the tool secretary (non-thinking chat model recommended) |

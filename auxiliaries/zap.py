@@ -794,7 +794,7 @@ class ZAPClient:
         with a ``"__urls__"`` leaf listing the full URLs that terminate each
         node. This mirrors the old native tree well enough for triage.
 
-        ``url`` is lenient: a bare host (``"192.168.90.110"``) or a host with
+        ``url`` is lenient: a bare host (``"10.10.10.110"``) or a host with
         a port but no scheme is normalised to ``http://...`` so it matches
         the ``baseurl`` prefix filter ZAP applies server-side. A leading
         scheme is preserved; trailing slashes are kept since ZAP's filter is
@@ -805,7 +805,7 @@ class ZAPClient:
         q: Dict[str, Any] = {}
         if url:
             u = url.strip()
-            # Accept bare hosts ("192.168.90.110") and "host:port" forms that
+            # Accept bare hosts ("10.10.10.110") and "host:port" forms that
             # lack a scheme; urlsplit mis-parses those (host -> path), so we
             # prepend a default scheme before handing to baseurl.
             if "://" not in u:
@@ -1020,7 +1020,7 @@ def zap_open_url(target: str,
     headers and respects the req/sec cap.
 
     Args:
-        target: Fully qualified URL including scheme, e.g. ``http://192.168.90.110/``.
+        target: Fully qualified URL including scheme, e.g. ``http://10.10.10.110/``.
             Must be reachable from this host; ZAP fetches it directly.
         scope_handle: Program handle for auto-injection of mandatory testing
             requirements (Intigriti RoE). Pair with ``scope_platform``.
@@ -1181,7 +1181,7 @@ def zap_alerts(base_url: Optional[str] = None,
     it, call ``zap_alert_message`` with the alert's ``id``.
 
     Args:
-        base_url: Optional URL prefix to filter by (e.g. ``http://192.168.90.110``).
+        base_url: Optional URL prefix to filter by (e.g. ``http://10.10.10.110``).
         risk_id: Optional minimum risk level (0-4). Returns ALL alerts when None.
         summary: If True (default), return compact triage records. If False,
             return the full raw ZAP alert objects.

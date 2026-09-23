@@ -48,7 +48,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.0.0.245:11434/v1").rstrip(
+# Ollama endpoint: lab LAN address (host lane: 10.10.10.134:11434 via the
+# enp92s0 lab-switch lane). Override with OLLAMA_BASE_URL in .env.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://10.10.10.134:11434/v1").rstrip(
     "/"
 )
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")

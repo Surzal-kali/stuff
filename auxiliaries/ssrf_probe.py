@@ -106,7 +106,7 @@ _LOCALHOST_PAYLOADS: Tuple[str, ...] = (
 
 _INTERNAL_PAYLOADS: Tuple[str, ...] = (
     "http://192.168.0.1/",
-    "http://10.0.0.1/",
+    "http://10.10.10.1/",
     "http://172.16.0.1/",
     "http://169.254.169.254/",
     "http://169.254.169.254/latest/meta-data/",

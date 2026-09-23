@@ -295,7 +295,7 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
     """Launch ffuf against ``url`` and return immediately.
 
     The URL must contain the ``FUZZ`` keyword where wordlist entries are
-    substituted (e.g. ``http://10.0.0.1/FUZZ``).  Machine-readable JSON
+    substituted (e.g. ``http://10.10.10.50/FUZZ``).  Machine-readable JSON
     output is always captured to a per-job file; ``ffuf_status`` prefers
     that file's findings over the human-table parse.
 
@@ -308,7 +308,7 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
 
     Args:
         url: Target URL containing the ``FUZZ`` keyword, e.g.
-            ``http://10.0.0.1/FUZZ``.
+            ``http://10.10.10.50/FUZZ``.
         wordlist: Path to the wordlist file (passed to ``-w``).  Empty
             string falls back to the framework default wordlist.
         options: Additional ffuf command-line options as a single string

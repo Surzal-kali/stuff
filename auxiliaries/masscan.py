@@ -170,7 +170,7 @@ def _get_iface_ip(iface: str) -> Optional[str]:
         return None
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    # Output format: "wlp0s20f3    inet 10.0.0.49/24 brd ..."
+    # Output format: "wlp0s20f3    inet 10.10.10.1/24 brd ..."
     parts = r.stdout.split()
     for i, p in enumerate(parts):
         if p == "inet" and i + 1 < len(parts):
@@ -449,7 +449,7 @@ def run_masscan(
     # Resolve --adapter-ip from the SPECIFIED interface when possible, so
     # the source IP matches the pinned NIC.  Fall back to $MASSCAN_ADAPTER_IP,
     # then to the default-route IP.  Without this, --adapter-ip always
-    # reflected the default-route interface (e.g. 10.0.0.7 on enp92s0)
+    # reflected the default-route interface (e.g. 10.10.10.1 on enp92s0)
     # regardless of the -e <iface> flag — masscan then used the wrong NIC's
     # IP as source, silently breaking scans on multi-interface hosts.
     adapter_ip: Optional[str] = None

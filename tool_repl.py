@@ -609,15 +609,15 @@ Tool REPL commands:
   quit / exit            Leave the REPL
 
 Flag args are type-coerced from the tool's own manifest schema:
-  --target 10.0.0.1       string (default)
+  --target 10.10.10.50    string (default)
   --port 22               integer (per schema)
   --verbose               bare flag → True
   --no-verbose             → False
   --limit 5                integer (per schema)
 
 Positional args fill required params in order:
-  run auxiliaries.nmap.run_nmap 10.0.0.1 "-Pn -p 22"
-  (equivalent to --target 10.0.0.1 --options "-Pn -p 22")
+  run auxiliaries.nmap.run_nmap 10.10.10.50 "-Pn -p 22"
+  (equivalent to --target 10.10.10.50 --options "-Pn -p 22")
 """)
 
 

@@ -264,7 +264,7 @@ def _coerce_arg_value(name: str, value: Any, schema_type: str) -> Any:
                 raise ValueError(
                     f"argument '{name}' must be an object/dict, got a string that "
                     f"isn't valid JSON: {e}. Pass the dict directly, e.g. "
-                    f"\"{name}\": {{\"RHOSTS\": \"10.0.0.5\"}}, NOT as a JSON-encoded string."
+                    f"\"{name}\": {{\"RHOSTS\": \"10.10.10.50\"}}, NOT as a JSON-encoded string."
                 )
             if not isinstance(parsed, dict):
                 raise ValueError(

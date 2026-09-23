@@ -228,7 +228,7 @@ def extract_js_routes(
     ``skipped``.
 
     Args:
-        url: In-scope page or JS file URL, e.g. ``http://192.168.90.114/``.
+        url: In-scope page or JS file URL, e.g. ``http://10.10.10.114/``.
         max_scripts: Max bundles to fetch from one page (default 25).
         timeout: Per-fetch timeout in seconds.
         insecure: Skip TLS verification (self-signed lab certs).

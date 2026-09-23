@@ -34,7 +34,7 @@ from utils.wordlists import resolve_default_wordlist
 
 
 # hydra's success line looks like:
-#   host: 10.0.0.1   login: admin   password: letmein
+#   host: 10.10.10.50   login: admin   password: letmein
 # IPv4, IPv6 (in brackets), or a hostname may appear as the host value.
 _HYDRA_FOUND_RE = re.compile(
     r"^host:\s+(?P<host>\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]|[^\s:]+)\s+"
@@ -157,7 +157,7 @@ def _inject_default_credentials(opt_list: List[str]) -> tuple[List[str], Dict[st
 
 @framework_tool(
     "Launch and start a new Hydra credential brute-force / password-spray "
-    "against a service target (e.g. ssh://10.0.0.1, ftp://host, "
+    "against a service target (e.g. ssh://10.10.10.50, ftp://host, "
     "http-post-form://host/path:user=^USER^&pass=^PASS^:F=invalid). "
     "Non-blocking and detached — starts the run in the background and "
     "returns immediately with a job ID for later retrieval.",
@@ -171,7 +171,7 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
     ``hydra_status(job_id)`` until it reports ``status: "done"``.
 
     The ``target`` is hydra's ``service://server[:port][/OPT]`` operand
-    (e.g. ``ssh://10.0.0.1:22``, ``ftp://192.168.0.5``, or for HTTP forms
+    (e.g. ``ssh://10.10.10.50:22``, ``ftp://192.168.0.5``, or for HTTP forms
     ``http-post-form://host/login.php:user=^USER^&pass=^PASS^:F=invalid``).
     Credentials and tuning come from ``options`` (``-l``/``-L`` for logins,
     ``-p``/``-P`` for passwords, ``-C`` for a colon file, ``-t`` for
@@ -179,7 +179,7 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
     per-attempt progress).
 
     Args:
-        target: The hydra service target, e.g. ``ssh://10.0.0.1``.  This is
+        target: The hydra service target, e.g. ``ssh://10.10.10.50``.  This is
             passed as its own argv element and never interpolated into a
             shell string.
         options: Additional hydra command-line options as a single string
