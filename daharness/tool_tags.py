@@ -1,6 +1,6 @@
 """Tool category taxonomy + the bulk tag map (semantic-search viability).
 
-153 registry tools is past the point where every tool surfaces for every
+154 registry tools is past the point where every tool surfaces for every
 reasonable phrasing.  Category tags fix discoverability: a tool's tags are
 appended to its embedded capability text (``...\\n\\nCategories: web.fuzz``)
 so a search that uses category language ("recon", "fuzz", "brute", "packet")
@@ -21,7 +21,7 @@ DESIGN (three small pieces, no find_tools changes):
 
 2. ``TOOL_TAGS`` — the bulk assignment for EXISTING tools, keyed by exact
    registry tool_id (module.function / module.Class.method).  One reviewable
-   table instead of a 153-call-site diff across ~30 modules.  Deliberately
+   table instead of a 154-call-site diff across ~30 modules.  Deliberately
    UNTAGGED tools (fit is genuinely ambiguous — see PENDING below) are absent:
    absence degrades to today's behaviour, a wrong tag would mislead.
 
@@ -192,6 +192,7 @@ TOOL_TAGS: Dict[str, Tuple[str, ...]] = {
     "listeners.raw_scan.syn_scan": ("net.raw",),
     "auxiliaries.nmap.run_nmap": ("net.raw",),
     "auxiliaries.nmap.nmap_status": ("net.raw",),
+    "auxiliaries.nmap.nmap_scripts": ("net.raw",),
     "auxiliaries.masscan.run_masscan": ("net.raw",),
     "auxiliaries.masscan.masscan_status": ("net.raw",),
     "auxiliaries.masscan.masscan_cancel": ("net.raw",),

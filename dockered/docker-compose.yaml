@@ -201,6 +201,21 @@ services:
       bhe_neo4j_secret: "${NEO4J_PASSWORD}"
       bhe_neo4j_database: "neo4j"
 
+      # Default admin credentials (2026-09-24 lockout recovery): the admin
+      # password is owned by BLOODHOUND_ADMIN_PASSWORD in .env — no more
+      # banner hunting in container logs. ALL five fields must be non-empty
+      # or BloodHound ignores them and randomizes the password
+      # (FillAndPopulateDefaultAdminInfo, cmd/api/src/bootstrap/server.go).
+      # bhe_recreate_default_admin=true deletes + recreates the admin user on
+      # EVERY boot — REMOVE it once login is confirmed, or any UI-side
+      # password change gets silently reverted on restart.
+      bhe_default_admin_principal_name: "admin"
+      bhe_default_admin_password: "${BLOODHOUND_ADMIN_PASSWORD}"
+      bhe_default_admin_email_address: "admin@lab.local"
+      bhe_default_admin_first_name: "Lab"
+      bhe_default_admin_last_name: "Admin"
+      bhe_recreate_default_admin: "true"
+
       # General settings
       bhe_log_level: INFO
       bhe_root_url: "http://localhost:${BLOODHOUND_PORT}"

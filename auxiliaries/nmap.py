@@ -15,12 +15,24 @@ the shared :mod:`utils.background_job` helper:
 This mirrors the proven sqlmap ``run_sqlmap`` / ``sqlmap_status`` shape
 and inherits the shared ``BackgroundJob`` machinery so amass/gobuster can
 do the same with a one-line ``launch_job`` call.
+
+NSE (Nmap Scripting Engine): nmap's installed script library
+(/usr/share/nmap/scripts, 600+ .nse files — smb-enum-shares, ldap-search,
+smb-vuln-ms17-010, ...) is fully available through ``run_nmap``'s
+``options`` string (``--script``, ``--script-args``). The
+``nmap_scripts`` tool lists what is actually installed (name + category +
+description) so the secretary never passes ``--script`` a script nmap
+would refuse to load — it resolves the installed script's real name
+first. The scripts' category keywords are folded into ``nmap_scripts``'s
+embedding text so "ldap search" / "smb enum" phrasings land on it.
 """
 
 from __future__ import annotations
 
+import os
 import re
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from constants import framework_tool
 from utils.background_job import launch_job, poll_job
@@ -85,8 +97,15 @@ def _nmap_target_argv(target: str) -> List[str]:
     "Launch and start a new Nmap port scan on a target, subnet, or CIDR "
     "range: discovers live hosts and enumerates open ports and services. "
     "Non-blocking and detached — starts the scan in the background and "
-    "returns immediately with a scan ID for later retrieval.",
-    next_hints=["nmap_status"],
+    "returns immediately with a scan ID for later retrieval. NSE scripts "
+    "(--script) run any of the 600+ installed .nse files — service enum "
+    "and version probes (smb-enum-shares, smb-enum-users, ldap-search, "
+    "ldap-rootdse), vulnerability checks (smb-vuln-ms17-010, "
+    "smb-vuln-ms08-067, ftp-vsftpd-backdoor), auth brute (smb-brute, "
+    "ldap-brute) — inline with the port scan; resolve the exact installed "
+    "script name with nmap_scripts first, then pass --script <name> in "
+    "options.",
+    next_hints=["nmap_status", "nmap_scripts"],
 )
 def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     """Launch nmap against ``target`` and return immediately.
@@ -103,8 +122,12 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     Args:
         target: The target host or IP address (or CIDR range).
         options: Additional nmap command-line options as a single string
-            (e.g. ``"-p- -sV -sC"``).  Quoted sub-phrases are preserved by
-            shlex.  ``-Pn`` is included by default.
+            (e.g. ``"-p- -sV"``).  Quoted sub-phrases are preserved by
+            shlex.  ``-Pn`` is included by default.  NSE scripts run via
+            ``--script`` (e.g. ``"-p445 --script smb-enum-shares"``,
+            ``"--script ldap-search --script-args searchFilter='...'"``);
+            verify the installed script name with ``nmap_scripts`` first
+            so nmap never refuses an unloadable name.
     """
     import shlex
 
@@ -149,3 +172,241 @@ def nmap_status(job_id: str) -> Dict[str, Any]:
         job_id: The ``job_id`` returned by ``run_nmap``.
     """
     return poll_job(job_id, tool_name="nmap")
+
+
+# --- NSE script discovery ----------------------------------------------------
+#
+# nmap's NSE library is a directory of .nse files (600+ on a stock Kali
+# install: smb-enum-shares, ldap-search, smb-vuln-ms17-010, ...).  The
+# secretary model cannot see that directory, so a request like "run an
+# ldap-search scan" has no hook: run_nmap's doc never mentioned --script
+# and nothing could list the installed scripts to confirm the exact name.
+# nmap_scripts closes that loop: it lists what IS installed (name +
+# category + description) so --script only ever receives loadable names.
+
+_SCRIPTS_DIR_CANDIDATES = (
+    "/usr/share/nmap/scripts",
+    "/usr/local/share/nmap/scripts",
+    "/usr/lib/nmap/scripts",
+)
+
+# Script name -> doc description, for scripts the model is most likely to
+# ask for by name.  Serves as a graceful fallback when a script's
+# machine-readable header is unparsable; the nmap --script-help path below
+# is the primary source of descriptions.
+_COMMON_SCRIPT_BRIEFS: Dict[str, str] = {
+    "smb-enum-shares": "enumerate SMB shares via null/credentialed sessions",
+    "smb-enum-users": "enumerate SMB user accounts",
+    "smb-enum-sessions": "enumerate active SMB sessions",
+    "smb-enum-domains": "enumerate SMB domains",
+    "smb-enum-groups": "enumerate SMB groups",
+    "smb-enum-processes": "enumerate processes over SMB",
+    "smb-enum-services": "enumerate services via SVCCTL",
+    "smb-ls": "list directory contents over SMB",
+    "smb-os-discovery": "fingerprint OS/version/domain over SMB",
+    "smb-security-mode": "report SMB signing and auth level",
+    "smb-protocols": "negotiate and list SMB protocol dialects",
+    "smb-vuln-ms08-067": "check MS08-067 Server service overflow",
+    "smb-vuln-ms17-010": "check MS17-010 EternalBlue/EternalRomance",
+    "smb-vuln-conficker": "check Conficker worm infection",
+    "smb-vuln-ms10-054": "check MS10-054 Server service DoS/RCE",
+    "smb-vuln-ms10-061": "check MS10-061 Print Spooler RCE (Stuxnet)",
+    "smb-vuln-ms06-025": "check MS06-025 RAS service overflow",
+    "smb-vuln-ms07-029": "check MS07-029 DNS RPC overflow",
+    "smb-vuln-cve2009-3103": "check SMBv2 Negotiate overflow (CVE-2009-3103)",
+    "smb-vuln-cve-2017-7494": "check Samba CVE-2017-7494 RCE",
+    "smb-vuln-webexec": "check WebEx Service RCE",
+    "smb-double-pulsar-backdoor": "check DoublePulsar SMB backdoor",
+    "smb-brute": "brute-force SMB username/password",
+    "smb-psexec": "run commands over SMB via psexec",
+    "smb-system-info": "pull system info over SMB",
+    "smb-mbenum": "query the master browser for a host list",
+    "smb2-security-mode": "report SMB2 signing/auth enforcement",
+    "smb2-capabilities": "report negotiated SMB2 capabilities",
+    "smb2-time": "report SMB2 server time (for kerberoasting windows)",
+    "smb2-vuln-uptime": "detect hosts missing MS17-010-era reboots",
+    "ldap-search": "search an LDAP tree with a custom filter (dump users/objects)",
+    "ldap-rootdse": "fetch the LDAP rootDSE (naming contexts, versions)",
+    "ldap-brute": "brute-force LDAP bind credentials",
+    "ldap-novell-getpass": "retrieve Novell universal passwords over LDAP",
+    "ftp-anon": "check anonymous FTP access",
+    "ftp-vsftpd-backdoor": "check vsftpd 2.3.4 backdoor",
+    "http-title": "grab HTTP page titles",
+    "http-enum": "enumerate common web paths",
+    "http-methods": "enumerate HTTP methods (OPTIONS)",
+    "banner": "grab a service banner",
+    "default": "metavalue — NOT a real script (default script selection)",
+    "*": "metavalue — NOT a real script (wildcard script selection)",
+}
+
+
+def _find_scripts_dir() -> Optional[Path]:
+    """Return the first existing NSE scripts directory, or None."""
+    override = os.getenv("NMAP_SCRIPTS_DIR")
+    if override and Path(override).is_dir():
+        return Path(override)
+    for cand in _SCRIPTS_DIR_CANDIDATES:
+        p = Path(cand)
+        if p.is_dir():
+            return p
+    return None
+
+
+@framework_tool(
+    "List, search, and describe the NSE (Nmap Scripting Engine) scripts "
+    "installed on this box: their exact script names for --script, their "
+    "NSE categories (auth, discovery, intrusive, vuln, safe, brute, ...), "
+    "and their descriptions. Query by substring or by category — e.g. "
+    "query 'smb' or category 'smb' for SMB enumeration/vuln scripts, "
+    "'ldap' for ldap-search/ldap-rootdse/ldap-brute. Resolve the exact "
+    "installed script name here BEFORE passing --script to run_nmap, so "
+    "nmap never refuses an unloadable name.",
+    next_hints=["run_nmap", "nmap_status"],
+)
+def nmap_scripts(
+    query: str = "", category: str = "", detail: bool = False, limit: int = 40
+) -> Dict[str, Any]:
+    """List the installed NSE scripts, optionally filtered.
+
+    Args:
+        query: Case-insensitive substring match against the script
+            name (e.g. ``"smb"``, ``"ldap-search"``).
+        category: NSE category filter (auth, broadcast, brute, default,
+            discovery, dos, exploit, external, fuzzer, intrusive,
+            malware, safe, version, vuln).  ``"smb"`` also works as a
+            category-style filter since smb-* scripts declare it.
+        detail: Fetch each matched script's ``--script-help`` description
+            from nmap itself (slower: one nmap invocation per batch, not
+            per script).
+        limit: Maximum scripts returned (default 40).
+
+    Returns a dict with ``scripts`` (name, categories, description),
+    ``total_installed``, and the scripts directory path.
+    """
+    import shutil
+    import subprocess as sp
+
+    scripts_dir = _find_scripts_dir()
+    if not scripts_dir:
+        return {
+            "error": ("no NSE scripts directory found (looked in "
+                      f"{', '.join(_SCRIPTS_DIR_CANDIDATES)}; override with "
+                      "NMAP_SCRIPTS_DIR) — nmap may not be installed"),
+            "scripts": [],
+            "total_installed": 0,
+        }
+
+    nmap_bin = shutil.which("nmap") or "nmap"
+
+    def _load_script(path: Path) -> Dict[str, Any]:
+        """Best-effort parse of one .nse: name, description, categories.
+
+        Real NSE files declare these as LUA ASSIGNMENTS, not comment
+        headers (verified against the installed library):
+        ``description = [[ ...long prose... ]]`` (multiline block string)
+        and ``categories = {"default", "discovery", "safe"}``.  The
+        ``-- @usage`` / ``-- @args`` comment tags carry invocation
+        examples.  Parse order: lua description block → categories table
+        → first @usage line.
+        """
+        name = path.stem
+        text = ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+
+        # description = [[ ... ]]  (lua long-string; may be [[ or [=[)
+        description = ""
+        m = re.search(
+            r"^\s*description\s*=\s*\[=*\[\s*(.*?)\s*\]=*\]\s*$",
+            text[:8192], re.S | re.M,
+        )
+        if m:
+            # First prose paragraph only — HTML tags stay out.
+            raw = re.sub(r"<[^>]+>", " ", m.group(1))
+            for para in raw.split("\n\n"):
+                cleaned = " ".join(para.split())
+                if len(cleaned) > 25:  # skip stub paragraphs
+                    description = cleaned
+                    break
+
+        # categories = { "a", "b", ... }
+        categories: List[str] = []
+        m = re.search(r"^\s*categories\s*=\s*\{(.*?)\}", text[:8192], re.S | re.M)
+        if m:
+            categories = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+
+        # @usage example (comment block) — the ready-made invocation line.
+        usage = ""
+        m = re.search(r"@usage\s*\n\s*(?:--\s*)?(.+)", text, re.M)
+        if m:
+            usage = m.group(1).strip()
+
+        return {
+            "name": name,
+            "categories": categories,
+            "description": (description[:400] if description
+                            else _COMMON_SCRIPT_BRIEFS.get(name, "")),
+            "usage": usage,
+        }
+
+    installed: List[Dict[str, Any]] = []
+    for p in sorted(scripts_dir.glob("*.nse")):
+        installed.append(_load_script(p))
+
+    ql = query.strip().lower()
+    cl = category.strip().lower()
+    matched = installed
+    if ql or cl:
+        matched = []
+        for s in installed:
+            name_l = s["name"].lower()
+            cats_l = [c.lower() for c in s["categories"]]
+            if ql and not (ql in name_l or any(ql in c for c in cats_l)
+                           or ql in (s["description"] or "").lower()):
+                continue
+            if cl and not (cl in cats_l or any(cl in c for c in cats_l)
+                           or cl in name_l):
+                continue
+            matched.append(s)
+
+    matched = matched[: max(1, int(limit))]
+
+    # Optional: pull real descriptions from nmap itself (one subprocess per
+    # batch, not per script — nmap --script-help takes a comma list).
+    if detail and matched:
+        try:
+            names = [s["name"] for s in matched[:15]]
+            proc = sp.run(
+                [nmap_bin, "--script-help", ",".join(names)],
+                capture_output=True, text=True, timeout=30,
+            )
+            # --script-help output blocks look like:
+            #   | smb-enum-shares
+            #   |   Attempts to list shares ... (indented prose)
+            # Split on the "| <name>" headers and attach each block to its
+            # script; unknown names are ignored.
+            blocks: Dict[str, List[str]] = {}
+            current = None
+            for line in (proc.stdout or "").splitlines():
+                hm = re.match(r"^\|\s*([a-z0-9_-]+)\s*$", line)
+                if hm:
+                    current = hm.group(1)
+                    blocks.setdefault(current, [])
+                elif current is not None and line.strip():
+                    blocks[current].append(line.strip())
+            for s in matched:
+                help_text = " ".join(blocks.get(s["name"], []))
+                if help_text:
+                    s["description"] = help_text[:400]
+        except (sp.TimeoutExpired, OSError):
+            pass
+
+    return {
+        "scripts": matched,
+        "total_installed": len(installed),
+        "scripts_dir": str(scripts_dir),
+        "hint": ("pass the exact name via run_nmap options, e.g. "
+                 "run_nmap(target, '-p445 --script smb-enum-shares')"),
+    }

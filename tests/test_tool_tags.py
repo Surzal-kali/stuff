@@ -298,7 +298,7 @@ def test_discovery_spot_capabilities():
     cap3 = manifests["auxiliaries.impacket_suite.secretsdump"].internal_semantic_capability
     assert cap3.endswith("Categories: net.services")
     assert len(manifests) >= 150
-    # 153/153 tagged now: every discovered tool carries at least one tag.
+    # 154/154 tagged now: every discovered tool carries at least one tag.
     untagged = [m.module_id for m in manifests.values() if not m.tags]
     assert not untagged, f"discovered tools with no tags: {untagged}"
 

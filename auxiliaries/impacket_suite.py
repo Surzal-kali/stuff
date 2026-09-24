@@ -117,7 +117,13 @@ def smb_enum_shares(target, username="", password="", domain=""):
         raise ScopeGateError(f"scope gate: {_sc_reason}")
 
     try:
-        conn = SMBConnection(target, target, remoteByName=False, timeout=10)
+        # Positional-only construction (remoteName, remoteHost) — the
+        # proven-working pattern (same as smb_scanner.check_null_session).
+        # NEVER pass remoteName=/remoteByName= as kwargs: remoteByName
+        # doesn't exist in impacket (TypeError), and remoteName=False
+        # collides with the first positional (TypeError "multiple values").
+        # Both variants shipped here historically and both TypeErrored.
+        conn = SMBConnection(target, target, timeout=10)
         if username:
             conn.login(username, password, domain)
         else:
@@ -163,7 +169,10 @@ def smb_read_file(target, share, path, username="", password="", domain="", max_
         raise ScopeGateError(f"scope gate: {_sc_reason}")
 
     try:
-        conn = SMBConnection(target, target, remoteName=False, timeout=10)
+        # Positional-only construction — see the note in smb_enum_shares:
+        # remoteName=False as a kwarg TypeErrors ("multiple values") because
+        # the first positional already fills remoteName.
+        conn = SMBConnection(target, target, timeout=10)
         if username:
             conn.login(username, password, domain)
         else:

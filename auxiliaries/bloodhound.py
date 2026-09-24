@@ -59,6 +59,15 @@ _BH_PRINCIPAL = os.getenv("BLOODHOUND_ADMIN_PRINCIPAL", "admin")
 _BH_PASSWORD = os.getenv("BLOODHOUND_ADMIN_PASSWORD", "")
 _TIMEOUT = (10.0, 120.0)
 
+# Loopback fallback for the host lane.  The container DNS name (``bloodhound``)
+# only resolves on the workbench network (inside open-terminal); on the host
+# lane BloodHound CE is reachable at the published host port instead.  The
+# client flips to this fallback on the first connection failure and stays
+# there (see BloodHoundClient._try_fallback), so one .env serves both lanes.
+_BH_FALLBACK_URL = (
+    f"http://127.0.0.1:{os.getenv('BLOODHOUND_PORT', '18080')}".rstrip("/")
+)
+
 # Output caps so large graph results don't blow up the model's context.
 _RESULT_NODE_CAP = 200
 _RESULT_EDGE_CAP = 200
@@ -104,8 +113,30 @@ class BloodHoundClient:
         self._token: Optional[str] = None
         self._token_ts: float = 0.0
 
+    def _try_fallback(self) -> bool:
+        """On connection failure, flip to the host-lane loopback URL.
+
+        Returns True if a fallback exists and we switched to it.  Sticky: once
+        flipped, every later request uses the fallback.  No-op when the
+        fallback IS the current base (container lane, where the fallback URL
+        is unreachable and retrying it would just burn the timeout).
+        """
+        if _BH_FALLBACK_URL and self.base != _BH_FALLBACK_URL:
+            self.base = _BH_FALLBACK_URL
+            return True
+        return False
+
     def _login(self) -> None:
-        """Authenticate and store the JWT token."""
+        """Authenticate and store the JWT token.
+
+        Payload shape: BloodHound CE builds since ~2026-09 require an explicit
+        ``login_method`` ("secret" = password auth) and take the principal as
+        ``username``.  Older builds used ``principal_name`` with no method
+        field and return 404 "resource not found" when ``login_method`` is
+        unknown (they only support the legacy shape).  We try the modern shape
+        first and fall back to the legacy shape on a 404 so both image
+        generations work.
+        """
         if not self.password:
             raise BloodHoundAPIError(
                 0,
@@ -113,18 +144,53 @@ class BloodHoundClient:
                 "in `docker logs bloodhound-server | grep 'Initial Password'`, "
                 "or set it after your first login change.",
             )
-        r = self.session.post(
-            f"{self.base}/api/v2/login",
-            json={
-                "principal_name": self.principal,
-                "password": self.password,
-            },
-            timeout=_TIMEOUT,
-        )
+        try:
+            r = self.session.post(
+                f"{self.base}/api/v2/login",
+                json={
+                    "login_method": "secret",
+                    "username": self.principal,
+                    "secret": self.password,
+                },
+                timeout=_TIMEOUT,
+            )
+        except requests.ConnectionError as e:
+            if not self._try_fallback():
+                raise BloodHoundAPIError(
+                    0,
+                    f"BloodHound unreachable at {self.base} — is the "
+                    f"container running? ({e})",
+                ) from e
+            # Fallback lane: retry the modern-shape login on the new base.
+            r = self.session.post(
+                f"{self.base}/api/v2/login",
+                json={
+                    "login_method": "secret",
+                    "username": self.principal,
+                    "secret": self.password,
+                },
+                timeout=_TIMEOUT,
+            )
+        if r.status_code == 404:
+            # Legacy image (pre-login_method): principal_name-only shape.
+            r = self.session.post(
+                f"{self.base}/api/v2/login",
+                json={
+                    "principal_name": self.principal,
+                    "password": self.password,
+                },
+                timeout=_TIMEOUT,
+            )
         if not r.ok:
             raise BloodHoundAPIError(r.status_code, f"login failed: {r.text[:500]}")
         data = r.json()
-        self._token = data.get("token") or data.get("access_token")
+        # Modern builds wrap the token: {"data": {"session_token": ...}}.
+        # Legacy builds returned a flat {"token": ...} / {"access_token": ...}.
+        self._token = (
+            (data.get("data") or {}).get("session_token")
+            or data.get("token")
+            or data.get("access_token")
+        )
         if not self._token:
             raise BloodHoundAPIError(0, "login response missing token field")
         self._token_ts = time.time()
@@ -146,6 +212,9 @@ class BloodHoundClient:
                 headers=self._auth_headers(), timeout=_TIMEOUT,
             )
         except requests.ConnectionError as e:
+            if self._try_fallback():
+                return self._request(method, path, params=params,
+                                     json_body=json_body, retry_auth=retry_auth)
             raise BloodHoundAPIError(
                 0,
                 f"BloodHound unreachable at {self.base} — is the container "
@@ -241,9 +310,24 @@ class BloodHoundClient:
         BloodHound CE's ``POST /api/v2/graphs/cypher`` returns a unified graph
         with nodes and edges arrays.  We cap the result so large queries don't
         overwhelm the model's context window.
+
+        Empty-result quirk (verified 2026-09-24 against the 2026-09
+        specterops/bloodhound build): this API returns **404 "resource not
+        found"** when a Cypher query matches zero rows — 200 for
+        ``MATCH (n) RETURN n LIMIT 1`` on a populated graph, 404 for
+        ``MATCH (d:Domain) ...`` on an empty one.  Normalized here to an
+        honest empty graph so callers see 0 nodes, not a hard failure.
         """
-        data = self._request("POST", "/api/v2/graphs/cypher",
-                             json_body={"query": cypher})
+        try:
+            data = self._request("POST", "/api/v2/graphs/cypher",
+                                 json_body={"query": cypher})
+        except BloodHoundAPIError as e:
+            if e.status_code == 404:
+                return {
+                    "nodes": [], "edges": [],
+                    "meta": {"empty_result_404": True},
+                }
+            raise
         return self._normalize_graph(data)
 
     def shortest_path(self, start_node: str, end_node: str,

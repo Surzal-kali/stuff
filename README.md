@@ -136,7 +136,7 @@ surfaces the tagged tools even when the tool's own prose never used that word.
   hit), and a tag change re-embeds the tool automatically on the next
   `python -m daharness.core` (the doc changes, which is the change signal).
 - Non-canonical tags are warned about (bootstrap/reindex log) but kept.
-- All 153 registry tools are tagged as of 2026-09-22 (`net.services` closed
+- All 154 registry tools are tagged as of 2026-09-24 (`net.services` closed
   the non-HTTP-service gap; port scanners stay `net.raw` — the scan lane —
   while `net.services` is for interacting with a discovered service).
 
@@ -170,7 +170,7 @@ is in your `PATH`.
 
 | Tool | Module | Notes |
 |---|---|---|
-| **Nmap** | `auxiliaries/nmap.py` | Port/service scanning |
+| **Nmap** | `auxiliaries/nmap.py` | Port/service scanning; NSE script library accessible via `--script` in options (`nmap_scripts` lists the 600+ installed scripts) |
 | **Masscan** | `auxiliaries/masscan.py` | Fast async port scanning; requires root or `CAP_NET_RAW` |
 | **OWASP Amass** | `auxiliaries/amass.py` | Subdomain enumeration (v5+; passive mode by default) |
 | **OWASP ZAP** | `auxiliaries/zap.py` | Web app scanning; launched in `-daemon` mode by `bootstrap.py` |
