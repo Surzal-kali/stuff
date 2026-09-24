@@ -204,12 +204,25 @@ class BloodHoundClient:
         self, method: str, path: str, *, params: Optional[dict] = None,
         json_body: Optional[dict] = None, retry_auth: bool = True,
     ) -> Any:
-        """Make an authenticated API request with one 401 retry."""
-        url = f"{self.base}{path}"
+        """Make an authenticated API request with one 401 retry.
+
+        ORDERING TRAP (fixed 2026-09-24): resolve the auth headers BEFORE
+        building the URL. ``_auth_headers()`` may call ``_login()``, which can
+        flip ``self.base`` to the fallback lane when the primary is down. If
+        the URL is built first (the old order), it stays pinned to the dead
+        primary even though auth just succeeded on the fallback — the request
+        then fires at the unresolvable host and produces the self-contradicting
+        error "unreachable at http://127.0.0.1:18080 (…Failed to resolve
+        'bloodhound'…)" (both halves true, opposite lanes). Auth stays inside
+        the try so a both-lanes-dead ConnectionError from ``_login()`` still
+        converts to the BloodHoundAPIError envelope the tools catch.
+        """
         try:
+            headers = self._auth_headers()
+            url = f"{self.base}{path}"
             r = self.session.request(
                 method, url, params=params, json=json_body,
-                headers=self._auth_headers(), timeout=_TIMEOUT,
+                headers=headers, timeout=_TIMEOUT,
             )
         except requests.ConnectionError as e:
             if self._try_fallback():
@@ -273,18 +286,33 @@ class BloodHoundClient:
         return ""
 
     def upload_file_chunk(self, job_id: str, file_path: str) -> Dict[str, Any]:
-        """Upload a file to an existing upload job."""
+        """Upload a file to an existing upload job.
+
+        Same ordering trap as ``_request``: auth headers are resolved first so
+        a fallback flip inside ``_login()`` is reflected in the URL that is
+        built below.
+        """
         p = Path(file_path)
         if not p.is_file():
             raise BloodHoundAPIError(0, f"file not found: {file_path}")
-        with open(p, "rb") as fh:
-            files = {"file": (p.name, fh, "application/octet-stream")}
-            r = self.session.post(
-                f"{self.base}/api/v2/file-upload/{job_id}",
-                files=files,
-                headers=self._auth_headers(),
-                timeout=_TIMEOUT,
-            )
+        try:
+            headers = self._auth_headers()
+            with open(p, "rb") as fh:
+                files = {"file": (p.name, fh, "application/octet-stream")}
+                r = self.session.post(
+                    f"{self.base}/api/v2/file-upload/{job_id}",
+                    files=files,
+                    headers=headers,
+                    timeout=_TIMEOUT,
+                )
+        except requests.ConnectionError as e:
+            if self._try_fallback():
+                return self.upload_file_chunk(job_id, file_path)
+            raise BloodHoundAPIError(
+                0,
+                f"BloodHound unreachable at {self.base} — is the container "
+                f"running? ({e})",
+            ) from e
         if not r.ok:
             raise BloodHoundAPIError(r.status_code, f"upload chunk failed: {r.text[:500]}")
         try:
