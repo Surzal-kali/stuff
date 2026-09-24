@@ -90,6 +90,12 @@ services:
     environment:
       - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
       - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+      # Chroma is reached on the compose network by service name + internal
+      # port (container listens on 8000; 9000 is only the host-published map).
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      # Ollama lives on the Windows lab host (10.10.10.128); /v1 = OpenAI-compat
+      - OLLAMA_BASE_URL=http://10.10.10.128:11434/v1
       # Point Open WebUI's file browser at the live production code bind mount
       # (..:/opt/framework) instead of the default `home` (/home/user). The
       # default root seeds the named volume with the open-terminal package's
@@ -105,7 +111,7 @@ services:
   # ─────────────────────────────────────────────────────────────────────────
   # Open WebUI — chat front end layered over the framework.
   # Reaches open-terminal at open-terminal:8000 (tools) and Ollama directly at
-  # 10.10.10.134:11434 (LLM, host lane enp92s0 — the lab-switch lane is routed
+  # 10.10.10.128:11434 (LLM, host lane enp92s0 — the lab-switch lane is routed
   # and SNATed downwind, so containers reach it through the host). Not behind
   # the open-terminal firewall — this is the open dev surface, not the gated
   # agent surface.
@@ -127,7 +133,7 @@ services:
     volumes:
       - open-webui-data:/app/backend/data
     environment:
-      - OLLAMA_BASE_URL=http://10.10.10.134:11434
+      - OLLAMA_BASE_URL=http://10.10.10.128:11434
       - OPEN_TERMINAL_API_KEY=${OPEN_TERMINAL_API_KEY}
       - WEBUI_URL_PREFIX=${WEBUI_URL_PREFIX}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
