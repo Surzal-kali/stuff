@@ -157,10 +157,15 @@ def normalize_arguments(arguments: Any) -> Tuple[Optional[dict], Optional[dict]]
 
 
 def _is_missing(val: Any) -> bool:
-    """Mirror agent._normalize_args_against_manifest's 'missing' semantics."""
+    """Mirror agent._normalize_args_against_manifest's 'missing' semantics.
+
+    2026-09-25 (F-032): an explicitly-supplied empty string is DATA, not
+    absence — ``db_connect(password: "")`` (empty-password credential probe)
+    must reach the tool.  Only None and empty containers count as missing;
+    string content (including "" and whitespace) is the caller's data and
+    the tool itself validates its semantics.
+    """
     if val is None:
-        return True
-    if isinstance(val, str) and not val.strip():
         return True
     if isinstance(val, (dict, list)) and len(val) == 0:
         return True
@@ -189,7 +194,9 @@ def validate_against_manifest(args: dict, manifest: Any) -> Optional[dict]:
     Returns None on pass or a rejection envelope. Checks, in order:
       1. unknown keys (skipped when the manifest declares no properties —
          open schema; caps from normalize_arguments still applied);
-      2. missing required keys (empty/whitespace containers count as missing);
+      2. missing required keys (None / empty containers count as missing;
+         explicitly-supplied strings — including "" — are data and pass:
+         F-032 empty-password probes, 2026-09-25);
       3. per-key tolerant type coercion + enum membership.
     Mutates ``args`` in place with coerced values (callers pass a fresh dict
     from normalize_arguments).

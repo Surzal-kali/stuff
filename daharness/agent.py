@@ -297,12 +297,13 @@ def _normalize_args_against_manifest(
     out = dict(args)  # shallow copy; values get replaced with coerced ones
 
     # 1. Check for required fields the model forgot entirely. Empty containers
-    #    (dict/list/str) also count as missing because the wrapper will have
-    #    nothing to dispatch on.
+    #    (dict/list) also count as missing because the wrapper will have
+    #    nothing to dispatch on.  2026-09-25 (F-032): an explicitly-supplied
+    #    empty STRING is DATA, not absence — db_connect's password: ""
+    #    (empty-password credential probe) must reach the tool; strings are
+    #    never 'missing' at the gateway, tools validate their own semantics.
     def _is_missing(val: Any) -> bool:
         if val is None:
-            return True
-        if isinstance(val, str) and not val.strip():
             return True
         if isinstance(val, (dict, list)) and len(val) == 0:
             return True

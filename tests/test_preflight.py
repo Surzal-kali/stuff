@@ -103,6 +103,40 @@ def test_missing_required_rejected():
     assert "targets" in rej["required"]
 
 
+def test_empty_string_required_arg_accepted():
+    """F-032 regression (2026-09-25): a required string supplied as '' is
+    DATA, not absence — db_connect(password: "") (empty-password credential
+    probe) must pass preflight.  Only None / empty containers are missing."""
+    _db_schema = {
+        "type": "object",
+        "properties": {
+            "db_type": {"type": "string"},
+            "host": {"type": "string"},
+            "password": {"type": "string"},
+        },
+        "required": ["db_type", "host", "password"],
+    }
+    assert preflight.validate_against_manifest(
+        {"db_type": "mysql", "host": "1.2.3.4", "password": ""},
+        _manifest(_db_schema),
+    ) is None
+    # Whitespace-only strings are data too (real passwords can be ' ').
+    assert preflight.validate_against_manifest(
+        {"db_type": "mysql", "host": "1.2.3.4", "password": " "},
+        _manifest(_db_schema),
+    ) is None
+    # Absent and None are still missing.
+    rej = preflight.validate_against_manifest(
+        {"db_type": "mysql", "host": "1.2.3.4"}, _manifest(_db_schema)
+    )
+    assert preflight.is_rejection(rej)
+    rej = preflight.validate_against_manifest(
+        {"db_type": "mysql", "host": "1.2.3.4", "password": None},
+        _manifest(_db_schema),
+    )
+    assert preflight.is_rejection(rej)
+
+
 def test_enum_violation_rejected():
     schema = {
         "type": "object",
