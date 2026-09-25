@@ -11,6 +11,9 @@ Kinds:
     ssh       - a paramiko SessionManager session  (id: ``sess-NNNN``) -> ``ssh:sess-0001``
     msf       - a Metasploit session (id: numeric)                 -> ``msf:1``
     listener  - a locally-bound listener service                    -> ``listener:tcp-4444``
+    collab    - the OOB collaborator listener                       -> ``collab:<id>``
+    db        - a direct-database connection (auxiliaries/db_client.py)
+              -> ``db:sess-0001``
 
 The kind prefix makes the namespace unforgeable as a string: an ``ssh:`` handle
 can never be silently passed to a Metasploit-only tool because the prefix will
@@ -32,7 +35,7 @@ HANDLE_SEPARATOR = ":"
 # The closed set of namespaces.  Adding a new session type means: (1) extend
 # this set, (2) emit handles from the creating tool, (3) declare
 # accepted_handle_kinds on the consuming tools.
-VALID_KINDS = {"ssh", "msf", "listener", "collab"}
+VALID_KINDS = {"ssh", "msf", "listener", "collab", "db"}
 
 
 def format_handle(kind: str, sid: str) -> str:
@@ -109,6 +112,7 @@ def validate_handle_for_tool(handle: str, accepted_kinds) -> Optional[str]:
             "msf": "Use interact_session / close_msf_session.",
             "listener": "Use close_listener to stop a bound listener.",
             "collab": "Use collab_stop to stop the collaborator listener.",
+            "db": "Use db_exec / db_close (db_schema_farm takes creds directly).",
         }.get(kind, "")
         return (
             f"Handle {handle!r} is kind '{kind}' but this tool accepts only "

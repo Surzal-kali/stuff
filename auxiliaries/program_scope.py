@@ -48,6 +48,7 @@ import json as _json
 import logging
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,8 +60,10 @@ from constants import framework_tool
 # When the framework is launched under sudo, the shell environment is stripped
 # and .env is never sourced.  Load it here as a module-level safety net so
 # H1_API_USERNAME / H1_API_TOKEN (and every other .env var) are available
-# regardless of entry point.  python-dotenv only sets vars that are not already
-# in os.environ, so explicit shell exports always win.
+# regardless of entry point.  override=True is deliberate (operator decision
+# 2026-09-25): the framework boots under sudo/root where shell exports don't
+# survive env_reset, so .env is the AUTHORITATIVE config channel and
+# intentionally stomps any inherited env.  Do NOT "fix" this to override=False.
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
@@ -157,7 +160,21 @@ def _fetch_all_pages(path: str, *, params: Optional[Dict[str, Any]] = None,
 
 def _scope_cache_path(handle: str, platform: str = "h1") -> Path:
     d = Path(os.getenv("WORKSPACE_ROOT", ".")) / "scope"
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Unwritable WORKSPACE_ROOT (sandboxed seat, rebuilt container, or a
+        # stale/stomped .env pointing at another user's home): degrade to a
+        # stable per-user tmp dir so cache reads/writes stay best-effort and
+        # never crash arm()/load_program_scope.  2026-09-25 regression: this
+        # mkdir was unconditional and killed arm() with a raw PermissionError
+        # (test_arm_requires_manifest) whenever WORKSPACE_ROOT pointed
+        # somewhere the runner cannot create.
+        d = Path(tempfile.gettempdir()) / "framework-scope-cache"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # even the fallback failed; callers' guards handle the miss
     name = handle if platform == "h1" else f"{platform}_{handle}"
     return d / f"{name}.json"
 
@@ -663,14 +680,30 @@ def _write_scope_file(manifest: Dict[str, Any]) -> Optional[str]:
         if p not in seen:
             seen.add(p)
             lines.append(p)
-    scope_path.write_text("\n".join(lines) + "\n")
+    try:
+        scope_path.write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        # Derived .scope file is best-effort: the manifest stays valid even
+        # when the workspace dir is unwritable (amass just gets no filter).
+        logging.getLogger(__name__).warning(
+            "scope file write failed (best-effort, ignored): %s", exc
+        )
+        return ""
     return str(scope_path)
 
 
 def _save_cache(handle: str, manifest: Dict[str, Any], platform: str = "h1") -> str:
-    p = _scope_cache_path(handle, platform)
-    p.write_text(_json.dumps(manifest, indent=2))
-    return str(p)
+    # Cache write is best-effort: a successful live fetch must not die just
+    # because the cache dir is unwritable (callers ignore this return).
+    try:
+        p = _scope_cache_path(handle, platform)
+        p.write_text(_json.dumps(manifest, indent=2))
+        return str(p)
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "scope cache write failed (best-effort, ignored): %s", exc
+        )
+        return ""
 
 
 def _load_cache(handle: str, platform: str = "h1") -> Optional[Dict[str, Any]]:

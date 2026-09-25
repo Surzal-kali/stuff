@@ -27,7 +27,9 @@ from daharness import _chat, ToolRegistry, OllamaEmbeddingFunction
 # When the framework is launched under sudo, the shell environment is stripped
 # and .env is never sourced.  Load it here so all env vars (H1 creds, ZAP,
 # gateway key, etc.) are available regardless of how the process is started.
-# python-dotenv only sets vars not already in os.environ, so shell exports win.
+# override=True is deliberate (operator decision 2026-09-25): .env is the
+# AUTHORITATIVE config channel — the stack boots under root where shell
+# exports don't survive env_reset.  Do NOT "fix" this to override=False.
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent / ".env", override=True)

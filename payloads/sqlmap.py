@@ -98,11 +98,20 @@ def _parse_verdict(log_text: str) -> Dict[str, Any]:
 @framework_tool(
     "Launch a sqlmap scan against a target URL in the background; returns a "
     "job_id you poll with sqlmap_status. Non-interactive (--batch is forced). "
-    "Use this for SQL injection testing.",
+    "Use this for SQL INJECTION testing through a web parameter. If you "
+    "already have valid database credentials, do NOT use this - the db_* "
+    "tools (db_connect / db_exec_batch / db_schema_farm, net.services) speak "
+    "the protocol directly and are faster, quieter and structured.",
     next_hints=["sqlmap_status"],
 )
 def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
     """Launch sqlmap against ``target_url`` and return immediately.
+
+    Lane note (2026-09-22): sqlmap = injection testing (attack verb). Direct
+    database access with known credentials is a different lane - use the
+    db_* tools in auxiliaries/db_client.py (db_connect / db_exec_batch /
+    db_schema_farm), which speak MySQL/MSSQL/PostgreSQL wire protocols with
+    the credentials and need no injectable parameter.
 
     sqlmap runs as a detached background subprocess writing to a per-job log
     file; this call does NOT block on the scan. Poll the result with
@@ -240,7 +249,9 @@ def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
 @framework_tool(
     "Poll a sqlmap scan job: returns running/done, a parsed injectable "
     "verdict, the detected DBMS, and recent log lines. Call until the "
-    "scan reports done.",
+    "scan reports done. The DBMS name in the verdict pairs with the direct "
+    "db_* tools (db_connect / db_schema_farm) once credentials are known - "
+    "sqlmap itself stays the injection lane only.",
     next_hints=["sqlmap_status", "report_finding"],
 )
 def sqlmap_status(job_id: str) -> Dict[str, Any]:
