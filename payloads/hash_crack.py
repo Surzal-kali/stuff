@@ -34,6 +34,19 @@ launch). Operator override hooks: ``JOHN_BIN=`` / ``HASHCAT_BIN=`` in the
 root-0600 ``.env`` via sudo — ``loaddotenv`` picks them up at the next
 stack boot.
 
+TMP HASHFILE LIFECYCLE (fixed 2026-09-26, see ledger): background runs
+spawn the cracker via ``launch_job`` (fire-and-forget) and then a daemon
+watcher thread unlinks the per-job hashfile AFTER the process exits. An
+earlier cleanup (operator commit a1fae22) unlinked in a ``finally``
+immediately after ``launch_job`` returned — i.e. before the cracker had
+opened the file. hashcat (6.2.6) treats a hashfile path that no longer
+exists as a single literal hash (``hashes_init_filename`` -> HL_MODE_ARG
+when ``hc_path_exist()`` is false) and parses the PATH STRING as a hash:
+for any ``hash:salt``-layout mode that is ``Hash
+'/tmp/hashes_*.txt': Separator unmatched`` + ``No hashes loaded.``
+(bare-hash modes report line-length/signature variants — same root
+cause).
+
 Scope-gate: NONE, deliberately — cracking is offline compute on recovered
 material.  Nothing here contacts a target or leaves the box (same class
 as ``crypto_kit``); engagement data cannot egress through these tools.
@@ -47,10 +60,11 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from constants import framework_tool
-from utils.background_job import launch_job, poll_job
+from utils.background_job import get_job, launch_job, poll_job
 
 _JOHN_CANDIDATES = ("/usr/sbin/john", "/usr/bin/john", "/usr/local/bin/john")
 _HASHCAT_CANDIDATES = (
@@ -93,9 +107,13 @@ def _preflight(env_var: str, name: str, candidates: Tuple[str, ...]) -> Optional
 def _write_hashfile(hash_input: str) -> str:
     """One hash per line; accepts newline, comma, or semicolon separation.
 
-    The tempfile is 0600 in /tmp and MUST be removed by the caller once the
-    cracker process has read it — cracked material should not linger
-    world-writable-adjacent.  See _drop_hashfile / the run_* call sites."""
+    The tempfile is 0600 in /tmp and is dropped only AFTER the cracker
+    process exits (see _launch_hash_crack's watcher thread) — cracked
+    material should not linger world-writable-adjacent, but deleting it
+    earlier raced the cracker's own file open (hashcat/john spend tens
+    to hundreds of ms in binary/library startup before reading the
+    file).  The blocking *_show paths (synchronous subprocess.run) drop
+    it in ``finally`` — the file is fully consumed there."""
     lines = [
         part.strip()
         for part in re.split(r"[\n;,]+", (hash_input or "").strip())
@@ -117,6 +135,113 @@ def _drop_hashfile(path: Optional[str]) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+def _cleanup_after_exit(proc: "subprocess.Popen", path: str) -> None:
+    """Watcher-thread body: drop the hashfile once the cracker process
+    exited.  The cracker has by then fully read the file (or failed on
+    its own); nothing races the child's file open."""
+    try:
+        proc.wait()
+    except Exception:  # noqa: BLE001 - a cleanup watcher must never raise
+        pass
+    _drop_hashfile(path)
+
+
+def _launch_hash_crack(
+    command: List[str],
+    hashfile: str,
+    *,
+    tool_name: str,
+    timeout: float,
+    verdict_parser,
+) -> Dict[str, Any]:
+    """``launch_job`` wrapper that owns the tmp-hashfile lifecycle.
+
+    launch_job returns the instant the child is SPAWNED — the child has
+    not opened the hashfile yet.  Unlinking right after launch (the
+    pre-2026-09-26 bug, operator commit a1fae22) deleted the file out
+    from under hashcat/john; hashcat then fell back to parsing the path
+    string itself as a literal hash -> ``Separator unmatched`` / ``No
+    hashes loaded.``.  So the file is dropped by a watcher thread after
+    the process exits.  The blocking ``*_show`` paths (synchronous
+    ``subprocess.run``) keep their ``finally`` drop — the file is fully
+    consumed there.
+
+    Residual: if the harness dies before the cracker exits, the daemon
+    watcher dies with it and the 0600 tempfile lingers in /tmp
+    (``hashes_*.txt``).  Never re-create the eager unlink to clean those
+    up — that re-opens the race; a stale-file sweep is an operator call.
+    """
+    try:
+        result = launch_job(
+            command,
+            tool_name=tool_name,
+            timeout=timeout,
+            verdict_parser=verdict_parser,
+        )
+    except BaseException:
+        # Popen itself failed — the child never ran, so the file was never
+        # handed off; safe to drop before propagating.
+        _drop_hashfile(hashfile)
+        raise
+    entry = get_job(result["job_id"])
+    proc = entry.get("proc") if entry else None
+    if proc is not None:
+        threading.Thread(
+            target=_cleanup_after_exit,
+            args=(proc, hashfile),
+            name=f"drop-{tool_name}-hashfile-{result['job_id']}",
+            daemon=True,
+        ).start()
+    else:
+        result["note"] = (
+            f"{result.get('note') or ''} hashfile cleanup deferred: job "
+            f"entry not found — 0600 tempfile left at {hashfile} "
+            "(safe to rm once the job is gone)"
+        ).strip()
+    return result
+
+
+# hashcat positional order is strict: [options] HASHFILE [dict|mask].
+# Options passed through ``options`` may carry their own positionals (the
+# mask after ``-a 3``, dicts after ``-a 1/6/7``); those must be re-located
+# AFTER the hashfile, or hashcat treats the mask/dict token as the hash
+# itself (HL_MODE_ARG again) and the real hashfile as the mask/dict —
+# ``Hash '?u?l...': ...``-class failures, zero hashes loaded.
+_OPT_VALUE_CONSUMERS = frozenset({
+    "-a", "--attack-mode", "-m", "--hash-type",
+    "-r", "--rules-file", "-j", "--rules-left", "-k", "--rules-right",
+    "-o", "--outfile", "--outfile-format", "-w", "--workload-profile",
+    "-n", "--kernel-accel", "-u", "--kernel-loops", "-d",
+    "--opencl-devices", "--increment-min", "--increment-max",
+    "--potfile-path", "--session", "--separator", "--runtime",
+    "--debug-mode", "--remove-timer",
+})
+
+
+def _split_hashcat_positionals(extra: List[str]) -> Tuple[List[str], List[str]]:
+    """Split ``extra`` into (options, positionals) for hashcat argv order.
+
+    Conservative: a token is a positional (mask/dict) when it does not
+    start with ``-`` and is not the value of a known value-taking option.
+    Inline ``--opt=value`` forms and bare flags are always options.
+    """
+    opts: List[str] = []
+    positionals: List[str] = []
+    expect_value = False
+    for tok in extra:
+        if expect_value:
+            opts.append(tok)
+            expect_value = False
+            continue
+        if tok.startswith("-"):
+            opts.append(tok)
+            if tok in _OPT_VALUE_CONSUMERS:
+                expect_value = True
+        else:
+            positionals.append(tok)
+    return opts, positionals
 
 
 def _default_wordlist() -> Optional[str]:
@@ -273,17 +398,16 @@ def run_john(
             "(-m 0 / -m 1000, GPU on this box), or pass explicit "
             "options with --format."
         )
-    try:
-        result = launch_job(
-            command,
-            tool_name="john",
-            timeout=_JOHN_TIMEOUT,
-            verdict_parser=_parse_john,
-        )
-    finally:
-        _drop_hashfile(hashfile)
+    result = _launch_hash_crack(
+        command,
+        hashfile,
+        tool_name="john",
+        timeout=_JOHN_TIMEOUT,
+        verdict_parser=_parse_john,
+    )
     if note:
-        result["note"] = note
+        prev = result.get("note")
+        result["note"] = f"{prev} | {note}" if prev else note
     return result
 
 
@@ -395,7 +519,10 @@ def run_hashcat(
         hash_input: One or more hashes (newline/comma/semicolon separated).
         mode: hashcat ``-m`` code — get it from suggest_crack_mode.
         options: Extra hashcat options (e.g. ``"-a 3 ?u?l?l?l?l?d?d"`` or
-            ``"-r rules/best64.rule"``).
+            ``"-r rules/best64.rule"``). Positionals inside options (a
+            mask, or dicts for -a 1/6/7) are automatically re-ordered to
+            come AFTER the hash file — hashcat requires
+            ``[options] hashfile [mask|dict]``.
         wordlist: Optional wordlist path; empty resolves the framework
             default (rockyou) and only applies in -a 0 mode.
     """
@@ -423,20 +550,23 @@ def run_hashcat(
             attack = extra[i + 1]
     if attack is None:
         extra = ["-a", "0", *extra]
-    command = [binp, "-m", str(int(mode)), *extra, hashfile]
+        attack = "0"
+    # hashcat wants [options] HASHFILE [dict|mask] — positionals hiding in
+    # ``options`` (a mask for -a 3, dicts for -a 1/6/7) must come AFTER the
+    # hashfile, never before it.
+    opt_only, positionals = _split_hashcat_positionals(extra)
+    command = [binp, "-m", str(int(mode)), *opt_only, hashfile, *positionals]
     if attack in (None, "0"):
         wl = wordlist or _default_wordlist()
         if wl:
             command.append(wl)
-    try:
-        return launch_job(
-            command,
-            tool_name="hashcat",
-            timeout=_HASHCAT_TIMEOUT,
-            verdict_parser=_parse_hashcat,
-        )
-    finally:
-        _drop_hashfile(hashfile)
+    return _launch_hash_crack(
+        command,
+        hashfile,
+        tool_name="hashcat",
+        timeout=_HASHCAT_TIMEOUT,
+        verdict_parser=_parse_hashcat,
+    )
 
 
 @framework_tool(

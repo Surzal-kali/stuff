@@ -24,6 +24,39 @@ if str(_FRAMEWORK_ROOT) not in sys.path:
 from constants import TransportType, framework_tool
 from listeners.execution_tracker import EXECUTION_TRACKER
 
+# --- dedicated tool-executor pool (2026-09-25 executor-starvation fix) -------
+#
+# Sync tools previously ran on ``loop.run_in_executor(None, ...)`` — the
+# DEFAULT pool, sized min(32, cpu+4) (≈6-8 threads inside the workbench
+# container). A wedged tool (an ssh_exec blocked on a command chain that
+# reads stdin or spawns a daemon child) pinned its thread forever; the OWUI
+# wrapper timed out at 600s, the model retried, and after 3-4 wedged calls
+# the pool was exhausted — every OTHER sync tool then queued forever and the
+# whole stack appeared frozen until the container was reset.
+#
+# A dedicated, larger pool isolates tool execution: wedged tool threads can
+# never starve the loop's default executor (DNS lookups, subprocess pipes,
+# library internals that also use it), and BRAIN_TOOL_EXECUTORS gives the
+# operator a concurrency dial.
+_TOOL_EXECUTOR: Optional["concurrent.futures.Executor"] = None
+
+
+def _tool_executor() -> "concurrent.futures.Executor":
+    """Lazily build the dedicated executor for sync tool execution.
+
+    Size: BRAIN_TOOL_EXECUTORS (default 16) — comfortably above the 6-8 the
+    default pool offered, small enough that a runaway secretary can't fork-
+    bomb the sidecar. Created once, on first sync-tool dispatch.
+    """
+    global _TOOL_EXECUTOR
+    if _TOOL_EXECUTOR is None:
+        import concurrent.futures
+        workers = max(4, int(os.getenv("BRAIN_TOOL_EXECUTORS", "16")))
+        _TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="brain-tool"
+        )
+    return _TOOL_EXECUTOR
+
 EVENT_HANDLERS = {}
 
 class FunctionRegistry:
@@ -585,7 +618,12 @@ async def dispatch(event, full_payload=None):
                             call = functools.partial(tool, **kwargs)
                         else:
                             call = functools.partial(tool, *args)
-                        fut = loop.run_in_executor(None, call)
+                        # Dedicated tool pool (2026-09-25): NOT the default
+                        # executor. A wedged sync tool pins its thread for the
+                        # ceiling duration (or forever for a thread the kill
+                        # path cannot reap); on the default pool that starved
+                        # every other sync tool after a few retries.
+                        fut = loop.run_in_executor(_tool_executor(), call)
                         EXECUTION_TRACKER.attach_future(exec_id, fut)
                         result = (
                             await asyncio.wait_for(fut, ceiling)

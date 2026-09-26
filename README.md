@@ -568,6 +568,10 @@ values; see `.env.example` for the full key list):
 | `MSF_RPC_PORT` | `55553` | Metasploit RPC port |
 | `MCP_ENDPOINT` | `http://127.0.0.1:55553` | Metasploit MCP sidecar endpoint |
 | `BRAIN_DISPATCH_TIMEOUT` | `600` | Brain socket dispatch timeout (seconds) |
+| `BRAIN_EXEC_CEILING` | `3600` | Hard cap on any single tool execution on the Brain (seconds; 0 = off) |
+| `BRAIN_TOOL_EXECUTORS` | `16` | Dedicated Brain thread-pool size for sync tool execution (isolates wedged tools from the default executor) |
+| `SSH_EXEC_TIMEOUT` | `300` | Per-command wall-clock cap for ssh_exec / ssh_exec_batch (seconds; 0 = unbounded). On timeout only the SSH channel is closed — the persistent session handle survives |
+| `SSH_EXEC_OUTPUT_CAP` | `262144` | Max stdout bytes kept per ssh_exec command before truncation |
 | `BRAIN_SCAN_DIRS` | `auxiliaries,listeners,payloads` | Directories the Brain scans at startup |
 | `WORKSPACE_ROOT` | current directory | Root for tool path resolution |
 | `GATEWAY_API_KEY` | — | API gateway authentication key (unset = dev mode) |

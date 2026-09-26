@@ -28,6 +28,7 @@ When to use this vs ``ssh_connect`` + ``ssh_exec``:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict, List
 
@@ -135,23 +136,53 @@ def ssh_exec_batch(
         }
 
     results: List[Dict[str, Any]] = []
+    # Per-command wall-clock cap (2026-09-25): batched chains share the hang
+    # shapes of single ssh_exec calls (stdin-waiting segments, daemon children
+    # holding the channel open). Without a cap one wedged command in the
+    # middle of a batch burned the whole batch — and, on the Brain, one
+    # executor thread per retry until the pool starved.
+    per_cmd_cap = float(os.getenv("SSH_EXEC_TIMEOUT", "300"))
+
     try:
         for idx, command in enumerate(commands):
             try:
-                stdin, stdout, stderr = client.exec_command(command)
-                out = stdout.read().decode("utf-8", errors="replace")
-                err = stderr.read().decode("utf-8", errors="replace")
-                # recv_exit_status blocks until the command finishes; -1
-                # means the channel closed before the exit code arrived.
-                exit_code = stdout.channel.recv_exit_status()
+                from utils.paramiko_client import (
+                    _SshExecTimeout,
+                    _run_ssh_command,
+                )
+
+                env = _run_ssh_command(client, command, timeout=per_cmd_cap)
                 entry: Dict[str, Any] = {
                     "command": command,
-                    "stdout": out,
-                    "exit_code": exit_code,
+                    "stdout": env.get("stdout") or "",
+                    "exit_code": env.get("exit_code"),
                 }
-                if err:
-                    entry["stderr"] = err
+                if env.get("stderr"):
+                    entry["stderr"] = env["stderr"]
+                if env.get("stdout_truncated"):
+                    entry["stdout_truncated"] = True
+                if env.get("timed_out"):
+                    entry["timed_out"] = True
+                    entry["error"] = (
+                        f"exceeded the {per_cmd_cap:.0f}s per-command cap "
+                        "(SSH_EXEC_TIMEOUT) and was terminated"
+                    )
+                if env.get("error"):
+                    entry["error"] = env["error"]
                 results.append(entry)
+            except _SshExecTimeout:
+                results.append(
+                    {
+                        "command": command,
+                        "stdout": "",
+                        "exit_code": None,
+                        "timed_out": True,
+                        "error": (
+                            f"exceeded the {per_cmd_cap:.0f}s per-command cap "
+                            "(SSH_EXEC_TIMEOUT) and was terminated"
+                        ),
+                    }
+                )
             except paramiko.SSHException as exc:
                 results.append(
                     {
