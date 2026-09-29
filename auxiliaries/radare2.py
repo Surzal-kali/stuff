@@ -54,10 +54,15 @@ traceback.  Every other command works without the plugin.
 
 Truncation
 ----------
-``izz`` (whole-file strings) and ``afl`` (function list) explode on
-fat/static binaries.  Output is capped at ``R2_OUTPUT_CAP`` bytes (default
-200 KiB) with a stated policy in the envelope so the model knows it is
-seeing a prefix, not the full result.
+``izz`` (whole-file strings), ``afl`` (function list), and fat ``pdf`` /
+``pdg`` blobs explode on obfuscated/fat binaries.  Output is capped at
+``R2_OUTPUT_CAP`` bytes (default 32 KiB — sized so one oversized result is
+a moderate ~8-11k-token slice of a 100k-token model context window; the old
+200 KiB default could eat 50k+ tokens in a single call).  Truncation keeps
+the head AND tail (2/3 : 1/3) with an explicit omission marker between
+them, so address-sorted listings (strings, function lists) stay informative
+at both ends.  The envelope states the policy (``truncated``,
+``truncation_policy``, ``omitted_bytes``).
 
 Binary drop folder
 ------------------
@@ -135,14 +140,47 @@ _FORBIDDEN_RE: re.Pattern = re.compile(
 _ADDR_HEX_RE: re.Pattern = re.compile(r"^0x[0-9a-fA-F]+$")
 _ADDR_FLAG_RE: re.Pattern = re.compile(r"^[A-Za-z0-9_.$\-]+$")
 
-# Output truncation cap (bytes).  Tunable via env so fat-binary runs can be
-# widened without a code change.
-_OUTPUT_CAP: int = int(os.getenv("R2_OUTPUT_CAP", str(200 * 1024)))
-_TRUNCATION_NOTE: str = (
-    f"output capped at {_OUTPUT_CAP} bytes (R2_OUTPUT_CAP env) — "
-    "this is a prefix, not the full result; narrow with addr/count or "
-    "use a more targeted command"
-)
+# Output truncation cap (bytes of decoded stdout; r2 output is ASCII, so
+# chars ≈ bytes).  Default sized so one oversized result is a moderate slice
+# of a 100k-token model context window (~8-11k tokens on asm/hex output)
+# instead of half the window — the old 200 KiB default could cost 50k+ model
+# tokens in a single call.  Tunable via env so fat-binary runs can be widened
+# without a code change; R2_OUTPUT_CAP=0 disables truncation entirely.
+_OUTPUT_CAP: int = int(os.getenv("R2_OUTPUT_CAP", str(32 * 1024)))
+
+
+def _truncate_output(raw: str, cap: int) -> Tuple[str, int]:
+    """Head+tail truncation with an explicit omission marker.
+
+    Returns ``(output, omitted_bytes)``.  Sub-cap (or disabled, ``cap <= 0``)
+    output passes through untouched.  Over cap: keep a 2/3 head and 1/3 tail
+    separated by a single-line marker stating exactly what was omitted and
+    how to narrow — sorted r2 listings (strings, function lists) stay
+    informative at both ends, and the dropped middle is what a targeted
+    ``addr``/``count`` query should pull instead.  The returned output is
+    always ≤ ``cap`` chars, even for pathological caps smaller than the
+    marker itself.
+    """
+    if cap <= 0 or len(raw) <= cap:
+        return raw, 0
+    omitted = len(raw) - cap
+    marker = (
+        f"\n[... r2 output truncated: {omitted} of {len(raw)} bytes omitted "
+        f"(cap {cap} bytes, R2_OUTPUT_CAP env) — head+tail shown; narrow "
+        f"with addr/count or a more targeted verb rather than raising "
+        f"the cap ...]\n"
+    )
+    if len(marker) >= cap:
+        # Pathological: cap too small to hold the marker.  Keep the output
+        # bounded (≤ cap) and still say truncation happened.
+        return marker[:cap], omitted
+    budget = cap - len(marker)
+    head = (budget * 2) // 3
+    tail = budget - head
+    out = raw[:head] + marker
+    if tail > 0:
+        out += raw[-tail:]
+    return out, omitted
 
 # r2 subprocess timeout (seconds).  aaa on a fat static binary can be slow.
 _R2_TIMEOUT: float = float(os.getenv("R2_TIMEOUT", "120"))
@@ -489,8 +527,10 @@ def _hints_for(command: str, output: str) -> List[str]:
     "iR, iz, izz, pdf, pdg, pd, px, axt, axf, ps) plus an optional addr "
     "(hex int like 0x401000 or flag name like sym.main) and optional count "
     "(for pd/px). Runs read-only against a temp copy of the binary; analysis "
-    "(aaa) is always prepended. Output is truncated with a stated policy on "
-    "fat binaries.",
+    "(aaa) is always prepended. Oversized output is head+tail-truncated to "
+    "a 32 KiB default cap (R2_OUTPUT_CAP env) with an omission marker and "
+    "stated policy — narrow with addr/count or a targeted verb instead of "
+    "raising the cap.",
     next_hints=["report_finding"],
 )
 def run_r2(
@@ -524,7 +564,8 @@ def run_r2(
             status        — "ok" | "error"
             command       — the composed r2 -c string that ran
             summary       — one-line human-readable result
-            output        — r2 stdout (truncated if over R2_OUTPUT_CAP)
+            output        — r2 stdout (head+tail-truncated if over R2_OUTPUT_CAP)
+            omitted_bytes — bytes omitted by truncation (0 when not truncated)
             stderr        — r2 stderr (captured separately, always present)
             exit_code     — r2 process exit code (int; -1 on launch failure)
             truncated     — bool
@@ -642,10 +683,16 @@ def run_r2(
         except OSError:
             pass
 
-    # --- truncation with stated policy ---
+    # --- truncation with stated policy (head+tail, omission-accounted) ---
     raw_out = proc.stdout or ""
-    truncated = len(raw_out) > _OUTPUT_CAP
-    output = raw_out[:_OUTPUT_CAP] if truncated else raw_out
+    output, omitted = _truncate_output(raw_out, _OUTPUT_CAP)
+    truncated = omitted > 0
+    truncation_policy = (
+        f"head+tail truncation: {omitted} of {len(raw_out)} bytes omitted "
+        f"(cap {_OUTPUT_CAP} bytes via R2_OUTPUT_CAP env); narrow with "
+        f"addr/count or a more targeted verb; raise R2_OUTPUT_CAP to widen"
+        if truncated else None
+    )
 
     # Strip r2's INFO/WARN noise from the summary view but keep it in output.
     clean_lines = [
@@ -665,7 +712,8 @@ def run_r2(
         "stderr": (proc.stderr or "").strip(),
         "exit_code": proc.returncode,
         "truncated": truncated,
-        "truncation_policy": _TRUNCATION_NOTE if truncated else None,
+        "truncation_policy": truncation_policy,
+        "omitted_bytes": omitted,
         "target": target,
         "r2ghidra": ghidra_ok,
         "next_hints": _hints_for(command, output),
@@ -693,6 +741,7 @@ def _err_envelope(
         "exit_code": -1,
         "truncated": False,
         "truncation_policy": None,
+        "omitted_bytes": 0,
         "target": target,
         "r2ghidra": ghidra,
         "next_hints": [],
