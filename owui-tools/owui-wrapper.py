@@ -52,7 +52,7 @@ class Tools:
         """Running-model id for agent naming, sanitized for use as an id.
         Sources, in order: the __model__ special param (dict with 'id'),
         then __metadata__ 'model_id' / 'model'. Empty when unavailable."""
-        if md is None:
+        if md is None:``
             md = getattr(self, "__metadata__", None) or {}
         model_id = ""
         if isinstance(__model__, dict):
