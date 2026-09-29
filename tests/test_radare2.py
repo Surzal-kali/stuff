@@ -265,22 +265,55 @@ class TestTempCopy:
 # Truncation
 # ---------------------------------------------------------------------------
 class TestTruncation:
-    def test_truncation_flag_set_when_over_cap(self, monkeypatch):
-        """Force a tiny cap and verify the truncated flag + policy note."""
+    """Head+tail truncation: marker, omission accounting, sub-cap passthrough."""
+
+    def test_subcap_output_passthrough(self):
+        from auxiliaries.radare2 import _truncate_output
+        out, omitted = _truncate_output("short", 1024)
+        assert out == "short"
+        assert omitted == 0
+
+    def test_overcap_keeps_head_and_tail_with_marker(self):
+        from auxiliaries.radare2 import _truncate_output
+        raw = "HEADMARK" + "x" * 2000 + "TAILMARK"
+        out, omitted = _truncate_output(raw, 400)
+        assert omitted == len(raw) - 400
+        assert out.startswith("HEADMARK")
+        assert out.endswith("TAILMARK")
+        assert f"{omitted} of {len(raw)} bytes omitted" in out
+        assert "R2_OUTPUT_CAP" in out
+        assert len(out) <= 400
+
+    def test_tiny_cap_output_still_bounded(self):
+        """Pathological cap (< marker length) must still bound the output."""
+        from auxiliaries.radare2 import _truncate_output
+        out, omitted = _truncate_output("y" * 100, 10)
+        assert len(out) <= 10
+        assert omitted == 90
+
+    def test_zero_cap_disables_truncation(self):
+        from auxiliaries.radare2 import _truncate_output
+        out, omitted = _truncate_output("y" * 100, 0)
+        assert out == "y" * 100
+        assert omitted == 0
+
+    def test_envelope_truncation_fields(self, crackme_bin, monkeypatch):
+        """Force a small cap and verify the envelope's truncation fields."""
         import auxiliaries.radare2 as mod
-        monkeypatch.setattr(mod, "_OUTPUT_CAP", 10)
-        # We need a real binary with >10 bytes of output. Use _validate_count
-        # logic indirectly — but easiest: just test the flag logic by mocking.
-        # Instead, verify the cap constant is respected by checking the policy
-        # string references the cap value.
-        assert "10" in mod._TRUNCATION_NOTE.replace(str(10), "10") or True
-        # The real test: _OUTPUT_CAP is used as the slice bound.
-        assert mod._OUTPUT_CAP == 10
+        monkeypatch.setattr(mod, "_OUTPUT_CAP", 400)
+        r = mod.run_r2(crackme_bin, "is")
+        assert r["status"] == "ok"
+        assert r["truncated"] is True
+        assert r["omitted_bytes"] > 0
+        assert "head+tail" in r["truncation_policy"]
+        assert str(400) in r["truncation_policy"]
+        assert len(r["output"]) <= 400
 
     def test_no_truncation_on_small_output(self, crackme_bin):
         r = run_r2(crackme_bin, "iI")
         assert r["truncated"] is False
         assert r["truncation_policy"] is None
+        assert r["omitted_bytes"] == 0
 
 
 # ---------------------------------------------------------------------------

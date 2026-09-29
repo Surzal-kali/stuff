@@ -586,6 +586,8 @@ values; see `.env.example` for the full key list):
 | `COLLAB_DNS_PORT` | `53` | OOB collaborator DNS port |
 | `COLLAB_PUBLIC_URL` | *(empty)* | Public HTTPS base URL for the collaborator (e.g. Tailscale Funnel `https://<host>.ts.net`); set = public path-based callback URLs + `/r/<id>?to=` 302 endpoint live |
 | `R2_BINARY_TARGETS_ROOT` | `binaries/` | Radare2 binary drop folder |
+| `R2_OUTPUT_CAP` | `32768` | run_r2 output cap in bytes; head+tail truncation with omission marker (`0` disables) |
+| `R2_TIMEOUT` | `120` | r2 subprocess wall-clock cap (seconds) |
 | `JADX_APK_TARGETS_ROOT` | `apk/` | jadx apk drop folder |
 | `JADX_BIN` | — | jadx launcher path (falls back to PATH; requires Java 11+ JRE) |
 | `JADX_TIMEOUT` | `900` | jadx subprocess wall-clock cap (seconds) |
