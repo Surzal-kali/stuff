@@ -54,8 +54,16 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # --- Framework services (as user) ---
-if [ -f "$FRAMEWORK_ROOT/listeners/thebrain.py" ]; then
-    echo "Starting Brain sidecar..." >&2
+# Brain sidecar: intentionally NOT started in the container lane (2026-09-28).
+# The host framework.service Brain is the primary; a second Brain here bid for
+# /tmp/brain.sock and produced a two-Brain race whenever the container
+# restarted. Tools executed through the container gateway then landed on the
+# container Brain, which sees the workbench-network DNS view (chroma, no
+# 127.0.0.1:18080) instead of the host's — so host-authored probe targets
+# answered differently depending on which Brain won the socket. The container
+# lane keeps only the API gateway :6000 (see dockered/start_gateway.py).
+if [ -f "$FRAMEWORK_ROOT/listeners/thebrain.py" ] && [ "${START_BRAIN_IN_CONTAINER:-0}" = "1" ]; then
+    echo "Starting Brain sidecar (opt-in via START_BRAIN_IN_CONTAINER=1)..." >&2
     cd "$FRAMEWORK_ROOT"
     gosu user "$VENV_PYTHON" listeners/thebrain.py &
     sleep 2

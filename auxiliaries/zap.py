@@ -459,13 +459,65 @@ class ZAPClient:
         budget.  The action session has NO retry, so a timeout surfaces
         immediately as a ``requests.exceptions.ReadTimeout`` instead of
         retrying 5× and freezing the stack for minutes.
+        Scheme fallback (2026-09-29): origin-form request lines are
+        scheme-forced to https first (see ``_ensure_https_scheme``). When
+        that forced attempt fails BEFORE any HTTP exchange — ZAP 2.17's
+        new sender turns a TLS/connect exception into an API-500
+        ``internal_error`` and a silent port into the synthetic zero
+        envelope — the request is retried ONCE over the scheme as written
+        (plain http → port 80 for origin-form lines). Nothing was
+        delivered by the failed attempt, so the retry cannot double-send.
+        Client-side timeouts are never retried: the request may already
+        be in flight.
         """
         _zap_scope_drift_guard()
-        raw_request = self._ensure_https_scheme(raw_request)
+        as_written = raw_request
+        wire = self._ensure_https_scheme(raw_request)
+        scheme_forced = wire != as_written
+        try:
+            resp = self._send_request_once(wire, follow_redirects, timeout)
+        except ZAPAPIError as first_err:
+            # Retry only for pre-HTTP failures: API-500 (the raised TLS/
+            # connect exception in ZAP 2.17, e.g. "SSLException:
+            # Unsupported or unrecognized SSL message" against a non-TLS
+            # :443) or the synthetic zero envelope.  The HTTP request
+            # never left in either case, so one as-written retry is
+            # side-effect safe.  Client timeouts (code "timeout") mean the
+            # request may already have been delivered — never retried.
+            fallback = scheme_forced and (
+                first_err.status_code >= 500 or first_err.code == "no_response")
+            if not fallback:
+                raise
+            try:
+                resp = self._send_request_once(as_written, follow_redirects, timeout)
+            except ZAPAPIError as retry_err:
+                raise ZAPAPIError(
+                    retry_err.status_code, retry_err.code,
+                    f"https send failed ({first_err.code}: "
+                    f"{first_err.message}); the request as written also "
+                    f"failed: {retry_err.message}"
+                ) from retry_err
+            resp["scheme_fallback"] = (
+                "https probe failed before any HTTP exchange (TLS "
+                "handshake/connect error) — retried once over the request "
+                "as written (origin-form → plain http, default port)."
+            )
+            return resp
+        return resp
+
+    def _send_request_once(self, request: str, follow_redirects: bool,
+                           timeout: float) -> Dict[str, Any]:
+        """One ``sendRequest`` attempt: returned envelope, or raise.
+
+        The synthetic zero-response envelope (target never spoke HTTP;
+        status line ``HTTP/1.0 0``) is raised as ``ZAPAPIError(0,
+        "no_response")`` so send_raw's scheme fallback treats it like any
+        other pre-HTTP failure.
+        """
         try:
             resp = self._get(
                 "core/action/sendRequest",
-                request=raw_request,
+                request=request,
                 followRedirects=str(follow_redirects).lower(),
                 timeout=timeout,
             )
@@ -483,27 +535,22 @@ class ZAPClient:
             # whose status line is "HTTP/1.0 0" and an empty body.  Surface
             # this as a clear error so the caller knows the target didn't
             # respond, rather than treating it as a successful empty page.
+            # The status TOKEN is compared, not the raw line: splitlines()
+            # strips \r, so a " 0\r" substring check can never match.
             rh = (resp or {}).get("responseHeader", "")
-            if rh and rh.splitlines() and " 0\r" in rh.splitlines()[0]:
+            first_line = rh.splitlines()[0] if rh.splitlines() else ""
+            toks = first_line.split()
+            status = toks[1] if len(toks) >= 2 else ""
+            if status == "0":
                 req_h = (resp or {}).get("requestHeader", "")
-                return {
-                    "error": (
-                        "ZAP sent the request but the target did not respond "
-                        f"(connection failed/timed out). ZAP returned a "
-                        f"synthetic zero-status response. Request: "
-                        f"{req_h.splitlines()[0] if req_h else '(unknown)'}"
-                    ),
-                    "response_status": "0",
-                    "requestHeader": req_h,
-                    "responseHeader": rh,
-                    "responseBody": "",
-                    "id": (resp or {}).get("id", ""),
-                }
+                first = req_h.splitlines()[0] if req_h else "(unknown)"
+                raise ZAPAPIError(
+                    0, "no_response",
+                    "ZAP sent the request but the target did not respond "
+                    "(connection failed/timed out). Synthetic zero-status "
+                    f"response for: {first}"
+                )
             return cast(Dict[str, Any], resp)
-        except ZAPAPIError:
-            # 400 Bad Request is returned if the raw request is malformed.
-            # Re-raise with the ZAP error body already in the message.
-            raise
         except requests.exceptions.Timeout as e:
             # The action session has no retry, so this fires once and
             # surfaces immediately.  Wrap it so the _zap_error_guard
@@ -541,6 +588,12 @@ class ZAPClient:
         exactly three whitespace-separated tokens), and origin-form
         requests that carry no Host header (there is nothing to derive
         the host from).
+
+        The https-default is safe against plain-http origins: send_raw
+        retries once over the as-written scheme when the forced attempt
+        fails before any HTTP exchange (TLS handshake error / silent
+        port), so origin-form requests land on the origin's plain http
+        port instead of surfacing a ZAP 500.
         """
         first, sep, rest = raw_request.partition("\n")
         if not sep:
@@ -941,6 +994,13 @@ _ZAP_ERROR_HINTS = {
         "is up and reachable from this host before retrying. "
         "Action endpoints are NOT retried (no double side-effects)."
     ),
+    "no_response": (
+        "ZAP sent the request but the target never spoke HTTP (closed "
+        "port, unreachable host, or a non-HTTP service on that port). "
+        "Scheme-forced https attempts are auto-retried over the request "
+        "as written before this error is surfaced — the origin is silent "
+        "on both the https and the as-written scheme."
+    ),
 }
 
 
@@ -969,7 +1029,11 @@ def _zap_error_guard(func):
                     f"verify the daemon is healthy (curl "
                     f"http://127.0.0.1:{ZAP_PORT}/JSON/core/view/version), "
                     f"and consider restarting ZAP or raising ZAP_XMX "
-                    f"(currently {_xmx}) if OOM-adjacent."
+                    f"(currently {_xmx}) if OOM-adjacent. If "
+                    f"/tmp/zap.log shows an SSLException/ConnectException "
+                    f"on sendRequest, the origin port does not speak the "
+                    f"scheme in the request line — write the line in "
+                    f"absolute form (GET http://host/path HTTP/1.1)."
                 )
             return {
                 "error": str(e),
@@ -1329,17 +1393,21 @@ def zap_send_raw(raw_request: str,
         raise ScopeGateError(f"scope gate: {_sc_reason}")
     # Model-written requests use \n; the wire needs \r\n. Normalize.
     wire = raw_request.replace("\r\n", "\n").replace("\n", "\r\n")
+    # Failures flow as ZAPAPIError -> _zap_error_guard structured dict.
+    # Scheme-forced https probes of non-TLS origins are auto-retried once
+    # over the scheme as written (plain http) inside send_raw; when the
+    # fallback fires the envelope carries a "scheme_fallback" note.
     env = _zap().send_raw(wire, follow_redirects=follow_redirects, timeout=timeout)
-    if env.get("error"):
-        return {"error": env["error"], "status": "Failed",
-                "response_status": env.get("response_status", "")}
-    return {
+    result = {
         "message_id": env.get("id", ""),
         "status": _status_from_headers(env.get("responseHeader", "")),
         "request_header": env.get("requestHeader", ""),
         "response_header": env.get("responseHeader", ""),
         "response_body": env.get("responseBody", ""),
     }
+    if env.get("scheme_fallback"):
+        result["scheme_fallback"] = env["scheme_fallback"]
+    return result
 
 
 # ---- protect-mode scope sync (2026-09-19) -----------------------------------

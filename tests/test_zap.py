@@ -24,6 +24,7 @@ import pytest
 # test (which would clobber a monkeypatched WORKSPACE_ROOT).
 import auxiliaries.program_scope  # noqa: F401
 
+import auxiliaries.zap as zap_module
 from auxiliaries.zap import ZAPClient, ZAPAPIError, _canonical, _status_from_headers
 
 
@@ -475,6 +476,137 @@ def test_spider_skips_set_option_when_default_depth(zap_client, monkeypatch):
 
     set_depth_calls = [c for c in calls if c[0] == "spider/action/setOptionMaxDepth"]
     assert len(set_depth_calls) == 0
+
+
+# --- Regression: https scheme-forcing vs plain-http origins (zap raw 500) ---
+#
+# 2026-09-29, 192.168.56.12 lab target: origin-form requests were
+# scheme-forced to https, ZAP TLS-handshook its lab-junk non-TLS :443
+# ("SSLException: Unsupported or unrecognized SSL message") and ZAP 2.17's
+# sender surfaced that as an API-500 internal_error. send_raw must retry
+# once over the scheme as written (plain http → port 80) instead.
+
+
+def test_send_raw_falls_back_to_as_written_scheme_on_zap_500(zap_client, monkeypatch):
+    """Forced-https ZAP-500 → exactly one as-written retry; success note."""
+    calls = []
+
+    def fake_get(view, **q):
+        calls.append(q["request"])
+        if q["request"].startswith("GET https://"):
+            raise ZAPAPIError(500, "internal_error", "Internal Error")
+        return {
+            "requestHeader": "GET / HTTP/1.1\r\nHost: 192.168.56.12\r\n\r\n",
+            "responseHeader": "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n",
+            "responseBody": "lab",
+            "id": "101",
+        }
+
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+    monkeypatch.setattr(zap_module, "_zap_scope_drift_guard", lambda: None)
+
+    out = zap_client.send_raw("GET / HTTP/1.1\nHost: 192.168.56.12\n\n")
+
+    assert len(calls) == 2
+    assert calls[0].startswith("GET https://192.168.56.12/ HTTP/1.1")
+    assert calls[1] == "GET / HTTP/1.1\nHost: 192.168.56.12\n\n"
+    assert out["id"] == "101"
+    assert "port 80" in out["scheme_fallback"] or "as written" in out["scheme_fallback"]
+
+
+def test_send_raw_no_fallback_for_absolute_form(zap_client, monkeypatch):
+    """Operator-written absolute-form https is an explicit scheme — a 500
+    must surface as-is, not trigger any retry."""
+    calls = []
+
+    def fake_get(view, **q):
+        calls.append(q["request"])
+        raise ZAPAPIError(500, "internal_error", "Internal Error")
+
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+    monkeypatch.setattr(zap_module, "_zap_scope_drift_guard", lambda: None)
+
+    with pytest.raises(ZAPAPIError):
+        zap_client.send_raw(
+            "GET https://192.168.56.12/ HTTP/1.1\nHost: 192.168.56.12\n\n")
+
+    assert len(calls) == 1
+
+
+def test_send_raw_no_retry_on_client_timeout(zap_client, monkeypatch):
+    """Client-side timeout (code "timeout") may mean the request was
+    delivered — never retried, even on a scheme-forced attempt."""
+    calls = []
+
+    def fake_get(view, **q):
+        calls.append(q["request"])
+        raise ZAPAPIError(0, "timeout", "sendRequest timed out")
+
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+    monkeypatch.setattr(zap_module, "_zap_scope_drift_guard", lambda: None)
+
+    with pytest.raises(ZAPAPIError) as ei:
+        zap_client.send_raw("GET / HTTP/1.1\nHost: slow.origin\n\n")
+
+    assert ei.value.code == "timeout"
+    assert len(calls) == 1
+
+
+def test_send_raw_zero_envelope_falls_back(zap_client, monkeypatch):
+    """Synthetic 'HTTP/1.0 0' envelope on the forced scheme → one as-written
+    retry (the status-token check actually detects it now; the old
+    " 0\\r" substring check was dead code — splitlines() strips \\r)."""
+    calls = []
+
+    def fake_get(view, **q):
+        calls.append(q["request"])
+        if q["request"].startswith("GET https://"):
+            return {
+                "requestHeader": "GET / HTTP/1.1\r\nHost: dead.port\r\n\r\n",
+                "responseHeader": "HTTP/1.0 0\r\n\r\n",
+                "responseBody": "",
+                "id": "9",
+            }
+        return {
+            "requestHeader": "GET / HTTP/1.1\r\nHost: dead.port\r\n\r\n",
+            "responseHeader": "HTTP/1.1 404 Not Found\r\n\r\n",
+            "responseBody": "nope",
+            "id": "10",
+        }
+
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+    monkeypatch.setattr(zap_module, "_zap_scope_drift_guard", lambda: None)
+
+    out = zap_client.send_raw("GET / HTTP/1.1\nHost: dead.port\n\n")
+
+    assert len(calls) == 2
+    assert out["id"] == "10"
+    assert out["scheme_fallback"]
+
+
+def test_send_raw_as_written_silent_target_raises_no_response(zap_client, monkeypatch):
+    """Origin silent on the as-written (absolute-form) scheme → no_response
+    raised; _zap_error_guard turns it into the structured error dict."""
+    calls = []
+
+    def fake_get(view, **q):
+        calls.append(q["request"])
+        return {
+            "requestHeader": "GET / HTTP/1.1\r\nHost: silent.target\r\n\r\n",
+            "responseHeader": "HTTP/1.0 0\r\n\r\n",
+            "responseBody": "",
+            "id": "11",
+        }
+
+    monkeypatch.setattr(zap_client, "_get", fake_get)
+    monkeypatch.setattr(zap_module, "_zap_scope_drift_guard", lambda: None)
+
+    with pytest.raises(ZAPAPIError) as ei:
+        zap_client.send_raw(
+            "GET http://silent.target/ HTTP/1.1\nHost: silent.target\n\n")
+
+    assert ei.value.code == "no_response"
+    assert len(calls) == 1  # absolute-form → no scheme forcing, no retry
 
 
 if __name__ == "__main__":

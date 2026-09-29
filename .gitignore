@@ -47,3 +47,5 @@ WIP_*.*
 !requirements.txt
 todo.md
 dockered/.env.save
+.vscode/*
+.github/*

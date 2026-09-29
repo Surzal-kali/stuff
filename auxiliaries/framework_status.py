@@ -145,20 +145,53 @@ def framework_health() -> Dict[str, Any]:
         "detail": f"127.0.0.1:{zap_port}" if zap_up else f"not listening on 127.0.0.1:{zap_port}",
     }
 
-    # BloodHound CE (workbench container; optional)
-    bh_host = "localhost"
-    bh_port = 8080
+    # BloodHound CE (optional subsystem; reachable by different paths per lane)
+    #   - container lane: Docker DNS name ``bloodhound`` on the workbench
+    #     network, internal port 8080.
+    #   - host lane: published port on loopback, ``127.0.0.1:$BLOODHOUND_PORT``.
+    # Mirror BloodHoundClient's fallback (auxiliaries/bloodhound.py:
+    # _BH_FALLBACK_URL) so the health verdict matches what the bh_* tools can
+    # actually reach. Candidate URLs: primary (BLOODHOUND_URL) first, then the
+    # loopback fallback (only when it differs from the primary host).
+    bh_candidates = [bh_url]
     try:
-        from urllib.parse import urlparse
-        parsed_bh = urlparse(bh_url)
-        bh_host = parsed_bh.hostname or "localhost"
-        bh_port = parsed_bh.port or 8080
+        bh_fallback_port = int(os.getenv("BLOODHOUND_PORT", "18080"))
+    except ValueError:
+        bh_fallback_port = 18080
+    bh_fallback = f"http://127.0.0.1:{bh_fallback_port}".rstrip("/")
+    try:
+        from urllib.parse import urlparse as _bh_urlparse
+        _bh_primary_host = (_bh_urlparse(bh_url).hostname or "").lower()
     except Exception:
-        pass
-    bh_up = _check_tcp(bh_host, bh_port)
+        _bh_primary_host = ""
+    if _bh_primary_host != "127.0.0.1":
+        bh_candidates.append(bh_fallback)
+    bh_up = False
+    bh_effective = None
+    _bh_probe_errors = []
+    for _bh_candidate in bh_candidates:
+        try:
+            _bh_parsed = _bh_urlparse(_bh_candidate)
+            _bh_host = _bh_parsed.hostname or "127.0.0.1"
+            _bh_port = _bh_parsed.port or 8080
+        except Exception:
+            _bh_host, _bh_port = "127.0.0.1", 8080
+        if _check_tcp(_bh_host, _bh_port):
+            bh_up = True
+            bh_effective = _bh_candidate
+            break
+        _bh_probe_errors.append(f"{_bh_host}:{_bh_port}")
+    if bh_up:
+        bh_detail = (
+            bh_effective
+            if bh_effective == bh_url
+            else f"{bh_effective} (host-lane fallback)"
+        )
+    else:
+        bh_detail = f"unreachable at {', '.join(_bh_probe_errors)}"
     subsystems["bloodhound"] = {
         "up": bh_up,
-        "detail": f"{bh_url}" if bh_up else f"unreachable at {bh_url}",
+        "detail": bh_detail,
     }
 
     # SQLite findings DB
