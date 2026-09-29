@@ -14,6 +14,7 @@ import pytest
 
 from utils.wordlists import (
     WORDLISTS_ROOT,
+    WORDLIST_SOURCES,
     COMMON_WORDLISTS,
     discover_wordlists,
     preflight_wordlists,
@@ -22,6 +23,20 @@ from payloads.wordlists import list_wordlists
 
 
 # --- fixtures ---------------------------------------------------------------
+
+@pytest.fixture
+def fake_sources(fake_tree, monkeypatch):
+    """Point the whole declared-source map at the fake tree (plus a second
+    source so the multi-source path is exercised)."""
+    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+    monkeypatch.setattr(
+        "utils.wordlists.WORDLIST_SOURCES",
+        {"wordlists": str(fake_tree), "absent-src": str(fake_tree / "nope")},
+    )
+    # payloads.wordlists re-exports the names it imported at module load;
+    # patch those views too where the tool reads them.
+    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
+    return fake_tree
 
 @pytest.fixture
 def fake_tree(tmp_path):
@@ -113,9 +128,7 @@ def test_discover_missing_root_yields_nothing(tmp_path):
 
 # --- list_wordlists tool -----------------------------------------------------
 
-def test_list_wordlists_catalog(fake_tree, monkeypatch):
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
-    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+def test_list_wordlists_catalog(fake_sources):
     r = list_wordlists()
     assert r["ok"] is True
     assert r["total"] == 3
@@ -124,19 +137,27 @@ def test_list_wordlists_catalog(fake_tree, monkeypatch):
     assert "Discovery/Web-Content" in r["by_category"]
     assert "Usernames" in r["by_category"]
     assert "rockyou.txt" in r["common_present"]
+    # multi-source reporting: the only existing bin is the faked main root
+    assert "wordlists" in r["by_source"]
+    assert r["sources_seen"] == ["wordlists"]
+    assert "absent-src" in r["sources_absent"]
 
 
-def test_list_wordlists_category_filter(fake_tree, monkeypatch):
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
-    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+def test_list_wordlists_source_filter(fake_sources):
+    """The source filter narrows by bin label (case-insensitive)."""
+    r = list_wordlists(source="wordlists")
+    assert r["total"] == 3  # all fake entries live in the main root bin
+    r_none = list_wordlists(source="nonexistent-bin")
+    assert r_none["total"] == 0
+
+
+def test_list_wordlists_category_filter(fake_sources):
     r = list_wordlists(category="passwords")  # case-insensitive
     assert r["total"] == 1
     assert r["wordlists"][0]["path"].endswith("rockyou.txt")
 
 
-def test_list_wordlists_limit_cap(fake_tree, monkeypatch):
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
-    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+def test_list_wordlists_limit_cap(fake_sources):
     r = list_wordlists(limit=2)
     assert r["total"] == 3
     assert r["returned"] == 2
@@ -147,7 +168,10 @@ def test_list_wordlists_limit_cap(fake_tree, monkeypatch):
 
 def test_list_wordlists_missing_root_warnings(tmp_path, monkeypatch):
     monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", tmp_path / "nope")
-    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", tmp_path / "nope")
+    monkeypatch.setattr(
+        "utils.wordlists.WORDLIST_SOURCES",
+        {"wordlists": str(tmp_path / "nope")},
+    )
     r = list_wordlists()
     assert r["ok"] is False
     assert r["total"] == 0
@@ -197,9 +221,7 @@ def test_resolve_wordlist_missing_returns_none(tmp_path):
     assert resolve_wordlist("nope/missing.txt", root=tmp_path) is None
 
 
-def test_list_wordlists_includes_defaults(fake_tree, monkeypatch):
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
-    monkeypatch.setattr("utils.wordlists.WORDLISTS_ROOT", fake_tree)
+def test_list_wordlists_includes_defaults(fake_sources):
     r = list_wordlists()
     assert set(r["defaults"].keys()) == {"ffuf", "hydra_logins", "hydra_passwords"}
     # fake_tree contains common.txt and top-usernames-shortlist.txt but NOT
