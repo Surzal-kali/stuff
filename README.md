@@ -37,6 +37,7 @@ by `search_tools` in the current conversation. A tool_id that was never
 surfaced is rejected — the model cannot hallucinate a tool into existence.
 
 The `daharness/` package exposes focused import paths:
+
 - `daharness.core` — backwards-compat shim re-exporting legacy public names
 - `daharness.agent` — secretary agent factory
 - `daharness.executor` — standalone execution helpers (no ChromaDB needed)
@@ -169,7 +170,7 @@ subprocess by the corresponding module; install the CLI binary and ensure it
 is in your `PATH`.
 
 | Tool | Module | Notes |
-|---|---|---|
+| --- | --- | --- |
 | **Nmap** | `auxiliaries/nmap.py` | Port/service scanning; NSE script library accessible via `--script` in options (`nmap_scripts` lists the 600+ installed scripts) |
 | **Masscan** | `auxiliaries/masscan.py` | Fast async port scanning; requires root or `CAP_NET_RAW` |
 | **OWASP Amass** | `auxiliaries/amass.py` | Subdomain enumeration (v5+; passive mode by default) |
@@ -190,8 +191,13 @@ is in your `PATH`.
 
 1. Install ZAP (`sudo apt install zaproxy` on Debian/Ubuntu/Kali — the plain
    `zap` package name does not resolve — or download from the official
-   site).
-2. Ensure the `zap` binary is in your PATH or at `/usr/share/zap/zap.sh`.
+   site).  Kali's package installs `/usr/bin/zaproxy` / `/usr/bin/owasp-zap`
+   (both wrappers for `/usr/share/zaproxy/zap.sh`); the plain-ZAP layout
+   (`zap` on PATH or `/usr/share/zap/zap.sh`) also works. For anything else,
+   set `ZAP_BIN` to the launcher path.
+2. The launcher is resolved automatically in the order: `$ZAP_BIN` → `zap` →
+   `zaproxy` → `owasp-zap` (all PATH) → `/usr/share/zaproxy/zap.sh` →
+   `/usr/share/zap/zap.sh`.
 3. The framework launches ZAP in `-daemon` mode (loopback-only API) and
    manages its configuration automatically. The home directory is pinned to
    `.zap_home/` in the workspace root. ZAP is never run as root — the
@@ -211,6 +217,7 @@ scope gate at the browser request-routing layer; passive subresources
 (img/css/font/media/script) are allowed from anywhere so pages render.
 
 1. Install the Python package and the Chromium browser binary:
+
    ```bash
    ./venv/bin/pip install playwright
    # IMPORTANT: install the browser INTO THE REPO (gitignored) so the path
@@ -219,6 +226,7 @@ scope gate at the browser request-routing layer; passive subresources
    PLAYWRIGHT_BROWSERS_PATH="$(pwd)/.pw-browsers" \
      ./venv/bin/python -m playwright install chromium
    ```
+
    The browser lands in `.pw-browsers/` (gitignored). The sidecar
    auto-resolves it from `$WORKSPACE_ROOT/.pw-browsers` (falling back to
    this module's repo root) and sets `PLAYWRIGHT_BROWSERS_PATH` at import —
@@ -244,7 +252,6 @@ scope gate at the browser request-routing layer; passive subresources
 3. `bootstrap.py` starts the MSF MCP sidecar (`msfrpcd`) automatically and
    vectorizes discovered modules into the tool registry.
 
-
 ### Docker deployment (`dockered/`)
 
 A containerized workbench lives in `dockered/` and bind-mounts the live
@@ -259,7 +266,7 @@ docker compose up -d --build
 Services:
 
 | Service | Host port | Notes |
-|---|---|---|
+| --- | --- | --- |
 | ChromaDB (`chroma`) | `9000` | Reuses the existing `chroma-data/` volume |
 | Open Terminal | `8000` | Codebase workbench: agent shell + file browser; hosts the framework gateway + Brain sidecar |
 | Open WebUI | `3000` | Chat front end; calls the framework via the tool wrappers in `owui-tools/` |
@@ -309,6 +316,7 @@ namespace) so the secretary can recall that a finding *exists* without
 bloating its context with the full evidence payload.
 
 Framework tools in `utils/findings.py`:
+
 - **`report_finding`** — the terminal action for any tool chain. Mints a
   structured finding and stores a one-line memory pointer.
 - **`render_findings`** — renders all findings as a markdown report (filters
@@ -327,6 +335,7 @@ machine-readable manifest the secretary and scan tools consult. Caches
 manifests to `scope/<handle>.json`.
 
 Framework tools:
+
 - **`load_program_scope`** — fetch (or load cached) program scope: in-scope
   assets (typed: URL/WILDCARD/DOMAIN/CIDR/IP/ANDROID/IOS/BLOCKCHAIN with
   `max_severity` and CIA requirements), out-of-scope assets, excluded
@@ -432,6 +441,7 @@ process — a REPL change takes effect immediately inside a running Brain.
 
 Gated calls fail CLOSED — a block raises `ScopeGateError`, which surfaces
 as `Failed` on both dispatch paths (Brain socket + in-process fallback):
+
 - **`check_send`** — packetcraft `send_packet` / `send_and_receive_packet`:
   the destination IP extracted from the crafted packet (v4/v6 dst, ARP
   `pdst`); the check runs BEFORE the probe fires.
@@ -442,6 +452,7 @@ as `Failed` on both dispatch paths (Brain socket + in-process fallback):
 
 Verdict tiers (first match wins; an out-of-scope match always beats an
 in-scope wildcard):
+
 1. **Operator allowlist** — `scope add-ip` blessings (authoritative,
    CDN-safe: the operator confirmed the IP belongs to an in-scope host).
 1b. **Operator-blessed hostnames** — `scope add-host <hostname> <ip>` maps a
@@ -522,6 +533,7 @@ in `schema.md`. The findings table shares this database.
 ### API Gateway (`api_gateway.py`)
 
 FastAPI server (port 5000) exposing:
+
 - `GET /health` — framework health check
 - `POST /tools/execute` — semantic tool lookup + execution
 - `POST /tools/search` — semantic tool search (no execution)
@@ -559,7 +571,7 @@ Environment variables (copy `.env.example` to `.env` and fill in real
 values; see `.env.example` for the full key list):
 
 | Variable | Default | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `OLLAMA_BASE_URL` | Lab lane fallback (`10.10.10.134`) | Ollama API endpoint — set explicitly in `.env` |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
@@ -648,6 +660,7 @@ approval if the gate is toggled on).
 
 1. Import `framework_tool` from `constants`.
 2. Decorate your function or class method:
+
    ```python
    from constants import framework_tool
 
@@ -655,6 +668,7 @@ approval if the gate is toggled on).
    def my_tool(target, port):
        ...
    ```
+
 3. Place the module under `auxiliaries/`, `listeners/`, or `payloads/`
    (the Brain's default scan dirs).
 4. Re-index or restart the Brain sidecar.

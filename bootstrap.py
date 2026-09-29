@@ -311,9 +311,30 @@ class FrameworkLoader:
         host = host or ZAP_HOST
         port = port or ZAP_PORT
 
-        zap_bin = shutil.which("zap") or "/usr/share/zap/zap.sh"
-        if not Path(zap_bin).exists():
-            logger.error("[!] ZAP launcher not found at %s", zap_bin)
+        # ZAP launcher resolution across distro layouts. Official tarball /
+        # older Debian: `zap` on PATH or /usr/share/zap/zap.sh. Kali (and
+        # modern Debian/Ubuntu zaproxy packages): /usr/bin/zaproxy and
+        # /usr/bin/owasp-zap -- both sh wrappers that `cd /usr/share/zaproxy`
+        # and `exec ./zap.sh "$@"`, so -daemon/-config args pass through
+        # unchanged. ZAP_BIN (env) wins over everything for non-standard
+        # installs. First existing candidate is used.
+        zap_candidates = [
+            os.getenv("ZAP_BIN", ""),
+            shutil.which("zap") or "",
+            shutil.which("zaproxy") or "",
+            shutil.which("owasp-zap") or "",
+            "/usr/share/zaproxy/zap.sh",
+            "/usr/share/zap/zap.sh",
+        ]
+        zap_bin = next(
+            (c for c in zap_candidates if c and Path(c).exists()), None
+        )
+        if not zap_bin:
+            logger.error(
+                "[!] ZAP launcher not found (tried: %s). Install zaproxy "
+                "(apt install zaproxy) or set ZAP_BIN to the zap.sh path.",
+                ", ".join(c or "<unset>" for c in zap_candidates),
+            )
             return
 
         # Daemon JVM heap — sized by $ZAP_XMX (default 512m, bump for large

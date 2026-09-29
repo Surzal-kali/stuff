@@ -1,6 +1,8 @@
 """OWASP ZAP HTTP API client + framework tools.
 
-Talks to a headless ZAP daemon (``zap.sh -daemon``) over its plain-HTTP API
+Talks to a headless ZAP daemon (launched via ``-daemon``; Kali's
+``zaproxy``/``owasp-zap`` wrappers and the upstream ``zap.sh`` both take the
+same flags) over its plain-HTTP API
 (loopback only). The daemon is launched by ``bootstrap.start_zap_daemon`` and
 exposes the API at ``http://127.0.0.1:<ZAP_PORT>`` with the configured
 ``ZAP_API_KEY`` sent as the ``apikey`` query parameter on every call.
@@ -855,11 +857,19 @@ class ZAPClient:
         """Generate a local report (html / xml / json / md). Returns the path.
 
         The ZAP ``reports`` add-on is NOT bundled into the daemon JAR --
-        a vanilla ``zap.sh -daemon`` invocation returns ``no_implementor``
-        (HTTP 400) for any /report/ endpoint. We detect that case and
-        return a structured error instead of letting the exception bubble,
-        so the model can suggest installing the add-on from the marketplace.
+        a vanilla daemon invocation returns ``no_implementor`` (HTTP 400)
+        for any /report/ endpoint. We detect that case and return a
+        structured error instead of letting the exception bubble, so the
+        model can suggest installing the add-on from the marketplace.
         """
+        _addon_hint = (
+            "ZAP reports add-on is not installed. The vanilla ZAP daemon "
+            "image does not bundle it. Run the daemon once with "
+            "`-addoninstall reports` (Kali: `zaproxy -daemon -addoninstall "
+            "reports`, plain ZAP: `zap.sh -daemon -addoninstall reports`) "
+            "to install, or fetch the reports add-on from the ZAP "
+            "marketplace, then restart the daemon."
+        )
         try:
             self._get(
                 "report/action/generate",
@@ -870,31 +880,13 @@ class ZAPClient:
         except ZAPAPIError as e:
             # 400 + body containing "no_implementor" -> add-on missing.
             if "no_implementor" in e.message:
-                return {
-                    "path": None,
-                    "error": (
-                        "ZAP reports add-on is not installed. The vanilla "
-                        "zap.sh -daemon image does not bundle it. Run "
-                        "`zap.sh -daemon -addoninstall reports` once to "
-                        "install, or fetch the reports add-on from the "
-                        "ZAP marketplace, then restart the daemon."
-                    ),
-                }
+                return {"path": None, "error": _addon_hint}
             raise
         except requests.exceptions.HTTPError as e:
             # Fallback for non-ZAP HTTP errors.
             if (e.response is not None
                     and "no_implementor" in (e.response.text or "")):
-                return {
-                    "path": None,
-                    "error": (
-                        "ZAP reports add-on is not installed. The vanilla "
-                        "zap.sh -daemon image does not bundle it. Run "
-                        "`zap.sh -daemon -addoninstall reports` once to "
-                        "install, or fetch the reports add-on from the "
-                        "ZAP marketplace, then restart the daemon."
-                    ),
-                }
+                return {"path": None, "error": _addon_hint}
             raise
         return {"path": report_file}
 
