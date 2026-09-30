@@ -33,9 +33,6 @@ def fake_sources(fake_tree, monkeypatch):
         "utils.wordlists.WORDLIST_SOURCES",
         {"wordlists": str(fake_tree), "absent-src": str(fake_tree / "nope")},
     )
-    # payloads.wordlists re-exports the names it imported at module load;
-    # patch those views too where the tool reads them.
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", fake_tree)
     return fake_tree
 
 @pytest.fixture
@@ -154,25 +151,46 @@ def test_list_wordlists_source_filter(fake_sources):
 def test_list_wordlists_category_filter(fake_sources):
     r = list_wordlists(category="passwords")  # case-insensitive
     assert r["total"] == 1
-    assert r["wordlists"][0]["path"].endswith("rockyou.txt")
+    # browse mode exposes the (sampled) entries under 'sample'
+    assert r["sample"][0]["path"].endswith("rockyou.txt")
+    # the same filter inside query mode returns them under 'wordlists'
+    rq = list_wordlists(query="rock", category="passwords")
+    assert rq["total"] == 1
+    assert rq["wordlists"][0]["path"].endswith("rockyou.txt")
+
+
+def test_list_wordlists_query_filters(fake_sources):
+    """query narrows to substrings over name/path/category/source."""
+    r = list_wordlists(query="rockyou")
+    assert r["mode"] == "query"
+    assert r["total"] == 1
+    assert r["wordlists"][0]["basename"] if False else r["wordlists"][0]["path"].endswith("rockyou.txt")
+    # by-bin: 'dirb' substring query is a no-match in this tree (fake bin is
+    # 'wordlists'), so total is 0 — the query path returns matches only.
+    r_dirb = list_wordlists(query="dirb")
+    assert r_dirb["query"] == "dirb"
+    assert r_dirb["total"] == 0
 
 
 def test_list_wordlists_limit_cap(fake_sources):
-    r = list_wordlists(limit=2)
+    r = list_wordlists(query="", limit=2)  # empty query == browse mode
+    # browse caps the SAMPLE at 10 and honors limit for the returned page
+    assert r["mode"] == "browse"
     assert r["total"] == 3
     assert r["returned"] == 2
-    assert r["limit_applied"] is True
-    # by_category is complete regardless of limit
+    # summaries are complete regardless of limit
     assert sum(r["by_category"].values()) == 3
+    # full catalog never dumped in browse mode: at most 10 entries
+    assert len(r["sample"]) <= 10
+    assert "wordlists" not in r  # no full-catalog key in browse mode
 
 
 def test_list_wordlists_missing_root_warnings(tmp_path, monkeypatch):
-    monkeypatch.setattr("payloads.wordlists.WORDLISTS_ROOT", tmp_path / "nope")
     monkeypatch.setattr(
         "utils.wordlists.WORDLIST_SOURCES",
         {"wordlists": str(tmp_path / "nope")},
     )
-    r = list_wordlists()
+    r = list_wordlists(query="rockyou")
     assert r["ok"] is False
     assert r["total"] == 0
     assert r["warnings"]
