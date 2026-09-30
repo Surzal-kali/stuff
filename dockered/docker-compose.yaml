@@ -64,14 +64,14 @@ services:
   # ─────────────────────────────────────────────────────────────────────────
   chroma:
     image: chromadb/chroma
-    command: ["run", "/config.yaml"]
+    command: [ "run", "/config.yaml" ]
     ports:
-      - "9000:8000"      # host 9000 -> container 8000 (matches existing mapping)
+      - "9000:8000" # host 9000 -> container 8000 (matches existing mapping)
     networks:
       workbench:
         ipv4_address: 172.28.0.10
     volumes:
-      - ../chroma-data:/data          # reuse the existing on-disk vector store
+      - ../chroma-data:/data # reuse the existing on-disk vector store
       - ./chroma-config.yaml:/config.yaml:ro
     restart: unless-stopped
 
@@ -80,8 +80,8 @@ services:
       context: ..
       dockerfile: dockered/open-terminal.Dockerfile
     ports:
-      - "8000:8000"    # Open Terminal API (connect Open WebUI here)
-      - "6000:6000"    # Framework REST + MCP gateway (debug from host)
+      - "8000:8000" # Open Terminal API (connect Open WebUI here)
+      - "6000:6000" # Framework REST + MCP gateway (debug from host)
     networks:
       workbench:
         ipv4_address: 172.28.0.20
@@ -104,8 +104,8 @@ services:
       # the terminal CWD, and the framework all agree on one workspace root.
       - OPEN_TERMINAL_FILE_BROWSER_ROOT=/opt/framework
     volumes:
-      - terminal-workspace:/home/user        # agent workspace (ephemeral files)
-      - /home/kali/github/stuff:/opt/framework       # live production code (bind mount, replaces COPY)
+      - terminal-workspace:/home/user # agent workspace (ephemeral files)
+      - /home/kali/github/stuff:/opt/framework # live production code (bind mount, replaces COPY)
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bloodhound"]
+      test: [ "CMD-SHELL", "pg_isready -U bloodhound" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -171,10 +171,16 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      # NOTE: cypher-shell (a full JVM launch, ~7-17s cold) blows past a 5s
+      # timeout and gets SIGKILLed every 10s interval — that alone kept the
+      # container permanently "unhealthy" AND burned CPU spinning JVMs. Probe
+      # the HTTP interface instead (55ms) with retries + start_period to ride
+      # out the (often 60s+) initial graph startup.
+      test: [ "CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7474 || exit 1" ]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 30
+      start_period: 180s
 
   bloodhound:
     image: specterops/bloodhound:latest
