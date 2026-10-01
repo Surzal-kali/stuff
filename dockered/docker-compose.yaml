@@ -140,101 +140,11 @@ services:
 
     restart: unless-stopped
 
-  postgres:
-    image: postgres:18
-    container_name: bloodhound-postgres
-    networks:
-      - workbench
-    environment:
-      POSTGRES_USER: bloodhound
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: bloodhound
-    volumes:
-      - postgres_data:/var/lib/postgresql
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U bloodhound" ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  neo4j:
-    image: neo4j:4.4-community
-    container_name: bloodhound-neo4j
-    networks:
-      - workbench
-    environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
-      NEO4J_dbms_memory_pagecache_size: 512M
-      NEO4J_dbms_memory_heap_initial__size: 512M
-      NEO4J_dbms_memory_heap_max__size: 1G
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-    healthcheck:
-      # NOTE: cypher-shell (a full JVM launch, ~7-17s cold) blows past a 5s
-      # timeout and gets SIGKILLed every 10s interval — that alone kept the
-      # container permanently "unhealthy" AND burned CPU spinning JVMs. Probe
-      # the HTTP interface instead (55ms) with retries + start_period to ride
-      # out the (often 60s+) initial graph startup.
-      test: [ "CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7474 || exit 1" ]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 180s
-
-  bloodhound:
-    image: specterops/bloodhound:latest
-    container_name: bloodhound-server
-    networks:
-      - workbench
-    depends_on:
-      postgres:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    environment:
-      # BloodHound CE reads DB config via individual field env vars (see
-      # cmd/api/src/config/config_test.go in SpecterOps/BloodHound). Using
-      # the field vars (bhe_database_*, bhe_neo4j_*) instead of a full
-      # connection string avoids URL-encoding issues when the password
-      # contains URI-special characters like '@'.
-      bhe_database_addr: "postgres:5432"
-      bhe_database_username: "bloodhound"
-      bhe_database_secret: "${POSTGRES_PASSWORD}"
-      bhe_database_database: "bloodhound"
-      bhe_neo4j_addr: "neo4j:7687"
-      bhe_neo4j_username: "neo4j"
-      bhe_neo4j_secret: "${NEO4J_PASSWORD}"
-      bhe_neo4j_database: "neo4j"
-
-      # Default admin credentials (2026-09-24 lockout recovery): the admin
-      # password is owned by BLOODHOUND_ADMIN_PASSWORD in .env — no more
-      # banner hunting in container logs. ALL five fields must be non-empty
-      # or BloodHound ignores them and randomizes the password
-      # (FillAndPopulateDefaultAdminInfo, cmd/api/src/bootstrap/server.go).
-      # bhe_recreate_default_admin=true deletes + recreates the admin user on
-      # EVERY boot — REMOVE it once login is confirmed, or any UI-side
-      # password change gets silently reverted on restart.
-      bhe_default_admin_principal_name: "admin"
-      bhe_default_admin_password: "${BLOODHOUND_ADMIN_PASSWORD}"
-      bhe_default_admin_email_address: "admin@lab.local"
-      bhe_default_admin_first_name: "Lab"
-      bhe_default_admin_last_name: "Admin"
-      bhe_recreate_default_admin: "true"
-
-      # General settings
-      bhe_log_level: INFO
-      bhe_root_url: "http://localhost:${BLOODHOUND_PORT}"
-    ports:
-      # Pulls port variable dynamically while maintaining your safe port layout
-      - "127.0.0.1:${BLOODHOUND_PORT}:8080"
-    restart: always
 volumes:
   terminal-workspace:
   open-webui-data:
-  postgres_data:
-  neo4j_data:
-  neo4j_logs:
+
 
 networks:
   workbench:
