@@ -13,8 +13,8 @@ working **on** the codebase.
 ### Tool Secretary (`daharness/`)
 
 The core agent loop lives in `daharness/agent.py`. A local Ollama model
-(default `hf.co/unsloth/GLM-4.7-Flash-GGUF:Q3_K_M`, override via
-`SECRETARY_MODEL`) is given two tools via a `FunctionToolset`:
+(default `ornith-1.5:35b`, override via `SECRETARY_MODEL`) is given two
+tools via a `FunctionToolset`:
 
 - **`search_tools`** — semantic search over the ChromaDB tool registry.
   Returns full manifests. Every result is recorded in
@@ -22,7 +22,9 @@ The core agent loop lives in `daharness/agent.py`. A local Ollama model
 - **`execute_tool`** — runs a surfaced tool. Declared
   `requires_approval=True`, so pydantic-ai pauses the run with
   `DeferredToolRequests`. The confirmer sees the full manifest + arguments
-  and must approve before execution proceeds.
+  and must approve before execution proceeds. This gate is internal to the
+  secretary lane: tool calls through the API gateway or MCP endpoint bypass
+  it — an integrating harness that wants sign-off adds its own layer.
 
 **Grounding rule:** `execute_tool` rejects any `tool_id` not in
 `SecretaryDeps.surfaced_tools`. Even if the tool exists in the registry, the

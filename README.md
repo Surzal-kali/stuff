@@ -3,9 +3,15 @@
 A headless, MCP-capable orchestration harness for security research and
 bug-bounty automation. A small local LLM (the "tool secretary") semantically
 searches a vector-indexed tool registry, selects the right module for a
-natural-language request, and executes it. An optional human-in-the-loop
-approval gate can be toggled on so every execution pauses for operator
-sign-off; the framework runs without it by default.
+natural-language request, and executes it. Inside the harness, every
+execution pauses for human-in-the-loop sign-off: the operator sees the full
+tool manifest and arguments before approving, and only an approved tool
+actually runs. (This gate is an internal-harness feature — the API gateway
+and MCP lanes bypass it unless the harness you're integrating adds its own
+approval layer.) Large tool outputs stay out of the model's context window
+via a result-projection middleman (`full` | `digest` | `page` — `digest` by
+default) that stores the raw evidence in a durable scratch store and hands
+the model a compact envelope instead.
 
 The framework follows a "hybrid glue" architecture: Python handles
 orchestration, agent loops, and API surfaces; C/C++ handles performance-critical
@@ -21,16 +27,26 @@ secretary model and gated by scope-compliance and reportability checks.
 ### Tool Secretary (`daharness/`)
 
 The core of the framework. A local LLM (Ollama; `SECRETARY_MODEL`, default
-'Qwen3.8:27b') acts as a conversational agent with two tools:
+`ornith-1.5:35b`) acts as a conversational agent with two tools:
 
 1. **`search_tools`** — semantic search over the tool registry (ChromaDB,
    `nomic-embed-text` embeddings, HNSW cosine similarity). Returns full tool
    manifests.
-2. **`execute_tool`** — runs a surfaced tool. An **opt-in human approval**
-   gate (`requires_approval=True` on the tool) can pause the run so the
-   operator sees the full manifest + arguments and approves or denies before
-   execution proceeds. The gate is off by default; toggle it on per-tool or
-   globally when you want sign-off on every execution.
+2. **`execute_tool`** — runs a surfaced tool. It is declared
+   `requires_approval=True`, so the run **always pauses** with pydantic-ai's
+   `DeferredToolRequests`: the confirmer shows the operator the full
+   manifest + arguments and execution proceeds only on approval
+   (`run_secretary()` resumes the loop with the same `deps` + message
+   history), capped at `SECRETARY_MAX_APPROVAL_ROUNDS` rounds per turn.
+   After an approved execution a framework-log tail (Brain/MSF) can be
+   appended to the result for visibility
+   (`POST_EXECUTION_LOGS`: `off` | `failures` | `always`, default
+   `failures`), and the result passes through the projection middleman
+   before it enters context (see
+   [Result Projection](#result-projection-utilsresult_projectionpy)).
+
+   This gate is internal to the secretary lane — tool calls that arrive
+   through the API gateway or the MCP endpoint skip it entirely.
 
 **Grounding rule:** the secretary can only execute tools it has seen returned
 by `search_tools` in the current conversation. A tool_id that was never
@@ -92,31 +108,48 @@ becomes the semantic capability description that the registry embeds.
 - **`auxiliaries/ssh_exec.py`** — **BRAIN_DISPATCH**: SSH batch command execution on a persistent connection
 - **`auxiliaries/smb_scanner.py`** — **BRAIN_DISPATCH**: SMB null session vulnerability scanning
 - **`auxiliaries/cert_tools.py`** — **BRAIN_DISPATCH**: TLS certificate generation/clearing for the OOB collaborator
-- **`auxiliaries/framework_status.py`** — **BRAIN_DISPATCH**: Framework operational health check (Brain, Ollama, ChromaDB, ZAP, BloodHound)
-- **`auxiliaries/bloodhound.py`** — **BRAIN_DISPATCH**: BloodHound CE AD graph analysis (login, ingest, Cypher query, query templates, entity lookup, attack path discovery)
+- **`auxiliaries/archived_urls.py`** — **BRAIN_DISPATCH**: Passive archived-URL discovery via the Wayback Machine CDX API (bounty-relevant triage: interesting files, parameterized URLs)
+- **`auxiliaries/cors_probe.py`** — **BRAIN_DISPATCH**: CORS posture + security-header audit (attacker-controlled `Origin` reflection and `null`-origin checks) via the per-hop scope-gated HTTP client
+- **`auxiliaries/db_client.py`** — **BRAIN_DISPATCH**: Direct-database connect + enumerate with KNOWN credentials (MySQL via pymysql, PostgreSQL via pg8000) — deliberately not the injection lane, which is sqlmap's
+- **`auxiliaries/dns_lookup.py`** — **BRAIN_DISPATCH**: Forward/reverse DNS resolution feeding the scope workflow (IP blessing; not scope-gated — it never touches the target)
+- **`auxiliaries/ftp_recon.py`** — **BRAIN_DISPATCH**: FTP/SFTP recon and transfer (banner, anonymous check, listings, authenticated get/put)
+- **`auxiliaries/framework_status.py`** — **BRAIN_DISPATCH**: Framework operational health check (Brain, Ollama, ChromaDB, ZAP, findings DB)
+- **`auxiliaries/playwright_recon.py`** — **BRAIN_DISPATCH**: Scope-gated rendered-DOM recon (client for the Playwright sidecar)
+- **`auxiliaries/playwright_sidecar.py`** — **Service**: Headless-Chromium sidecar enforcing the operator-armed scope gate at the browser request-routing layer (opt-in via `PLAYWRIGHT_SIDECAR=1`)
+- **`auxiliaries/ssrf_probe.py`** — **BRAIN_DISPATCH**: Parametric SSRF fuzzer that grades responses and out-of-band callbacks (optionally the collaborator's public redirect endpoint)
+- **`auxiliaries/tls_info.py`** — **BRAIN_DISPATCH**: TLS certificate + protocol posture inspection (subject/SANs, versions, ciphers, expiry runway)
+- **`auxiliaries/web_login_brute.py`** — **BRAIN_DISPATCH**: Session-aware web-login brute-forcing for CSRF-protected form endpoints (token reuse per session)
+- **`auxiliaries/web_probe.py`** — **BRAIN_DISPATCH**: Concurrent web-surface prober — turns open ports into live HTTP intel (status, title, stack fingerprints) in one envelope
 - **`payloads/metasploiting.py`** — **BRAIN_DISPATCH / MCP_RPC**: Metasploit module search, execution, session polling, interaction
 - **`payloads/ffuf.py`** — **BRAIN_DISPATCH**: ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel)
 - **`payloads/hydra.py`** — **BRAIN_DISPATCH**: Hydra credential brute-force / password-spray (launch/poll/cancel)
 - **`payloads/sqlmap.py`** — **BRAIN_DISPATCH**: sqlmap SQL injection detection (launch/poll with injectable verdict parsing)
 - **`payloads/searchsploiting.py`** — **BRAIN_DISPATCH**: searchsploit (ExploitDB) lookup for known exploits
 - **`payloads/fastcgi.py`** — **BRAIN_DISPATCH**: FastCGI/PHP-FPM exploitation (raw request + php://input RCE chain)
-- **`payloads/wordlists.py`** — **BRAIN_DISPATCH**: Discover and list available wordlist files
+- **`payloads/hash_crack.py`** — **BRAIN_DISPATCH**: john the Ripper + hashcat password cracking (hash-string mode suggestion; `run_*`/`*_status`/`*_show` background-job triplets)
+- **`payloads/js_recon.py`** — **BRAIN_DISPATCH**: Static JavaScript recon — API routes and secrets extracted from pages and bundles (no browser, no heavy deps)
+- **`payloads/wordlists.py`** — **BRAIN_DISPATCH**: Query-based wordlist discovery over the source tree including Kali's symlinked folders (feeds ffuf/hydra)
 - **`utils/findings.py`** — **BRAIN_DISPATCH**: Report, render, close, and supersede structured security findings
 - **`utils/paramiko_client.py`** — **BRAIN_DISPATCH**: Persistent SSH (connect/exec/shell/close) + one-shot mode
 - **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, send_and_receive_packet (sr1/srp1: fires a probe and captures its reply in one gated call), sniff_packets, dissect_packet, modify_packet, save/load pcap
 - **`utils/log_reader.py`** — **BRAIN_DISPATCH**: Read/stream Brain and MSF logs
 - **`utils/memory_tools.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember_text/recall_text)
+- **`utils/crypto_kit.py`** — **BRAIN_DISPATCH**: Offline crypto/encoding workbench — decode, identify, and attack encoded blobs (Base64/JSON cookies, JWTs, unsalted hashes; zero network)
+- **`utils/gated_http.py`** — **Helper**: HTTP GET that re-validates every redirect hop through the scope gate (closes the 302-to-out-of-scope bypass); used by cors_probe, ssrf_probe, web_probe, js_recon
+- **`utils/scratch_store.py`** — **Store**: Durable, ownership-scoped scratch storage backing digest/page result projection (see [Result Projection](#result-projection-utilsresult_projectionpy))
 - **`utils/background_job.py`** — **Helper**: Shared background-job launch/poll helper for long-running CLI tools
 - **`utils/handles.py`** — **Helper**: Session handle formatting, parsing, and validation
 - **`listeners/listening.py`** — **BRAIN_DISPATCH**: TCP listener with Brain event forwarding
 - **`listeners/collaborator.py`** — **BRAIN_DISPATCH**: OOB callback listener (Burp Collaborator analog): HTTP/HTTPS/DNS on one host
 - **`listeners/raw_scan.py`** — **BRAIN_DISPATCH**: Raw SYN port scanner (C++ plugin via ctypes)
+- **`listeners/brain_control.py`** — **BRAIN_DISPATCH**: Visibility + kill switch for Brain-side tool executions (`list_tool_executions` / `kill_tool_execution`)
+- **`listeners/execution_tracker.py`** — **Brain-side**: Execution tracker state shared with `thebrain.py` (live/tracked executions, zombie kill switch)
 - **`memories.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember/search/recall/get/forget)
 
 ### Tool Categories (`daharness/tool_tags.py`)
 
 With 150+ tools, not every tool surfaces for every reasonable phrasing. Each
-tool carries category tags from a canonical 14-bucket vocabulary that are
+tool carries category tags from a canonical 13-bucket vocabulary that are
 appended to its embedded capability text (`...\n\nCategories: web.fuzz`), so a
 search that uses category language ("recon", "fuzz", "brute", "packet")
 surfaces the tagged tools even when the tool's own prose never used that word.
@@ -137,7 +170,7 @@ surfaces the tagged tools even when the tool's own prose never used that word.
   hit), and a tag change re-embeds the tool automatically on the next
   `python -m daharness.core` (the doc changes, which is the change signal).
 - Non-canonical tags are warned about (bootstrap/reindex log) but kept.
-- All 154 registry tools are tagged as of 2026-09-24 (`net.services` closed
+- All registry tools are tagged (`net.services` closed
   the non-HTTP-service gap; port scanners stay `net.raw` — the scan lane —
   while `net.services` is for interacting with a discovered service).
 
@@ -185,7 +218,8 @@ is in your `PATH`.
 | **Impacket** | `auxiliaries/impacket_suite.py` | Windows post-exploitation (SMB, psexec, wmiexec, atexec, secretsdump) |
 | **Scapy** | `utils/packetcraft.py` | Packet crafting, send, send-and-receive probes (sr1/srp1), sniffing (Python library) |
 | **Paramiko** | `utils/paramiko_client.py`, `auxiliaries/ssh_exec.py` | SSH client (Python library) |
-| **BloodHound CE** | `auxiliaries/bloodhound.py` | AD attack-path analysis (graph queries, Cypher, query templates); workbench container, no sidecar |
+| **john the Ripper** | `payloads/hash_crack.py` | Password cracking (`run_john` / `john_status` / `john_show`, background-job pattern) |
+| **hashcat** | `payloads/hash_crack.py` | Password cracking (`run_hashcat` / `hashcat_status` / `hashcat_show`, background-job pattern) |
 
 ### OWASP ZAP
 
@@ -270,33 +304,30 @@ Services:
 | ChromaDB (`chroma`) | `9000` | Reuses the existing `chroma-data/` volume |
 | Open Terminal | `8000` | Codebase workbench: agent shell + file browser; hosts the framework gateway + Brain sidecar |
 | Open WebUI | `3000` | Chat front end; calls the framework via the tool wrappers in `owui-tools/` |
-| BloodHound CE (`bloodhound`) | `127.0.0.1:${BLOODHOUND_PORT}` | AD attack-path graph analysis (backed by `postgres` + `neo4j`) |
 
 **Open Terminal** is the codebase workbench. The framework source is
-bind-mounted at `/opt/framework` (host `..` → container).The
+bind-mounted at `/opt/framework` (host `..` → container). The
 Dockerfile (`dockered/open-terminal.Dockerfile`) bakes in the Python venv,
 Go-built CLI tools (ffuf, amass), radare2, jadx, searchsploit, and
 apt-available security tools; the framework source is never copied.
 
 **Open WebUI** is the chat front end. It reaches the framework through the
-Open WebUI tool wrappers in `owui-tools/owui-wrapper.py` (v0.3.2): four
+Open WebUI tool wrappers in `owui-tools/owui-wrapper.py` (v0.3.2): five
 tools — `framework_search_tools`, `framework_run_tool`,
-`framework_memory_search`, `framework_health` — that call the gateway's
-`/tools/search`, `/tools/execute`, `/memory/search`, and `/health` routes
-with per-chat session isolation (Brain sessions auto-named
+`framework_scratch_search`, `framework_memory_search`, `framework_health` —
+that call the gateway's `/tools/search`, `/tools/execute`, `/scratch/search`,
+`/memory/search`, and `/health` routes with per-chat session isolation (Brain
+sessions auto-named
 `owui-<model>-<chat>`). Install the wrapper as an Open WebUI tool and point
-its `gateway_url` valve at `http://localhost:6000` (from the host). There is no
-approval gate in this lane by default — tool calls execute directly through the
-gateway. The same can be said of the MCP server.
-
-**BloodHound CE** runs as a three-container stack (`bloodhound` +
-`postgres` + `neo4j`) on the `workbench` network. The framework's
-`auxiliaries/bloodhound.py` tools connect to it via `BLOODHOUND_URL`. See
-the user memory notes for setup details (Postgres 18, field-based env
-vars, randomized initial admin password in container logs).
+its `gateway_url` valve at `http://localhost:6000` (from the host; the
+wrapper default targets `http://open-terminal:6000` from inside the
+`open-webui` container). The approval gate is an internal-harness feature
+and does not exist in this lane — tool calls execute directly through the
+gateway, and the same applies to the MCP server. Add an approval layer in
+your own integrating harness if you need one there.
 
 Keys come from `dockered/.env`: `GATEWAY_API_KEY`,
-`OPEN_TERMINAL_API_KEY`, `POSTGRES_PASSWORD`, `NEO4J_PASSWORD`.
+`OPEN_TERMINAL_API_KEY`.
 
 ## Supporting Services
 
@@ -478,7 +509,8 @@ surfaces: the gate sees the REQUESTED target only — DNS-resolver traffic
 is out of its view, and redirect-following inside scan binaries is
 handled per-tool (ffuf `-r` is denylist-stripped; ZAP crawls are mirrored
 by `zap_sync_scope`, which puts ZAP itself in protect mode against OOS
-hops).
+hops; and `utils/gated_http.py` re-validates every redirect hop that the
+HTTP probe tools follow).
 
 ### Memory Service (`memories.py`)
 
@@ -532,10 +564,11 @@ in `schema.md`. The findings table shares this database.
 
 ### API Gateway (`api_gateway.py`)
 
-FastAPI server (port 5000) exposing:
+FastAPI server (port **5000** on the host lane; **6000** in the container
+lane) exposing:
 
 - `GET /health` — framework health check
-- `POST /tools/execute` — semantic tool lookup + execution (accepts `result_mode`: full|digest|page)
+- `POST /tools/execute` — exact `tool_id` dispatch or semantic lookup (accepts `result_mode`: full|digest|page, default `digest`)
 - `POST /tools/search` — semantic tool search (no execution)
 - `POST /scratch/search` — retrieve a stored tool result from the scratch store
 - `GET /scratch/list` — list recent scratch entries for an agent
@@ -544,18 +577,32 @@ FastAPI server (port 5000) exposing:
 - `POST /memory/recall` — vector similarity recall
 - `POST /mcp` — streamable-HTTP MCP endpoint (`tools/list` + `tools/call`)
 
+Also serves MCP (Model Context Protocol) handlers for tool listing and
+execution. `POST /tools/execute` and MCP `tools/call` dispatch directly —
+the internal approval gate does not exist in these lanes, so an integrating
+harness that wants sign-off needs to add its own layer before calling. If
+`GATEWAY_API_KEY` is set, every request is authenticated
+(sent as `X-API-Key`); otherwise the gateway runs in unauthenticated dev
+mode.
+
 ### Result Projection (`utils/result_projection.py`)
 
-Controls what enters the model's context window vs. what stays in scratch.
-Three modes (execution-envelope parameter, NOT a tool argument):
+A middleman between `execute_tool()` and the model's context window:
+`result_mode` is an execution-envelope parameter (passed alongside
+`tool_id`/`arguments`, NOT a tool argument — it never reaches the tool
+body). Three modes:
 
-- **`full`** (default) — raw tool result passes through unchanged. Zero
-  behavior change.
-- **`digest`** — stores the full result in scratch, returns a compact
+- **`digest`** (default for both the secretary agent and `POST
+  /tools/execute`) — stores the full result in scratch, returns a compact
   per-tool-family digest + a `scratch_ref` + the retrieval instruction. The
-  model is taught the retrieval move every call.
+  model is taught the retrieval move every call. Results smaller than
+  `SCRATCH_SMALL_RESULT_BYTES` (default 2 KiB — handles, verdicts, IDs) pass
+  through in full automatically; only genuinely large outputs (scan logs,
+  hit lists) are projected out.
+- **`full`** — the raw tool result passes through unchanged (also the
+  default on the MCP `tools/call` lane).
 - **`page`** — stores the full result in scratch, returns a bounded page of
-  list results + a `scratch_ref` + continuation info.
+  list results (offset/limit) + a `scratch_ref` + continuation info.
 
 **Why this is not the parked OWUI trim filter:** the projection runs *before*
 the result enters context (not after); the retrieval instruction is part of
@@ -574,9 +621,10 @@ host state + job_id, omitting the raw log text (retrievable from scratch).
 
 Durable, ownership-scoped storage for raw tool results. NOT vector memory
 (no embeddings, no semantic recall) and NOT the findings store (no lifecycle).
-Deterministic, reference-keyed store the model retrieves from via
-`framework_scratch_search` when it needs the full or filtered output of a
-prior tool call.
+Deterministic, reference-keyed store the model retrieves from when it needs
+the full or filtered output of a prior projected call: via the MCP
+`scratch_search` tool, the gateway's `POST /scratch/search`, or the Open
+WebUI `framework_scratch_search` wrapper.
 
 - **Storage:** `scratch.db` (SQLite metadata) + `scratch-data/` (compressed JSON payloads, 0700/0600).
 - **IDs:** opaque random values (`scratch:<16-hex>`), never sequential.
@@ -586,20 +634,19 @@ prior tool call.
 - **Caps:** per-entry 256 MiB (`SCRATCH_MAX_PAYLOAD_MB`), per-agent 1 GiB (`SCRATCH_MAX_AGENT_MB`).
 - **Atomic writes:** payload written to temp → fsync → rename → metadata commit.
 
-Also serves MCP (Model Context Protocol) handlers for tool listing and
-execution. If `GATEWAY_API_KEY` is set, every request is authenticated;
-otherwise the gateway runs in unauthenticated dev mode.
-
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.12+ (3.13 supported)
-- [Ollama](https://ollama.ai) running with `nomic-embed-text` and a chat
-  model (default: `Qwen3.8:27b`) — the secretary LLM uses Ollama for semantic search and
-  reasoning. The framework auto-discovers the Ollama API endpoint on the lab
-  lane (default: `10.10.10.134:11434` on `enp92s0`, 10.10.10.0/24) but you can
-  override it with `OLLAMA_BASE_URL` in `.env`.
+- [Ollama](https://ollama.ai) running with `nomic-embed-text` and a local
+  chat model (code default: `ornith-1.5:35b`; a thinking/reasoning model is
+  recommended — the secretary plans through defenses and
+  edge-infrastructure fingerprinting, which rewards reasoning). Swap via
+  `SECRETARY_MODEL` in `.env`. The Ollama endpoint defaults to a lab-LAN
+  fallback baked into `daharness/registry.py`; set `OLLAMA_BASE_URL` in
+  `.env` to your own listener and keep it loopback/LAN (see
+  [Safety Notes](#safety-notes)).
 - ChromaDB server (default: `localhost:9000`; used by the tool registry —
   the memory service `memories.py` uses its own embedded store at
   `.memory/chroma`)
@@ -617,10 +664,10 @@ values; see `.env.example` for the full key list):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OLLAMA_BASE_URL` | Lab lane fallback (`10.10.10.134`) | Ollama API endpoint — set explicitly in `.env` |
+| `OLLAMA_BASE_URL` | Lab LAN fallback | Ollama API endpoint — set explicitly in `.env` |
 | `CHROMA_HOST` | `localhost` | ChromaDB host |
 | `CHROMA_PORT` | `9000` | ChromaDB port |
-| `SECRETARY_MODEL` | `Qwen3.8:27b` | LLM model for the tool secretary (non-thinking chat model recommended) |
+| `SECRETARY_MODEL` | `ornith-1.5:35b` | LLM model for the tool secretary (thinking/reasoning chat model recommended) |
 | `MSGRPC_PASSWORD` | — | Metasploit RPC password |
 | `MSF_RPC_PORT` | `55553` | Metasploit RPC port |
 | `MCP_ENDPOINT` | `http://127.0.0.1:55553` | Metasploit MCP sidecar endpoint |
@@ -651,21 +698,16 @@ values; see `.env.example` for the full key list):
 | `WORDLISTS_ROOT` | `/usr/share/wordlists` | Wordlist tree root |
 | `SECRETARY_MAX_APPROVAL_ROUNDS` | `5` | Max approval rounds per secretary turn |
 | `SECRETARY_TURN_TIMEOUT` | `600` | Secretary turn wall-clock cap (seconds) |
+| `POST_EXECUTION_LOGS` | `failures` | Framework-log tail appended to the result after an approved execution: `off` \| `failures` \| `always` |
 | `SQLMAP_TIMEOUT` | `1800` | sqlmap scan wall-clock cap (seconds) |
 | `ROUTER_MAX_DISTANCE` | `1.1` | API-path semantic-match refusal threshold (ChromaDB L2; lower = stricter) |
 | `SCRATCH_TTL_HOURS` | `24` | Scratch store entry TTL (hours); expired entries are cleaned up on every store call |
 | `SCRATCH_MAX_PAYLOAD_MB` | `256` | Per-entry payload cap for the scratch store (MiB) |
 | `SCRATCH_MAX_AGENT_MB` | `1024` | Per-agent total payload cap for the scratch store (MiB) |
+| `SCRATCH_SMALL_RESULT_BYTES` | `2048` | Serialized results below this size pass through in full even under `digest`/`page` projection |
 | `ZAP_PROXY_BIND` | `0.0.0.0` | ZAP browser-proxy bind address (daemon API ACL stays loopback) |
 | `ZAP_XMX` | `512m` | ZAP daemon JVM heap size |
 | `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |
-| `INTIGRITI_API_TOKEN` | — | Intigriti API token (scope integration) |
-| `BLOODHOUND_URL` | `http://bloodhound:8080` | BloodHound CE API URL (workbench network) |
-| `BLOODHOUND_PORT` | `18080` | BloodHound CE host port (bound to `127.0.0.1`) |
-| `BLOODHOUND_ADMIN_PRINCIPAL` | `admin` | BloodHound CE admin principal name |
-| `BLOODHOUND_ADMIN_PASSWORD` | — | BloodHound CE admin password (find initial password in container logs) |
-| `POSTGRES_PASSWORD` | — | BloodHound CE Postgres 18 password (docker compose) |
-| `NEO4J_PASSWORD` | — | BloodHound CE Neo4j password (docker compose) |
 
 ### Running
 
@@ -688,10 +730,12 @@ pytest tests/
 ```
 
 In both modes, `bootstrap.py` starts the Brain sidecar, the ZAP daemon, the
-Metasploit MCP sidecar, and the API gateway (with MCP handlers). The
-Metasploit MCP sidecar is also vectorized, but the full index is only
-searchable from the secretary chat loop, and then executed (with operator
-approval if the gate is toggled on).
+Metasploit MCP sidecar, and the API gateway (with MCP handlers), after a
+wordlist-tree preflight (`utils.wordlists.preflight_wordlists`) surfaces a
+missing/empty wordlist source as a startup warning instead of a silent
+ffuf/hydra failure. The Metasploit MCP sidecar is also vectorized, but the
+full index is only searchable from the secretary chat loop, where executions
+pause for operator approval.
 
 ## Adding a New Tool
 
@@ -730,10 +774,18 @@ approval if the gate is toggled on).
 
 ## Safety Notes
 
-- **Human-in-the-loop (opt-in):** an approval gate can be toggled on so
-  every tool execution pauses for explicit operator sign-off — the
-  confirmer sees the full manifest and arguments before approving. It is
-  off by default; the framework executes tools directly when disarmed.
+- **Human-in-the-loop (secretary lane — always on there):** every
+  secretary-driven tool execution pauses for explicit operator sign-off —
+  `execute_tool` is declared `requires_approval=True`, the run halts with
+  the full manifest + arguments for the operator to approve or deny, and
+  only an approved execution actually runs. This gate is internal to the
+  harness: the API gateway and MCP lanes dispatch directly, so an
+  integrating harness must add its own approval if it wants sign-off.
+- **Context hygiene:** tool results pass through the projection middleman
+  (`digest` by default) before entering the model's context window — large
+  outputs go to the durable scratch store intact and the model gets a
+  compact envelope plus a retrieval reference (see
+  [Result Projection](#result-projection-utilsresult_projectionpy)).
 - **Scope compliance:** `check_scope` gates every scan against the loaded
   HackerOne program scope before execution — out-of-scope assets are
   rejected, and explicit out-of-scope entries override in-scope wildcards.
@@ -800,16 +852,22 @@ daharness/              Tool secretary agent + semantic registry (core package)
   findings.py           SQLite-backed findings store (FindingStore)
   models.py             ToolManifest + Finding pydantic models
   _param_docs.py        Parameter-docstring introspection for tool manifests
+  preflight.py          Deterministic pre-dispatch validation (fail-fast args gate)
+  tool_tags.py          Canonical tool category tags + TOOL_TAGS map
   core.py               Backwards-compat shim / CLI entry point
 constants.py            @framework_tool decorator + TransportType enum
 bootstrap.py            Daemon entry point; launches all sidecars (Brain, ZAP, MSF MCP, API)
-api_gateway.py          FastAPI control panel + MCP server (port 5000)
+api_gateway.py          FastAPI control panel + MCP server (port 5000 host lane / 6000 container lane)
 memories.py             ChromaDB-backed namespaced vector memory
+SYSTEM_PROMPT.md        "Brain of a local security lab" agent system prompt (reference)
+Modelfile.md            Ollama Modelfiles for the local secretary GGUF models
 listeners/
   thebrain.py           Unix socket sidecar + function registry
   listening.py          TCP listener with Brain integration
   collaborator.py       OOB callback listener (HTTP/HTTPS/DNS, Burp Collaborator analog)
   raw_scan.py           SYN scanner wrapper (C++ plugin)
+  brain_control.py      list/kill Brain-side tool executions (zombie control plane)
+  execution_tracker.py  Brain execution tracker state (zombie kill switch)
   plugins/              C/C++ shared objects (frameit, raw_scan)
 payloads/
   metasploiting.py      Metasploit RPC client (search/execute/sessions)
@@ -818,6 +876,8 @@ payloads/
   sqlmap.py             sqlmap SQL injection (launch/poll)
   searchsploiting.py    searchsploit (ExploitDB) lookup
   fastcgi.py            FastCGI/PHP-FPM exploitation
+  hash_crack.py         john/hashcat password cracking (launch/poll/show + mode suggestion)
+  js_recon.py           Static JS recon: routes + secrets from bundles
   wordlists.py          Wordlist discovery
   plugins/              Payload listener (C++)
 auxiliaries/
@@ -833,6 +893,17 @@ auxiliaries/
   smb_scanner.py        SMB null session scanner
   cert_tools.py         TLS cert generation for collaborator
   framework_status.py   Framework health check
+  archived_urls.py      Wayback CDX archived-URL discovery (passive recon)
+  cors_probe.py         CORS posture + security-header audit
+  db_client.py          Direct-database client (MySQL/PostgreSQL) for known creds
+  dns_lookup.py         Forward/reverse DNS resolution (scope-workflow feeder)
+  ftp_recon.py          FTP/SFTP recon + transfer
+  playwright_sidecar.py Scope-enforcing rendered-DOM recon sidecar (opt-in)
+  playwright_recon.py   Playwright sidecar client tools
+  ssrf_probe.py         Parametric SSRF fuzzer + OOB grading
+  tls_info.py           TLS certificate + protocol posture inspector
+  web_login_brute.py    Session-aware web-login brute (CSRF token reuse)
+  web_probe.py          Concurrent web-surface prober (ports → HTTP intel)
 utils/
   findings.py           Finding report/render/close/supersede tools
   paramiko_client.py    Persistent SSH tools
@@ -843,6 +914,10 @@ utils/
   memory_tools.py       remember_text/recall_text vector memory tools
   background_job.py     Shared background-job launch/poll helper
   handles.py            Session handle formatting/parsing/validation
+  result_projection.py  full|digest|page context-projection middleman
+  scratch_store.py      Durable scratch store for projected-out results
+  crypto_kit.py         Offline decode/identify/attack crypto-encoding workbench
+  gated_http.py         Per-hop scope-gated HTTP GET (redirect-bypass blocker)
   wordlists.py          Wordlist utilities
   plugins/              C/C++ shared objects + TLS certs
 encoders/               Encoder plugins (C/C++)
