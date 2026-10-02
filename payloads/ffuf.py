@@ -166,6 +166,56 @@ def _path_from_record(rec: Dict[str, Any]) -> str:
     return str(rec.get("url", ""))
 
 
+# Bound on parsed findings returned by the ffuf verdict parsers. ffuf result
+# cardinality is unbounded: against a catch-all target (an app that 302s
+# every path to a login page, so every wordlist word "hits") a recursive
+# directory-list-2.3-medium run produced 151k findings — a 29 MB poll reply
+# that the Brain wire guard (MAX_MESSAGE_SIZE, 10 MiB, listeners/thebrain.py)
+# rejected on the socket read. The cap keeps the serialized verdict far under
+# the wire limit; the full result set always remains in the per-job -o JSON
+# output file (surfaced in meta.output_file), so nothing is lost.
+_MAX_FINDINGS = int(os.getenv("FFUF_MAX_FINDINGS", "10000"))
+
+
+def _interest_rank(f: Dict[str, Any]) -> int:
+    """Interest ordering: 200s first, then 3xx redirects, then 403s, 500s."""
+    code = f.get("status") or 0
+    if code == 200:
+        return 0
+    elif 300 <= code < 400:
+        return 1
+    elif code == 403:
+        return 2
+    elif code == 500:
+        return 3
+    return 4
+
+
+def _cap_findings(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Bound the findings list so the poll verdict stays wire-safe.
+
+    When truncating, keep the most interesting findings first
+    (``_interest_rank``; ``sorted`` is stable, so original ffuf order is
+    preserved within a rank) and report the true total via
+    ``findings_total`` / ``findings_truncated`` so the caller knows the
+    list was cut and where the rest lives.
+    """
+    total = len(findings)
+    if total <= _MAX_FINDINGS:
+        return {
+            "findings": findings,
+            "findings_count": total,
+            "findings_total": total,
+            "findings_truncated": False,
+        }
+    return {
+        "findings": sorted(findings, key=_interest_rank)[:_MAX_FINDINGS],
+        "findings_count": _MAX_FINDINGS,
+        "findings_total": total,
+        "findings_truncated": True,
+    }
+
+
 def _parse_ffuf_output_file(out_path: str) -> Optional[Dict[str, Any]]:
     """Parse ffuf's ``-of json -o <file>`` output (one JSON object per file).
 
@@ -197,11 +247,9 @@ def _parse_ffuf_output_file(out_path: str) -> Optional[Dict[str, Any]]:
                 "duration": rec.get("duration"),
             }
         )
-    return {
-        "findings": findings,
-        "findings_count": len(findings),
-        "meta": {"source": "json"},
-    }
+    capped = _cap_findings(findings)
+    capped["meta"] = {"source": "json", "output_file": out_path}
+    return capped
 
 
 def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
@@ -268,11 +316,9 @@ def _parse_ffuf_verdict(log_text: str) -> Dict[str, Any]:
                 }
             )
 
-    return {
-        "findings": findings,
-        "findings_count": len(findings),
-        "meta": meta,
-    }
+    capped = _cap_findings(findings)
+    capped["meta"] = meta
+    return capped
 
 
 @framework_tool(
@@ -393,8 +439,13 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
         verdict = _parse_ffuf_verdict(log_text)
         file_verdict = _parse_ffuf_output_file(out_path)
         if file_verdict and file_verdict.get("findings_count"):
-            verdict["findings"] = file_verdict["findings"]
-            verdict["findings_count"] = file_verdict["findings_count"]
+            for key in (
+                "findings",
+                "findings_count",
+                "findings_total",
+                "findings_truncated",
+            ):
+                verdict[key] = file_verdict[key]
             verdict["meta"]["output_file"] = out_path
         return verdict
 
@@ -435,6 +486,10 @@ def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
     status distribution + interesting paths ARE the triage signal.  When it
     needs the full hit list (e.g. to feed specific paths to sqlmap or ZAP),
     it retrieves from scratch.
+
+    Findings arrive pre-capped (``_cap_findings`` / ``FFUF_MAX_FINDINGS``)
+    when a target matched everything; ``findings_total`` carries the true
+    count and the truncation note points at the full ``-o`` output file.
     """
     parts: list = []
 
@@ -446,7 +501,8 @@ def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
 
     findings = result.get("findings", [])
     findings_count = result.get("findings_count", len(findings))
-    parts.append(f"hits={findings_count}")
+    findings_total = result.get("findings_total", findings_count)
+    parts.append(f"hits={findings_total}")
 
     # Status code distribution — the primary triage signal.
     if findings:
@@ -463,19 +519,7 @@ def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
             parts.append(f"status_dist={dist}")
 
         # Top hits: 200s first, then 3xx, then 403s — capped at 15.
-        def _interest(f):
-            code = f.get("status", 0)
-            if code == 200:
-                return 0
-            elif 300 <= code < 400:
-                return 1
-            elif code == 403:
-                return 2
-            elif code == 500:
-                return 3
-            return 4
-
-        top = sorted(findings, key=_interest)[:15]
+        top = sorted(findings, key=_interest_rank)[:15]
         hit_lines = "\n  ".join(
             f"{f.get('status', '?')} {f.get('path', '?')} "
             f"(size={f.get('size', '?')}, words={f.get('words', '?')})"
@@ -484,6 +528,12 @@ def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
         parts.append(f"top_hits:\n  {hit_lines}")
         if findings_count > 15:
             parts.append(f"  ... +{findings_count - 15} more (retrieve full list from scratch)")
+        if result.get("findings_truncated"):
+            out_file = (result.get("meta") or {}).get("output_file", "?")
+            parts.append(
+                f"truncated: kept top {findings_count} of {findings_total} by "
+                f"interest (FFUF_MAX_FINDINGS); full results in {out_file}"
+            )
 
     job_id = result.get("job_id")
     if job_id:
@@ -518,8 +568,11 @@ def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
     "Poll, check, or monitor the progress and results of an existing, "
     "already-launched ffuf fuzzing job: returns running/done, a parsed list "
     "of discovered paths with HTTP status / size / words / lines, run meta "
-    "(URL, method, threads, wordlist), and recent log lines. Call once only "
-    "when the user requests an update; never poll repeatedly until done.",
+    "(URL, method, threads, wordlist), and recent log lines. The findings "
+    "list is capped at FFUF_MAX_FINDINGS with the most interesting status "
+    "codes kept; findings_total/findings_truncated report the true hit "
+    "count and the full results stay in the run's JSON output file. "
+    "Call once only when the user requests an update; never poll repeatedly until done.",
     next_hints=["ffuf_status", "report_finding"],
     result_digest=lambda r: _ffuf_status_digest(r),
 )
@@ -529,7 +582,10 @@ def ffuf_status(job_id: str) -> Dict[str, Any]:
     Reads the job's log file, checks whether the subprocess is still alive,
     and parses ffuf's output for discovered paths/responses.  Returns
     ``status: "running"`` while the run is in progress and ``status:
-    "done"`` once the process has exited.
+    "done"`` once the process has exited.  The parsed findings list is
+    capped at ``FFUF_MAX_FINDINGS`` (default 10000) so the reply stays under
+    the Brain's 10 MiB wire-frame limit; the complete result set always
+    remains in the run's ``-o`` JSON output file (``meta.output_file``).
 
     Args:
         job_id: The ``job_id`` returned by ``run_ffuf``.

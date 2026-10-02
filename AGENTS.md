@@ -201,6 +201,29 @@ exact `tool_id` during the registry's dynamic-discovery pass.
 **Pilot adapter:** `nmap_status` — returns open port count + full port list +
 host state + job_id, omitting the raw log text (retrievable from scratch).
 
+### Per-turn tool budget (`utils/tool_budget.py`)
+
+A hard cap on tool executions per turn, enforced in the gateway so the lanes
+that bypass the secretary's approval gate (Open WebUI bridge, MCP, REST) get
+the symmetric brake (`SECRETARY_MAX_APPROVAL_ROUNDS` covers the secretary).
+
+- **Counting**: every `/tools/execute` / MCP `tools/call` dispatch counts once. The request's
+  `turn_key` (Open WebUI passes `chat_id:message_id` from `__metadata__`; the
+  model never fills it) starts a fresh budget per value; when omitted, a
+  per-agent rolling counter resets after `TOOL_BUDGET_IDLE_RESET_MIN` idle.
+- **Final call executes, wrapped**: call N (the last allowed) runs normally but
+  its result gains a `tool_budget` directive — report findings and end the
+  turn. Applied *after* result projection so it survives digest replacement.
+- **Past the cap → refused**: the call does not execute; the response is a
+  structured `budget_exhausted` envelope (HTTP 200 / plain MCP text, not an
+  error — an instruction to reason over, not a transient failure to retry).
+- **Terminal lane**: memory (`utils.memory_tools.`) and findings
+  (`utils.findings.`) tools stay callable past the cap and don't consume
+  budget, so the model can actually comply instead of being trapped.
+- **Knobs**: `TOOL_BUDGET_PER_TURN` (default 10, 0 = disabled),
+  `TOOL_BUDGET_IDLE_RESET_MIN`, `TOOL_BUDGET_TERMINAL_ALLOWLIST`. Counters
+  are in gateway process memory and reset on restart.
+
 ### Scratch Store (`utils/scratch_store.py`)
 
 Durable, ownership-scoped storage for raw tool results. NOT vector memory
@@ -232,6 +255,44 @@ commands. `cleanup_stale()` closes sessions idle beyond a threshold.
 **Process-local:** sessions live in whichever process ran the tool (Brain or
 in-process launcher). If the Brain dies and a call falls back in-process,
 it cannot see sessions the Brain was holding.
+
+### Universal Cookie Jar (`utils/cookie_jar.py`) + Stateful HTTP Lane (`auxiliaries/web_session.py`)
+
+Durable web session state — the fix for middleware (Django CSRF, session
+cookies) that blocks stateless tools at the front door. Cookies and tokens
+are just strings, so they live in SQLite, not in process memory:
+
+- `CookieJarStore` (`get_jar()` singleton) — SQLite (WAL) at `COOKIE_JAR_DB`
+  (default `<workspace>/cookie_jar.db`). Two tables: `cookies` (domain,
+  name, path PK) and `tokens` (domain, name PK). Because state is on disk,
+  **every lane shares it**: Brain sidecar, in-process fallback, REPL, and
+  API gateway all read/write the same jar — deliberately sidestepping the
+  Session Manager's process-local pitfall. TTL purge
+  (`COOKIE_JAR_TTL_HOURS`, default 72) plus server-expiry purge run on every
+  mutation.
+- Matching is RFC 6265: `domain_specified` dot-form cookies cover subdomains;
+  **IP hosts never match dot-forms** (a `.56.106` suffix cookie must never
+  leak onto `192.168.56.106`). `cookie_header()` also path-matches, to feed
+  non-jar-aware tools (ffuf/sqlmap raw modes, ZAP reclient) a ready-made
+  `Cookie:` header.
+- `extract_csrf_tokens()` — pure function pulling tokens from hidden
+  inputs, `<meta>` tags, and response headers (canonical field order:
+  Django `csrfmiddlewaretoken` → Rails `authenticity_token` → Laravel
+  `_token` → ASP.NET `__RequestVerificationToken`). Values HTML-unescaped.
+- Management tools: `utils.cookie_jar.jar_state` / `jar_store_cookie`
+  (parses pasted `a=1; b=2` strings) / `jar_store_token` / `jar_clear` /
+  `jar_cookie_header`. Note: `BRAIN_SCAN_DIRS` excludes `utils/`, so these
+  run through in-process fallback — harmless, since state is on disk.
+- The lane (`auxiliaries.web_session`): `session_get` / `session_post` /
+  `session_request` apply jar state to a per-call `requests.Session` via
+  `gated_request(session=...)` — **every redirect hop still passes the
+  operator-armed scope gate**; the jar never bypasses it. `session_post`
+  auto-injects CSRF: form field into the body + `X-CSRFToken`-style header
+  derived from the vault/cookie. A Django login is three plain calls:
+  `session_get /login/` → `session_post` creds → `session_get /dashboard/`.
+- `gated_http.gated_get/gated_request` take an optional caller-managed
+  `session` — used as-is, never closed; `None` keeps the original
+  create-and-close stateless behavior.
 
 ### Metasploit Client (`payloads/metasploiting.py`)
 

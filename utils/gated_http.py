@@ -16,7 +16,10 @@ taken before its verdict.
 
 All framework HTTP tools route through this helper (cors_probe, web_probe,
 js_recon); archived_urls locks its endpoint by NOT following redirects at
-all.
+all.  Since 2026-10-02 both helpers accept an optional caller-managed
+``requests.Session`` — the hook the stateful web lane
+(auxiliaries/web_session.py + utils/cookie_jar.py) uses to carry cookie-jar
+state through the SAME per-hop gating without a second redirect loop.
 """
 
 from __future__ import annotations
@@ -38,12 +41,21 @@ def gated_get(
     verify: bool = True,
     timeout: Tuple[float, float] = (5.0, 10.0),
     max_hops: int = 5,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[requests.Response, List[Dict[str, Any]]]:
     """GET ``url`` manually following redirects, gate-checking every hop.
 
     Returns ``(response, hops)`` — ``hops`` is the ordered list of
     ``{"url", "status"}`` visited (first entry is the original URL).  The
     returned Response is the FINAL one.
+
+    ``session`` (optional): a caller-managed ``requests.Session`` — used
+    as-is and NOT closed on return (the caller owns its lifecycle).  This
+    is how the stateful web lane (auxiliaries/web_session.py) carries
+    jar-seeded cookies through the gated hop loop: redirect handling and
+    per-hop gating stay in exactly one place while Set-Cookie accumulation
+    lands on the caller's session.  ``None`` (every pre-existing caller)
+    keeps the create-per-call + close behaviour unchanged.
 
     Raises:
         ScopeGateError: if the starting URL or ANY redirect target fails
@@ -54,7 +66,9 @@ def gated_get(
     current = (url or "").strip()
     if not current:
         raise ScopeGateError("scope gate: empty URL")
-    session = requests.Session()
+    own_session = session is None
+    if own_session:
+        session = requests.Session()
     try:
         for _ in range(max_hops + 1):
             ok, reason = check_scan(current)
@@ -84,7 +98,8 @@ def gated_get(
             "stopped (all hops so far were in-scope)"
         )
     finally:
-        session.close()
+        if own_session:
+            session.close()
 
 
 def gated_request(
@@ -99,6 +114,7 @@ def gated_request(
     timeout: Tuple[float, float] = (5.0, 15.0),
     max_hops: int = 5,
     allow_redirects: bool = True,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[requests.Response, List[Dict[str, Any]]]:
     """Arbitrary-method HTTP request with per-hop scope-gate validation.
 
@@ -117,6 +133,13 @@ def gated_request(
     3xx response (no hop-following) — useful for SSRF probes that want to
     inspect a redirect body without following.
 
+    ``session`` (optional): a caller-managed ``requests.Session`` — used
+    as-is and NOT closed on return (caller owns the lifecycle; Set-Cookie
+    from every hop accumulates on it).  This is the stateful hook the
+    web-session lane uses to keep per-hop gating in one place while
+    carrying cookie-jar state.  ``None`` (default) preserves the original
+    create-per-call + close behaviour exactly.
+
     Returns ``(response, hops)``; ``hops`` is the ordered list of
     ``{"url", "status", "method"}`` visited.
     """
@@ -126,7 +149,9 @@ def gated_request(
         raise ScopeGateError("scope gate: empty URL")
     cur_method = (method or "GET").upper()
     cur_data, cur_json, cur_params = data, json, params
-    session = requests.Session()
+    own_session = session is None
+    if own_session:
+        session = requests.Session()
     try:
         for _ in range(max_hops + 1):
             ok, reason = check_scan(current)
@@ -163,7 +188,8 @@ def gated_request(
             "stopped (all hops so far were in-scope)"
         )
     finally:
-        session.close()
+        if own_session:
+            session.close()
 
 
 __all__ = ["gated_get", "gated_request"]

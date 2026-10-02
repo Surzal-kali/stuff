@@ -29,8 +29,10 @@ import pytest
 # test (which would clobber a monkeypatched WORKSPACE_ROOT).
 import auxiliaries.program_scope  # noqa: F401
 
+import payloads.ffuf as ffuf_mod
 from payloads.ffuf import (
     _FFUF_ROW_RE,
+    _ffuf_status_digest,
     _ffuf_supports_noninteractive,
     _inject_noninteractive,
     _parse_ffuf_output_file,
@@ -129,6 +131,97 @@ def test_output_file_parser_missing_or_garbage(tmp_path):
     p = tmp_path / "bad.json"
     p.write_text("{not json")
     assert _parse_ffuf_output_file(str(p)) is None
+
+
+# --- ffuf findings cap (Brain wire-frame limit) -------------------------------
+
+def test_output_file_parser_caps_and_prioritizes(tmp_path, monkeypatch):
+    """A catch-all target (every path 302s) turns every wordlist word into
+    a "hit" — 151k findings made a 29 MB poll reply that died on the Brain
+    socket read ("declared message length ... exceeds max 10485760"). The
+    verdict must stay bounded and keep the interesting hits."""
+    monkeypatch.setattr(ffuf_mod, "_MAX_FINDINGS", 3)
+    results = [
+        {"input": {"FUZZ": f"dir{i}"}, "status": 302, "length": 0,
+         "words": 1, "lines": 1, "redirectlocation": "/login",
+         "url": f"http://127.0.0.1:8977/dir{i}"}
+        for i in range(5)
+    ]
+    # The one real 200 hit is buried LAST; the cap must keep it.
+    results.append(
+        {"input": {"FUZZ": "real"}, "status": 200, "length": 42,
+         "words": 3, "lines": 4, "redirectlocation": "",
+         "url": "http://127.0.0.1:8977/real"}
+    )
+    p = tmp_path / "out.json"
+    p.write_text(json.dumps({"results": results}))
+    v = _parse_ffuf_output_file(str(p))
+    assert v["findings_count"] == 3
+    assert v["findings_total"] == 6
+    assert v["findings_truncated"] is True
+    paths = [f["path"] for f in v["findings"]]
+    assert "real" in paths and paths[0] == "real"  # 200 outranks 302 noise
+    assert v["meta"]["output_file"] == str(p)
+
+
+def test_output_file_parser_uncapped_under_limit(tmp_path):
+    captured = {
+        "results": [
+            {"input": {"FUZZ": "admin"}, "status": 301, "length": 0,
+             "words": 1, "lines": 1, "redirectlocation": "/admin/",
+             "url": "http://127.0.0.1:8977/admin"},
+            {"input": {"FUZZ": "backup.txt"}, "status": 200, "length": 3,
+             "words": 1, "lines": 2, "redirectlocation": "",
+             "url": "http://127.0.0.1:8977/backup.txt"},
+        ]
+    }
+    p = tmp_path / "out.json"
+    p.write_text(json.dumps(captured))
+    v = _parse_ffuf_output_file(str(p))
+    assert v["findings_count"] == 2
+    assert v["findings_total"] == 2
+    assert v["findings_truncated"] is False
+
+
+def test_verdict_log_parse_caps(monkeypatch):
+    monkeypatch.setattr(ffuf_mod, "_MAX_FINDINGS", 2)
+    lines = "\n".join(
+        f"path{i} [Status: 302, Size: 0, Words: 1, Lines: 1]"
+        for i in range(4)
+    )
+    v = _parse_ffuf_verdict(lines)
+    assert v["findings_count"] == 2
+    assert v["findings_total"] == 4
+    assert v["findings_truncated"] is True
+
+
+def test_status_digest_reports_true_total_and_truncation():
+    result = {
+        "status": "done",
+        "job_id": "d3148ebe",
+        "findings": [
+            {"path": "real", "status": 200, "size": 42, "words": 3},
+            {"path": "dir0", "status": 302, "size": 0, "words": 1},
+        ],
+        "findings_count": 10000,
+        "findings_total": 151097,
+        "findings_truncated": True,
+        "meta": {"output_file": "/tmp/ffuf_out_d58e241c.json"},
+    }
+    d = _ffuf_status_digest(result)
+    assert "hits=151097" in d["summary"]
+    assert "truncated: kept top 10000 of 151097" in d["summary"]
+    assert "/tmp/ffuf_out_d58e241c.json" in d["summary"]
+
+
+def test_status_digest_total_defaults_when_uncapped():
+    d = _ffuf_status_digest(
+        {"status": "done", "findings": [
+            {"path": "admin", "status": 200, "size": 5, "words": 1}
+        ]}
+    )
+    assert "hits=1" in d["summary"]
+    assert "truncated" not in d["summary"]
 
 
 def test_path_from_record_variants():

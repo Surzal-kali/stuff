@@ -209,6 +209,15 @@ class Tools:
         if result_mode and result_mode.lower() == "page":
             payload["page_offset"] = page_offset
             payload["page_limit"] = page_limit
+        # Per-turn tool budget key: Open WebUI passes 'message_id' in
+        # __metadata__ on newer builds, so every user message gets a fresh
+        # budget of framework tool executions. On older builds it is absent
+        # and the gateway falls back to a rolling idle-TTL counter per chat.
+        md = __metadata__ or getattr(self, "__metadata__", None) or {}
+        chat = md.get("chat_id") or md.get("id")
+        message_id = md.get("message_id")
+        if chat:
+            payload["turn_key"] = f"{chat}:{message_id}" if message_id else str(chat)
         return self._post("/tools/execute", payload)
 
     def framework_scratch_search(

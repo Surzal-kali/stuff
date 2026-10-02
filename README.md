@@ -120,6 +120,7 @@ becomes the semantic capability description that the registry embeds.
 - **`auxiliaries/tls_info.py`** — **BRAIN_DISPATCH**: TLS certificate + protocol posture inspection (subject/SANs, versions, ciphers, expiry runway)
 - **`auxiliaries/web_login_brute.py`** — **BRAIN_DISPATCH**: Session-aware web-login brute-forcing for CSRF-protected form endpoints (token reuse per session)
 - **`auxiliaries/web_probe.py`** — **BRAIN_DISPATCH**: Concurrent web-surface prober — turns open ports into live HTTP intel (status, title, stack fingerprints) in one envelope
+- **`auxiliaries/web_session.py`** — **BRAIN_DISPATCH**: Stateful HTTP lane — `session_get`/`session_post`/`session_request` carry cookies + CSRF tokens from the universal jar through every scope-gated hop (Django-style login flows end-to-end; see [Universal Cookie Jar](#universal-cookie-jar-utilscookie_jarpy))
 - **`payloads/metasploiting.py`** — **BRAIN_DISPATCH / MCP_RPC**: Metasploit module search, execution, session polling, interaction
 - **`payloads/ffuf.py`** — **BRAIN_DISPATCH**: ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel)
 - **`payloads/hydra.py`** — **BRAIN_DISPATCH**: Hydra credential brute-force / password-spray (launch/poll/cancel)
@@ -135,7 +136,8 @@ becomes the semantic capability description that the registry embeds.
 - **`utils/log_reader.py`** — **BRAIN_DISPATCH**: Read/stream Brain and MSF logs
 - **`utils/memory_tools.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember_text/recall_text)
 - **`utils/crypto_kit.py`** — **BRAIN_DISPATCH**: Offline crypto/encoding workbench — decode, identify, and attack encoded blobs (Base64/JSON cookies, JWTs, unsalted hashes; zero network)
-- **`utils/gated_http.py`** — **Helper**: HTTP GET that re-validates every redirect hop through the scope gate (closes the 302-to-out-of-scope bypass); used by cors_probe, ssrf_probe, web_probe, js_recon
+- **`utils/cookie_jar.py`** — **BRAIN_DISPATCH**: Universal cookie jar + token vault — durable, cross-process SQLite store of cookies/CSRF tokens/bearer strings every web tool shares (state lives on disk, so the Brain, in-process lane, REPL, and gateway all see the same jar; see [Universal Cookie Jar](#universal-cookie-jar-utilscookie_jarpy))
+- **`utils/gated_http.py`** — **Helper**: Per-hop scope-gated HTTP (closes the 302-to-out-of-scope bypass); used by cors_probe, ssrf_probe, web_probe, js_recon; `gated_get`/`gated_request` accept an optional caller-managed `requests.Session` (the stateful web_session lane rides this hook without changing default stateless behavior)
 - **`utils/scratch_store.py`** — **Store**: Durable, ownership-scoped scratch storage backing digest/page result projection (see [Result Projection](#result-projection-utilsresult_projectionpy))
 - **`utils/background_job.py`** — **Helper**: Shared background-job launch/poll helper for long-running CLI tools
 - **`utils/handles.py`** — **Helper**: Session handle formatting, parsing, and validation
@@ -184,6 +186,17 @@ returns a `job_id` immediately — the secretary turn is not held open.
 `poll_job` reads the log, checks liveness, tails recent lines, and returns
 a structured `status: "running" | "done"` dict. Each tool pair follows the
 `run_*` / `*_status` / `*_cancel` shape.
+
+Poll verdicts are bounded: ffuf's parsed findings list is capped at
+`FFUF_MAX_FINDINGS` (default 10000, most interesting status codes kept
+first) because a catch-all target — an app that redirects every path, so
+every wordlist word "hits" — can otherwise produce a verdict larger than
+the Brain's 10 MiB wire-frame guard (`MAX_MESSAGE_SIZE`,
+`listeners/thebrain.py`), and the reply dies on the socket read
+("brain dispatch failed: declared message length ... exceeds max"). The
+true count is reported via `findings_total` / `findings_truncated`, and
+the full result set always remains in the job's `-o` JSON output file
+(`meta.output_file`).
 
 ### C/C++ Plugins
 
@@ -527,6 +540,41 @@ sessions) keyed by `session_id`. Tools register connections on open and
 retrieve them for follow-up commands without re-authenticating. Includes
 stale-session cleanup.
 
+### Universal Cookie Jar (`utils/cookie_jar.py`)
+
+Almost every web tool in the framework is a stateless one-shot — it makes
+one request and throws away everything the app handed back. Middleware-managed
+state (Django's CSRF dance, session cookies, bearer tokens) therefore blocks
+audits at the front door: you can't even see the authenticated surface
+without carrying `csrftoken` + `csrfmiddlewaretoken` + `sessionid` between
+calls. Cookies and tokens are just strings, so the jar makes that state
+**durable and universal**:
+
+- **SQLite-backed** (`cookie_jar.db`, WAL): state lives on disk, so every
+  lane — Brain sidecar, in-process fallback, REPL, API gateway — sees the
+  same jar without any cross-process broker. Deliberately sidesteps the
+  process-local limitation of the Session Manager.
+- **Cookie jar** (RFC 6265 matching): domain rules honor `Domain=`-style
+  dot-forms, and IP hosts never match dot-forms (a `.56.106` suffix can't
+  leak a cookie onto `192.168.56.106`). Path rules apply when building
+  ready-made `Cookie:` headers for non-jar-aware tools (ffuf/sqlmap/ZAP).
+- **Token vault**: named token strings per host (CSRF form fields, bearer
+  tokens) with latest-wins upsert. `extract_csrf_tokens()` pulls values from
+  hidden inputs, `<meta>` tags, and response headers (Django, Rails,
+  Laravel, ASP.NET canonical order), HTML-unescaped.
+- **Hygiene**: TTL purge (default 72h via `COOKIE_JAR_TTL_HOURS`) plus
+  server-expiry purge on every mutation; `COOKIE_JAR_DB` overrides the path.
+- **Tools**: `jar_state`, `jar_store_cookie` (paste `a=1; b=2` strings),
+  `jar_store_token`, `jar_clear`, `jar_cookie_header`.
+
+The `session_get`/`session_post`/`session_request` lane
+(`auxiliaries/web_session.py`) applies this state through
+`gated_request(session=...)` — every hop still passes the operator-armed
+scope gate. A Django login becomes three plain calls: `session_get /login/`
+(cookie + token captured) → `session_post /login/` with credentials (form
+field + `X-CSRFToken` header auto-injected, `sessionid` captured) →
+`session_get /dashboard/` (authenticated).
+
 ### Session Handles (`utils/handles.py`)
 
 Typed session handles (`kind:session_id` strings) that tools declare via
@@ -568,7 +616,7 @@ FastAPI server (port **5000** on the host lane; **6000** in the container
 lane) exposing:
 
 - `GET /health` — framework health check
-- `POST /tools/execute` — exact `tool_id` dispatch or semantic lookup (accepts `result_mode`: full|digest|page, default `digest`)
+- `POST /tools/execute` — exact `tool_id` dispatch or semantic lookup (accepts `result_mode`: full|digest|page, default `digest`). Enforces a per-turn tool budget: with `turn_key` (e.g. `chat_id:message_id`), each turn gets `TOOL_BUDGET_PER_TURN` executions (default 10) — the last call's result carries an end-turn directive, and past-the-limit calls are refused outright (memory/findings tools stay callable so the model can report).
 - `POST /tools/search` — semantic tool search (no execution)
 - `POST /scratch/search` — retrieve a stored tool result from the scratch store
 - `GET /scratch/list` — list recent scratch entries for an agent
@@ -904,6 +952,7 @@ auxiliaries/
   tls_info.py           TLS certificate + protocol posture inspector
   web_login_brute.py    Session-aware web-login brute (CSRF token reuse)
   web_probe.py          Concurrent web-surface prober (ports → HTTP intel)
+  web_session.py        Stateful HTTP lane (session_get/post/request over the shared jar)
 utils/
   findings.py           Finding report/render/close/supersede tools
   paramiko_client.py    Persistent SSH tools
@@ -917,7 +966,8 @@ utils/
   result_projection.py  full|digest|page context-projection middleman
   scratch_store.py      Durable scratch store for projected-out results
   crypto_kit.py         Offline decode/identify/attack crypto-encoding workbench
-  gated_http.py         Per-hop scope-gated HTTP GET (redirect-bypass blocker)
+  cookie_jar.py         Universal durable cookie jar + token vault (SQLite)
+  gated_http.py         Per-hop scope-gated HTTP (redirect-bypass blocker; caller-managed session hook)
   wordlists.py          Wordlist utilities
   plugins/              C/C++ shared objects + TLS certs
 encoders/               Encoder plugins (C/C++)

@@ -26,6 +26,15 @@ from pydantic import BaseModel
 from typing import Any, Optional
 from starlette.routing import Route
 
+# Per-turn tool budget (utils/tool_budget.py) — see ToolRequest.turn_key.
+from utils.tool_budget import (
+    BUDGET_EXHAUSTED,
+    BUDGET_LAST,
+    ToolBudget,
+    terminal_directive,
+    wrap_result,
+)
+
 # ---------------------------------------------------------------------------
 # Per-request HTTP trace (gap-h root-cause hunt).  Append-only JSONL to
 # /tmp/gw_http_trace.log; one line per event.  Never raises into the request
@@ -238,6 +247,10 @@ class ToolRequest(BaseModel):
     page_limit: Optional[int] = 50
     # Optional chat id for scratch ownership scoping.
     chat_id: Optional[str] = None
+    # Per-turn tool budget key (utils/tool_budget.py). Each distinct value
+    # starts a fresh budget (e.g. Open WebUI passes chat_id:message_id);
+    # omit for a rolling per-agent counter with idle-TTL reset.
+    turn_key: Optional[str] = None
 
 class ToolSearchRequest(BaseModel):
     intent: str
@@ -318,6 +331,17 @@ _MCP_TOOL_EXECUTE_SCHEMA = {
             "default": 50,
             "description": "Page size cap (page mode only).",
         },
+        "turn_key": {
+            "type": "string",
+            "description": (
+                "Per-turn tool budget key (utils/tool_budget.py). Each "
+                "distinct value starts a fresh tool-call budget for this "
+                "agent (e.g. pass chat_id:message_id so every user message "
+                "gets a fresh budget); omit for a rolling per-agent counter "
+                "reset after idle time. Past-the-limit executions are "
+                "refused; memory and findings tools remain callable."
+            ),
+        },
     },
     # At least one of intent or tool_id must be present; validated in the handler.
 }
@@ -381,6 +405,9 @@ class APIGateway:
         self.tool_registry = tool_registry
         self.memory_service = memory_service
         self.api_key = api_key
+        # Per-turn tool-call budget (utils/tool_budget.py) shared by the
+        # REST and MCP dispatch paths below.
+        self.tool_budget = ToolBudget()
 
         # --- MCP server + transport ------------------------------------------
         # One low-level MCP server exposes the framework's operations as MCP
@@ -471,6 +498,26 @@ class APIGateway:
                     f"Accepted keys: {sorted(self._manifest_param_names(manifest))}",
                 )
 
+            # Per-turn tool budget (utils/tool_budget.py): count the call,
+            # refuse executions past the cap, and wrap the turn's final
+            # result with an end-turn directive. Terminal-lane tools
+            # (memory/findings) stay callable past the cap so the model can
+            # still write itself up.
+            budget_decision, budget_meta = self.tool_budget.pre_dispatch(
+                req.agent_id or "0", req.turn_key, manifest.module_id
+            )
+            if budget_decision == BUDGET_EXHAUSTED:
+                logging.info(
+                    "Budget refused tool %s for agent '%s' (turn %r): %s/%s used",
+                    manifest.module_id, req.agent_id, req.turn_key,
+                    budget_meta.get("used"), budget_meta.get("limit"),
+                )
+                return {
+                    "tool_id": manifest.module_id,
+                    "tool_name": manifest.external_sanitized_description,
+                    "result": budget_meta,
+                }
+
             # agent_id doubles as the Brain session id, so each identified
             # agent gets its own isolated tool state on the sidecar; omitted
             # falls back to the shared default session ("0").
@@ -492,6 +539,16 @@ class APIGateway:
                     chat_id=req.chat_id,
                     page_offset=req.page_offset or 0,
                     page_limit=req.page_limit or 50,
+                )
+
+            # End-turn directive for the turn's final call — applied AFTER
+            # projection so it survives digest replacement and reaches the
+            # model's context either way.
+            if budget_decision == BUDGET_LAST:
+                execution_result = wrap_result(
+                    execution_result,
+                    terminal_directive(BUDGET_LAST, budget_meta["used"], budget_meta["limit"]),
+                    budget_meta,
                 )
 
             # Return the result along with identifying information about the tool used
@@ -749,6 +806,20 @@ class APIGateway:
                         )
                     # agent_id -> Brain session id for per-agent isolation.
                     session_id = arguments.get("agent_id") or "0"
+                    # Per-turn tool budget — same rules as the REST path.
+                    budget_decision, budget_meta = self.tool_budget.pre_dispatch(
+                        session_id, arguments.get("turn_key"), manifest.module_id
+                    )
+                    if budget_decision == BUDGET_EXHAUSTED:
+                        logging.info(
+                            "Budget refused tool %s for agent '%s' (turn %r): %s/%s used",
+                            manifest.module_id, arguments.get("agent_id"),
+                            arguments.get("turn_key"),
+                            budget_meta.get("used"), budget_meta.get("limit"),
+                        )
+                        # Plain text, not isError — an instruction for the
+                        # model to reason over, not a transient error.
+                        return _mcp_text(budget_meta)
                     result = await self.tool_registry.execute_tool(
                         manifest, tool_args, session_id=session_id
                     )
@@ -764,6 +835,14 @@ class APIGateway:
                             chat_id=arguments.get("chat_id"),
                             page_offset=int(arguments.get("page_offset") or 0),
                             page_limit=int(arguments.get("page_limit") or 50),
+                        )
+                    # End-turn directive for the turn's final call (after
+                    # projection so it survives digest replacement).
+                    if budget_decision == BUDGET_LAST:
+                        result = wrap_result(
+                            result,
+                            terminal_directive(BUDGET_LAST, budget_meta["used"], budget_meta["limit"]),
+                            budget_meta,
                         )
                     logger.info(
                         "MCP executed tool %s for intent '%s' (session=%s) with result: %s",
