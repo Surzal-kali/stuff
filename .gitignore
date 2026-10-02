@@ -21,6 +21,10 @@ scope/
 /apk/*
 !/apk/.gitkeep
 !/apk/README.md
+# --- payload dropbox (generated munitions; msfvenom output root) ---
+/dropbox/*
+!/dropbox/.gitkeep
+!/dropbox/README.md
 bugcheck_ledger.md
 ledger_archive/*
 briefs/*
@@ -51,3 +55,4 @@ dockered/.env.save
 .github/*
 hydra.restore
 scratch.*
+cookie_jar.db*

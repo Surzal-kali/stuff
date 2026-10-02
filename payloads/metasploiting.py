@@ -500,6 +500,54 @@ class MetasploitClient:
             category=category,
         )
 
+    async def _start_handler_job(self, payload_name: str, lhost, lport):
+        """Start a standalone persistent ``exploit/multi/handler`` job for an
+        already-chosen reverse/bind payload.
+
+        Shared by ``_execute_module_impl`` (``start_handler=True`` on an
+        exploit dispatch) and the msfvenom lane
+        (``payloads/msfvenom_tools.py:generate_payload`` with
+        ``start_handler=True``) so the bind/listen semantics — load handler
+        module, load payload module, set LHOST/LPORT, execute, settle —
+        live in exactly one place.  The caller resolves LHOST/LPORT from its
+        own context (MSF options dict / PayloadModule defaults / the
+        generate call) before invoking.
+
+        Returns ``(job_id, None)`` on success, ``(None, error_string)`` on
+        failure.  A handler that won't start is not fatal to the exploit
+        itself, but for reverse payloads it usually means no session will
+        form — the caller surfaces the error rather than silently proceeding
+        to the 30s poll with no listener.
+        """
+        try:
+            handler_mod = self.client.modules.use("exploit", "multi/handler")
+            handler_pl = self.client.modules.use("payload", payload_name)
+            handler_pl["LHOST"] = lhost
+            handler_pl["LPORT"] = lport
+            handler_result = handler_mod.execute(payload=handler_pl)
+            handler_job = (
+                handler_result.get("job_id")
+                if isinstance(handler_result, dict)
+                else handler_result
+            )
+            if handler_job is None:
+                return None, (
+                    "Failed to start exploit/multi/handler (MSF returned "
+                    f"no job_id for {payload_name} LHOST={lhost} LPORT={lport}). "
+                    "The port may already be bound by another handler, or the "
+                    "payload/LHOST/LPORT are invalid."
+                )
+            # Give the listener a moment to bind before the payload fires,
+            # so the callback never arrives ahead of the bind.
+            await asyncio.sleep(1.0)
+            return handler_job, None
+        except Exception as e:  # noqa: BLE001 - surface, never mask
+            return None, (
+                f"Failed to start exploit/multi/handler for "
+                f"{payload_name} on {lhost}:{lport}: {e}. The listener "
+                "could not bind (port in use?) or the payload is invalid."
+            )
+
     async def _execute_module_impl(
         self,
         module_path: str,
@@ -846,37 +894,11 @@ class MetasploitClient:
                         "IP the TARGET can route a connection back to. Set "
                         "PAYLOAD, LHOST, LPORT and retry."
                     )
-                try:
-                    handler_mod = self.client.modules.use(
-                        "exploit", "multi/handler"
-                    )
-                    handler_pl = self.client.modules.use("payload", payload_name)
-                    handler_pl["LHOST"] = lhost
-                    handler_pl["LPORT"] = lport
-                    handler_result = handler_mod.execute(payload=handler_pl)
-                    handler_job = (
-                        handler_result.get("job_id") if isinstance(handler_result, dict) else handler_result
-                    )
-                    if handler_job is None:
-                        return (
-                            "Failed to start exploit/multi/handler (MSF returned "
-                            f"no job_id for {payload_name} LHOST={lhost} LPORT={lport}). "
-                            "The port may already be bound by another handler, or the "
-                            "payload/LHOST/LPORT are invalid."
-                        )
-                    # Give the listener a moment to bind before the exploit
-                    # fires, so the callback never arrives ahead of the bind.
-                    await asyncio.sleep(1.0)
-                except Exception as e:
-                    # A handler that won't start is not fatal to the exploit
-                    # itself, but for reverse payloads it usually means no
-                    # session will form — surface it rather than silently
-                    # proceeding to the 30s poll with no listener.
-                    return (
-                        f"Failed to start exploit/multi/handler for "
-                        f"{payload_name} on {lhost}:{lport}: {e}. The listener "
-                        "could not bind (port in use?) or the payload is invalid."
-                    )
+                handler_job, _handler_err = await self._start_handler_job(
+                    payload_name, lhost, lport
+                )
+                if handler_job is None:
+                    return _handler_err
 
                 # We are providing the listener ourselves, so the exploit
                 # module must NOT start its own implicit handler — otherwise

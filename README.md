@@ -120,8 +120,9 @@ becomes the semantic capability description that the registry embeds.
 - **`auxiliaries/tls_info.py`** — **BRAIN_DISPATCH**: TLS certificate + protocol posture inspection (subject/SANs, versions, ciphers, expiry runway)
 - **`auxiliaries/web_login_brute.py`** — **BRAIN_DISPATCH**: Session-aware web-login brute-forcing for CSRF-protected form endpoints (token reuse per session)
 - **`auxiliaries/web_probe.py`** — **BRAIN_DISPATCH**: Concurrent web-surface prober — turns open ports into live HTTP intel (status, title, stack fingerprints) in one envelope
-- **`auxiliaries/web_session.py`** — **BRAIN_DISPATCH**: Stateful HTTP lane — `session_get`/`session_post`/`session_request` carry cookies + CSRF tokens from the universal jar through every scope-gated hop (Django-style login flows end-to-end; see [Universal Cookie Jar](#universal-cookie-jar-utilscookie_jarpy))
+- **`auxiliaries/web_session.py`** — **BRAIN_DISPATCH**: Stateful HTTP lane — `session_get`/`session_post`/`session_request`/`session_upload` carry cookies + CSRF tokens from the universal jar through every scope-gated hop (Django-style login flows end-to-end; `session_upload` is the multipart delivery step of the msfvenom lane; see [Universal Cookie Jar](#universal-cookie-jar-utilscookie_jarpy))
 - **`payloads/metasploiting.py`** — **BRAIN_DISPATCH / MCP_RPC**: Metasploit module search, execution, session polling, interaction
+- **`payloads/msfvenom_tools.py`** — **BRAIN_DISPATCH**: msfvenom payload generation into `dropbox/` (presets per target stack, menu browser, artifact listing) — the file-upload lane's step 1; `start_handler=True` starts the catch listener
 - **`payloads/ffuf.py`** — **BRAIN_DISPATCH**: ffuf web fuzzing: directories, files, vhosts, parameters (launch/poll/cancel)
 - **`payloads/hydra.py`** — **BRAIN_DISPATCH**: Hydra credential brute-force / password-spray (launch/poll/cancel)
 - **`payloads/sqlmap.py`** — **BRAIN_DISPATCH**: sqlmap SQL injection detection (launch/poll with injectable verdict parsing)
@@ -224,6 +225,7 @@ is in your `PATH`.
 | **Radare2** | `auxiliaries/radare2.py` | Static binary analysis; `r2pm -ci r2ghidra` for decompilation |
 | **jadx** | `auxiliaries/jadx.py` | APK/dex/jar decompilation (`apk/` drop folder, cached workspaces, grep/read over decompiled sources) |
 | **Metasploit Framework** | `payloads/metasploiting.py` | MSF RPC integration (MCP sidecar started by `bootstrap.py`) |
+| **msfvenom** | `payloads/msfvenom_tools.py` | Payload artifact generation for upload testing (`dropbox/` output; handler start built in) |
 | **ffuf** | `payloads/ffuf.py` | Web content fuzzing |
 | **Hydra** | `payloads/hydra.py` | Credential brute-force |
 | **sqlmap** | `payloads/sqlmap.py` | SQL injection detection |
@@ -919,6 +921,7 @@ listeners/
   plugins/              C/C++ shared objects (frameit, raw_scan)
 payloads/
   metasploiting.py      Metasploit RPC client (search/execute/sessions)
+  msfvenom_tools.py     msfvenom payload generation + catch handler (upload lane)
   ffuf.py               ffuf web fuzzing (launch/poll/cancel)
   hydra.py              Hydra credential brute-force (launch/poll/cancel)
   sqlmap.py             sqlmap SQL injection (launch/poll)
@@ -952,7 +955,7 @@ auxiliaries/
   tls_info.py           TLS certificate + protocol posture inspector
   web_login_brute.py    Session-aware web-login brute (CSRF token reuse)
   web_probe.py          Concurrent web-surface prober (ports → HTTP intel)
-  web_session.py        Stateful HTTP lane (session_get/post/request over the shared jar)
+  web_session.py        Stateful HTTP lane (session_get/post/upload over the shared jar)
 utils/
   findings.py           Finding report/render/close/supersede tools
   paramiko_client.py    Persistent SSH tools

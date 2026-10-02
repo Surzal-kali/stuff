@@ -110,6 +110,7 @@ def gated_request(
     params: Optional[Dict[str, Any]] = None,
     data: Any = None,
     json: Any = None,
+    files: Any = None,
     verify: bool = True,
     timeout: Tuple[float, float] = (5.0, 15.0),
     max_hops: int = 5,
@@ -133,6 +134,11 @@ def gated_request(
     3xx response (no hop-following) — useful for SSRF probes that want to
     inspect a redirect body without following.
 
+    ``files`` (optional): a requests-shaped multipart files mapping — with it,
+    ``requests`` sends a ``multipart/form-data`` body (file-upload endpoints);
+    paired with a dict ``data``, both travel as multipart form fields.  Dropped
+    on a 303 redirect exactly like the body.
+
     ``session`` (optional): a caller-managed ``requests.Session`` — used
     as-is and NOT closed on return (caller owns the lifecycle; Set-Cookie
     from every hop accumulates on it).  This is the stateful hook the
@@ -148,7 +154,7 @@ def gated_request(
     if not current:
         raise ScopeGateError("scope gate: empty URL")
     cur_method = (method or "GET").upper()
-    cur_data, cur_json, cur_params = data, json, params
+    cur_data, cur_json, cur_params, cur_files = data, json, params, files
     own_session = session is None
     if own_session:
         session = requests.Session()
@@ -165,6 +171,7 @@ def gated_request(
                 params=cur_params,
                 data=cur_data,
                 json=cur_json,
+                files=cur_files,
                 verify=verify,
                 timeout=timeout,
                 allow_redirects=False,
@@ -179,10 +186,10 @@ def gated_request(
             if nxt == current:
                 return resp, hops
             current = nxt
-            # 303 -> GET + drop body; 307/308 -> preserve; 301/302 -> preserve.
+            # 303 -> GET + drop body (and files); 307/308 -> preserve; 301/302 -> preserve.
             if resp.status_code == 303:
                 cur_method = "GET"
-                cur_data, cur_json, cur_params = None, None, None
+                cur_data, cur_json, cur_params, cur_files = None, None, None, None
         raise ScopeGateError(
             f"scope gate: redirect chain exceeded {max_hops} hops; "
             "stopped (all hops so far were in-scope)"

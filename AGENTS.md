@@ -359,6 +359,57 @@ Confirmed end-to-end on `192.168.90.110`: `dispatch_metasploit` with
 persistent `msf:` shell session that `interact_session` reads (`uid=0(root)`
 on `Linux metasploitable`).
 
+### msfvenom Payload Generation (`payloads/msfvenom_tools.py`) + Upload Lane
+
+The file-upload vulnerability testing lane, closing the framework's
+"generate an artifact, push it through a vulnerable upload form" gap. The
+flow every tool in this lane is built around:
+
+    generate_payload  ->  session_upload  ->  session_get (trigger URL)
+    (start_handler=True)       |                        |
+              ^----------------+--- handler catches the callback
+
+- **`generate_payload`** runs msfvenom (subprocess, argv list — no shell)
+  into the gitignored `dropbox/` folder at the repo root (override
+  `MSFVENOM_DROPBOX`; see `dropbox/README.md`). The envelope returns the
+  absolute `out_path` + `sha256` + `size_bytes` — hand `out_path` straight
+  to `session_upload`. `presets` (`php`, `jsp`, `war`, `aspx`, `asp`,
+  `python`, `nodejs`, `ruby`, `elf`, `exe`, `php_bind`) fill
+  payload+format+extension defaults for a target stack; `msfvenom_menu`
+  browses payloads/formats/encoders by substring query; `list_dropbox`
+  recovers artifacts from earlier turns when the `out_path` was lost.
+- **Meterpreter payloads are hard-blocked, mirroring `dispatch_metasploit`**
+  — the in-framework handler lane can never catch their callback
+  (AutoLoadExtensions serialization). Pure shell payloads only.
+- **`start_handler=True`** starts a persistent `exploit/multi/handler` job
+  via `MetasploitClient._start_handler_job` — the shared handler-start
+  primitive extracted from `_execute_module_impl` so both the dispatch lane
+  and this lane start identical listeners. It calls the client *directly*,
+  NOT through `dispatch_metasploit`: the handler is an inbound listener
+  with no RHOSTS, and the armed scope gate refuses exploit dispatches that
+  lack RHOSTS — an end-around that is safe because nothing is sent to a
+  target. A handler failure never fails the generation — it lands in the
+  envelope's `handler` sub-dict; the artifact exists either way.
+- **Scope stance**: generation is offline compute (no gate — same class
+  as `hash_crack`); the *delivery* steps are gated: `session_upload` and
+  the trigger `session_get` are per-hop scope-gated like all framework HTTP.
+- **`session_upload`** (`auxiliaries/web_session.py`) is the multipart
+  delivery step: reads a local artifact, POSTs `multipart/form-data` with
+  jar cookies applied and the stored CSRF token auto-injected as a *form
+  field* (multipart can't carry a raw body string — `data` must be a dict
+  of form fields). `file_name` overrides the multipart filename
+  independently of the local file (extension-filter bypasses are
+  server-side filename games: upload `shell.php.jpg` from a local
+  `shell.php`); the content type is sniffed from that name. Validation of
+  *local* inputs (missing source, size cap via `SESSION_UPLOAD_MAX_MB`,
+  bad `data` shape) raises `ValueError` — `ScopeGateError` stays reserved
+  for "the armed gate blocked traffic", so the secretary never reads a
+  local-input problem as a scope decision.
+- **LHOST reachability** is the operator's call, same rule as the MSF lane:
+  reverse payloads need the target to route back; for targets that can't,
+  use a bind payload (`php_bind` preset, `*/shell_bind_tcp`) and connect
+  after triggering.
+
 ### Open WebUI Tool (`openwebui_tools/framework_bridge.py`)
 
 Open WebUI tool definitions (v0.3.2) that call the framework API for tool
