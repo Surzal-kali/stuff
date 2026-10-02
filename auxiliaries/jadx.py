@@ -1168,6 +1168,114 @@ def _count_all(ws: str, skip: Optional[str] = None) -> int:
 # ---------------------------------------------------------------------------
 # The composite tool
 # ---------------------------------------------------------------------------
+
+def _run_jadx_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Digest adapter for ``run_jadx`` — per-verb compact summary.
+
+    The full jadx output (grep match lists, decompiled source blobs, file
+    trees) is stored in scratch; the model gets a verb-specific digest:
+
+    - **grep**: match count + first N matches (file:line:match) + paging info
+    - **decompile**: java source count + workspace reuse flag + next hints
+    - **tree**: file/dir count + whether truncated + a sample of paths
+    - **read**: line count + truncated flag (the source content is the output)
+    - **manifest**: char count + truncated flag (the XML is the output)
+    - **class**: line count + class name + truncated flag
+    - **error**: the error message (errors pass through in full anyway)
+    """
+    status = str(result.get("status", "")).lower()
+    if status == "error":
+        # Errors are always returned in full by the projection layer.
+        err = result.get("error", "") or result.get("summary", "")
+        return {"summary": f"error: {err[:500]}", "row_hint_format": ""}
+
+    verb = result.get("verb", "unknown")
+    parts: list = [f"status=ok", f"verb={verb}"]
+
+    summary = result.get("summary", "")
+    if summary:
+        parts.append(f"summary={summary[:300]}")
+
+    delta = result.get("delta", "")
+    if delta:
+        parts.append(f"delta={delta[:200]}")
+
+    # --- verb-specific compact fields ---
+    if verb == "grep":
+        matches = result.get("matches", [])
+        total = result.get("total_matches", len(matches))
+        parts.append(f"matches={total}")
+        # Include first 10 matches — file:line:match preview.
+        if matches:
+            match_lines = "\n  ".join(
+                f"{m.get('file', '?')}:{m.get('line', '?')}: "
+                f"{str(m.get('match', ''))[:80]}"
+                for m in matches[:10]
+            )
+            parts.append(f"top_matches:\n  {match_lines}")
+            if total > 10:
+                parts.append(f"  ... +{total - 10} more (retrieve from scratch)")
+        truncated = result.get("truncated", False)
+        if truncated:
+            next_offset = result.get("next_offset")
+            if next_offset:
+                parts.append(f"next_offset={next_offset}")
+
+    elif verb == "decompile":
+        java_count = result.get("java_source_count", 0)
+        parts.append(f"java_sources={java_count}")
+        cached = result.get("cached", False)
+        parts.append(f"cached={'yes' if cached else 'no'}")
+
+    elif verb == "tree":
+        total_files = result.get("total_files", 0)
+        parts.append(f"total_files={total_files}")
+        truncated = result.get("truncated", False)
+        if truncated:
+            parts.append("truncated=True")
+            next_offset = result.get("next_offset")
+            if next_offset:
+                parts.append(f"next_offset={next_offset}")
+        # Include a small sample of paths.
+        listing = result.get("listing", [])
+        if listing:
+            sample = "\n  ".join(str(p) for p in listing[:8])
+            parts.append(f"sample:\n  {sample}")
+
+    elif verb in ("read", "manifest", "class"):
+        # These verbs return content in 'output' — report size + truncation.
+        output = result.get("output", "")
+        if isinstance(output, str) and output:
+            line_count = len([ln for ln in output.splitlines() if ln.strip()])
+            parts.append(f"lines={line_count}")
+        truncated = result.get("truncated", False)
+        if truncated:
+            parts.append("truncated=True")
+        if verb == "class":
+            cls = result.get("single_class", "")
+            if cls:
+                parts.append(f"class={cls}")
+
+    # Common: target name + jadx version.
+    target = result.get("target", "")
+    if target:
+        parts.append(f"target={os.path.basename(target)}")
+
+    # Next hints — guide the model's next jadx call.
+    hints = result.get("next_hints", [])
+    if hints:
+        parts.append(f"hints: {'; '.join(hints[:3])}")
+
+    summary_text = " | ".join(parts)
+
+    row_hint = (
+        "scratch_search scratch:<id> --filter 'api_key|token|secret' "
+        "# pull specific matches from the full output"
+    )
+
+    return {"summary": summary_text, "row_hint_format": row_hint}
+
+
 @framework_tool(
     "Static Android APK analysis with jadx — apk disassembly and "
     "decompilation: disassemble and decompile an APK/dex/jar/aab/xapk into "
@@ -1180,6 +1288,7 @@ def _count_all(ws: str, skip: Optional[str] = None) -> int:
     "from the apk/ drop folder. Runs offline (no network, no scope gate); "
     "the decompile is cached per target and reused until the apk changes.",
     next_hints=["report_finding"],
+    result_digest=lambda r: _run_jadx_digest(r),
 )
 def run_jadx(
     target: str,

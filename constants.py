@@ -11,6 +11,7 @@ def framework_tool(
     accepted_handle_kinds=None,
     next_hints=None,
     tags=None,
+    result_digest=None,
 ):
     """Decorator to mark a function as a framework tool callable by the Brain.
 
@@ -34,6 +35,14 @@ def framework_tool(
     category language surface the tool, and they persist in the registry
     metadata + describe_manifest output.  Decorator tags win over the bulk
     TOOL_TAGS map (daharness/tool_tags.py) for the same tool id.
+    ``result_digest`` (optional callable) registers a per-tool digest adapter
+    used by the result projection layer (utils/result_projection.py).  When
+    ``result_mode='digest'`` is requested, the adapter receives the raw tool
+    result and returns ``{"summary": str, "row_hint_format": str}`` — a
+    compact, structurally-honest digest that replaces the full output in the
+    model's context.  The full output is stored in scratch and retrievable
+    via ``scratch_search``.  Tools without an adapter fall back to a naive
+    head+count preview.  See RFC 2026-10-01.
     """
     def decorator(func):
         func._is_framework_tool = True
@@ -42,5 +51,21 @@ def framework_tool(
         func._accepted_handle_kinds = tuple(accepted_handle_kinds) if accepted_handle_kinds else ()
         func._next_hints = tuple(next_hints) if next_hints else ()
         func._tool_tags = tuple(tags) if tags else ()
+        func._result_digest = result_digest
+        # Register the adapter immediately so the projection layer can find
+        # it by tool_id at projection time.  The tool_id for a decorated
+        # function is ``module.qualname`` (set during discovery); for methods
+        # it's ``module.Class.method``.  We register with a provisional key
+        # here and the registry's discovery pass re-registers under the
+        # exact tool_id once known.  The provisional key uses __module__
+        # + __qualname__ which matches the discovery construction for
+        # module-level functions.
+        if result_digest is not None:
+            try:
+                from utils.result_projection import register_digest_adapter
+                provisional_id = f"{func.__module__}.{func.__qualname__}"
+                register_digest_adapter(provisional_id, result_digest)
+            except ImportError:
+                pass  # result_projection not importable yet (boot ordering)
         return func
     return decorator

@@ -166,11 +166,53 @@ SIGTERM/SIGINT.
 
 FastAPI server (port 5000 on the host lane; 6000 in the container lane):
 - `GET /health` — health check
-- `POST /tools/execute` — exact `tool_id` dispatch, or semantic lookup (`find_best_tool`) + execution
+- `POST /tools/execute` — exact `tool_id` dispatch, or semantic lookup (`find_best_tool`) + execution. Accepts `result_mode` (full|digest|page) for result projection.
 - `POST /tools/search` — candidate menu (top_k) without execution
+- `POST /scratch/search` — retrieve a stored tool result from the scratch store (by `scratch_ref`)
+- `GET /scratch/list` — list recent scratch entries for an agent
+- `GET /scratch/stats` — scratch store statistics
 - `POST /memory/search` — keyword memory search
 - `POST /memory/recall` — vector similarity recall
 - `POST /mcp` — streamable-HTTP MCP endpoint (tools/list + tools/call)
+
+### Result Projection (`utils/result_projection.py`)
+
+Controls what enters the model's context window vs. what stays in scratch.
+Three modes (execution-envelope parameter, NOT a tool argument):
+
+- **`full`** (default) — raw tool result passes through unchanged. Zero behavior change.
+- **`digest`** — stores the full result in scratch, returns a compact per-tool-family digest + a `scratch_ref` + the retrieval instruction. The model is taught the retrieval move every call.
+- **`page`** — stores the full result in scratch, returns a bounded page of list results + a `scratch_ref` + continuation info.
+
+**Why this is not the parked OWUI trim filter:** the projection runs *before*
+the result enters context (not after); the retrieval instruction is part of
+the return (the model never guesses how to get the full output); per-tool-family
+digest logic is honest because the tool knows its own output structure.
+
+**Digest adapter registration:** tools opt in via
+`@framework_tool(..., result_digest=my_digest_fn)`. The adapter takes the raw
+result dict and returns `{"summary": str, "row_hint_format": str}`. Tools
+without an adapter fall back to a naive head+count preview. The adapter is
+registered at decoration time (provisional key) and re-registered under the
+exact `tool_id` during the registry's dynamic-discovery pass.
+
+**Pilot adapter:** `nmap_status` — returns open port count + full port list +
+host state + job_id, omitting the raw log text (retrievable from scratch).
+
+### Scratch Store (`utils/scratch_store.py`)
+
+Durable, ownership-scoped storage for raw tool results. NOT vector memory
+(no embeddings, no semantic recall) and NOT the findings store (no lifecycle).
+Deterministic, reference-keyed store the model retrieves from via
+`scratch_search` when it needs the full or filtered output of a prior tool call.
+
+- **Storage:** `scratch.db` (SQLite metadata) + `scratch-data/` (compressed JSON payloads, 0700/0600).
+- **IDs:** opaque random values (`scratch:<16-hex>`), never sequential — a guess from another chat cannot leak data.
+- **Ownership:** every entry is scoped to `agent_id`; a valid-looking ref from the wrong agent returns "not found".
+- **Persistence:** entries survive a framework restart (on-disk).
+- **TTL:** 24h (env `SCRATCH_TTL_HOURS`); cleanup runs on every `store()` call.
+- **Caps:** per-entry 256 MiB (`SCRATCH_MAX_PAYLOAD_MB`), per-agent 1 GiB (`SCRATCH_MAX_AGENT_MB`).
+- **Atomic writes:** payload written to temp → fsync → rename → metadata commit. A crash never leaves a torn entry.
 
 ### Memory Service (`memories.py`)
 

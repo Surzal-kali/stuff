@@ -167,8 +167,9 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
     """Launch hydra against ``target`` and return immediately.
 
     Hydra runs as a detached background subprocess writing to a per-job log
-    file; this call does NOT block on the run.  Poll the result with
-    ``hydra_status(job_id)`` until it reports ``status: "done"``.
+    file; this call does NOT block on the run.  Perform one status poll to
+    confirm it is running, then hand off to the user.  Poll again only when
+    the user requests an update.
 
     The ``target`` is hydra's ``service://server[:port][/OPT]`` operand
     (e.g. ``ssh://10.10.10.50:22``, ``ftp://192.168.0.5``, or for HTTP forms
@@ -225,12 +226,82 @@ def run_hydra(target: str, options: str = "") -> Dict[str, Any]:
     return job
 
 
+def _hydra_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Digest adapter for ``hydra_status`` — cracked creds + progress only.
+
+    The full hydra log (thousands of attempt lines) is stored in scratch;
+    the model gets:
+    - job status (running/done) + elapsed
+    - cracked credential pairs (host:login:password) — small and critical
+    - attempt progress (N of M)
+    - job_id (needed for re-polling)
+    - status_line (hydra's completion summary)
+
+    The model rarely needs the raw attempt log to decide the next action —
+    the cracked pairs ARE the actionable signal.  When it needs the full log
+    (e.g. to see which attempts failed and why), it retrieves from scratch.
+    """
+    parts: list = []
+
+    status = result.get("status", "unknown")
+    parts.append(f"status={status}")
+
+    if result.get("elapsed") is not None:
+        parts.append(f"elapsed={result['elapsed']}s")
+
+    creds = result.get("credentials", [])
+    creds_found = result.get("credentials_found", len(creds))
+    if creds:
+        parts.append(f"credentials_found={creds_found}")
+        # The credential pairs are the primary actionable signal — include
+        # them in full so the model can chain to ssh_exec, db_connect, etc.
+        cred_lines = "\n  ".join(
+            f"{c['host']}:{c['login']}:{c['password']}" for c in creds[:20]
+        )
+        parts.append(f"creds:\n  {cred_lines}")
+        if len(creds) > 20:
+            parts.append(f"  ... +{len(creds) - 20} more (retrieve full list from scratch)")
+    else:
+        parts.append("credentials_found=0")
+
+    attempts = result.get("attempts", {})
+    if attempts.get("total"):
+        parts.append(f"progress={attempts.get('done', '?')}/{attempts['total']}")
+
+    status_line = result.get("status_line")
+    if status_line:
+        parts.append(f"summary={status_line[:200]}")
+
+    job_id = result.get("job_id")
+    if job_id:
+        parts.append(f"job_id={job_id}")
+
+    exit_code = result.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+
+    timed_out = result.get("timed_out")
+    if timed_out:
+        parts.append("timed_out=True")
+
+    summary = " | ".join(parts)
+
+    row_hint = (
+        "scratch_search scratch:<id> --filter 'login' "
+        "# pull specific credential entries from the full output"
+    )
+
+    return {"summary": summary, "row_hint_format": row_hint}
+
+
 @framework_tool(
     "Poll, check, or monitor the progress and results of an existing, "
     "already-launched Hydra brute-force job: returns running/done, a parsed "
     "list of cracked credentials (host/login/password), attempt progress "
-    "(N of M), and recent log lines. Call until the job reports done.",
+    "(N of M), and recent log lines. Call once only when the user requests an "
+    "update; never poll repeatedly until done.",
     next_hints=["hydra_status", "report_finding"],
+    result_digest=lambda r: _hydra_status_digest(r),
 )
 def hydra_status(job_id: str) -> Dict[str, Any]:
     """Poll the progress of a run launched by ``run_hydra``.

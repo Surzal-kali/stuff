@@ -113,9 +113,10 @@ def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
     db_schema_farm), which speak MySQL/MSSQL/PostgreSQL wire protocols with
     the credentials and need no injectable parameter.
 
-    sqlmap runs as a detached background subprocess writing to a per-job log
-    file; this call does NOT block on the scan. Poll the result with
-    ``sqlmap_status(job_id)`` until it reports ``status: "done"``.
+    "sqlmap runs as a detached background subprocess writing to a per-job log
+    file; this call does NOT block on the scan. Perform one status poll to
+    confirm it is running, then hand off to the user. Poll again only when the
+    user requests an update.
 
     ``--batch`` is forced (appended if not already in ``options``) so sqlmap
     never blocks on an interactive prompt, and stdin is /dev/null as a
@@ -242,14 +243,19 @@ def run_sqlmap(target_url: str, options: str = "") -> Dict[str, Any]:
         "log_file": log_path,
         "target": target_url,
         "started": started,
-        "message": "poll with sqlmap_status(job_id) until status == 'done'",
+        "message": (
+            "launch accepted; perform one status poll to confirm the job is "
+            "running, then hand off to the user. Poll again only when the "
+            "user requests an update."
+        ),
     }
 
 
 @framework_tool(
     "Poll a sqlmap scan job: returns running/done, a parsed injectable "
-    "verdict, the detected DBMS, and recent log lines. Call until the "
-    "scan reports done. The DBMS name in the verdict pairs with the direct "
+    "verdict, the detected DBMS, and recent log lines. Call once only when "
+    "the user requests an update; never poll repeatedly until done. The DBMS "
+    "name in the verdict pairs with the direct "
     "db_* tools (db_connect / db_schema_farm) once credentials are known - "
     "sqlmap itself stays the injection lane only.",
     next_hints=["sqlmap_status", "report_finding"],

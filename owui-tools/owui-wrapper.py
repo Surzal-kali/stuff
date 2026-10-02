@@ -167,6 +167,9 @@ class Tools:
         tool_id: str,
         arguments: str = "{}",
         agent_id: str = "",
+        result_mode: str = "digest",
+        page_offset: int = 0,
+        page_limit: int = 50,
         __model__: dict | None = None,
         __metadata__: dict | None = None,
     ) -> str:
@@ -182,6 +185,17 @@ class Tools:
             model id + chat id (owui-<model>-<chat>), so parallel bug-bounty
             chats never share tool state. Reuse the same explicit value
             across chats to deliberately share state.
+        :param result_mode: Result projection — controls what enters your
+            context window. 'digest' (default) stores the full result in
+            scratch and returns a compact summary + a scratch_ref you can
+            retrieve later with framework_scratch_search. 'page' returns a
+            bounded page of list results + a scratch_ref. 'full' returns the
+            raw tool result with no projection. Small results (under ~2KB)
+            always pass through in full regardless of mode — only large
+            outputs (scans, grep dumps, fuzzing results) trigger projection.
+            Use 'full' only when you need the complete raw output in context.
+        :param page_offset: Page offset (page mode only).
+        :param page_limit: Page size cap (page mode only, default 50).
         """
         try:
             args = json.loads(arguments or "{}")
@@ -191,7 +205,43 @@ class Tools:
             return f"ERROR: 'arguments' is not valid JSON ({e}). Pass a JSON object string."
         payload = {"tool_id": tool_id, "arguments": args}
         payload["agent_id"] = agent_id or self._chat_agent_id(__model__, __metadata__)
+        payload["result_mode"] = result_mode or "digest"
+        if result_mode and result_mode.lower() == "page":
+            payload["page_offset"] = page_offset
+            payload["page_limit"] = page_limit
         return self._post("/tools/execute", payload)
+
+    def framework_scratch_search(
+        self,
+        scratch_ref: str,
+        agent_id: str = "",
+        offset: int = 0,
+        limit: int = 0,
+        filter: str = "",
+        __model__: dict | None = None,
+        __metadata__: dict | None = None,
+    ) -> str:
+        """Retrieve the full or filtered output of a prior tool call whose
+        result_mode was 'digest' or 'page'. The scratch_ref comes from the
+        result envelope of a framework_run_tool call with result_mode='digest'
+        or result_mode='page'.
+
+        :param scratch_ref: The scratch:<hex> reference from a prior result.
+        :param agent_id: Leave empty to use this chat's auto-derived agent id
+            (must match the agent_id used for the original framework_run_tool call).
+        :param offset: Skip the first N items in list-bearing results.
+        :param limit: Return at most N items (0 = no limit; use sparingly).
+        :param filter: Case-insensitive substring filter on list items.
+        """
+        payload = {
+            "scratch_ref": scratch_ref,
+            "offset": offset,
+            "limit": limit,
+        }
+        if filter:
+            payload["filter"] = filter
+        payload["agent_id"] = agent_id or self._chat_agent_id(__model__, __metadata__)
+        return self._post("/scratch/search", payload)
 
     def framework_memory_search(
         self, query_text: str, namespace: str, agent_id: str = ""

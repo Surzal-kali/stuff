@@ -1104,11 +1104,16 @@ def zap_open_url(target: str,
     return result
 
 
-@framework_tool("Start the traditional ZAP spider against a URL; returns spider_id.")
+@framework_tool(
+    "Start the traditional ZAP spider against a URL; returns spider_id. "
+    "Confirm launch with one status call, then hand off to the user; poll "
+    "again only when the user requests an update."
+)
 @_zap_error_guard
 def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[str, str]:
     """Crawl from ``target`` up to ``max_depth`` hops. Returns the spider id;
-    poll with ``zap_spider_status`` until it reaches 100.
+    perform one status call to confirm launch, then hand off to the user.
+    Poll again only when the user requests an update.
 
     Args:
         target: Fully qualified URL to start crawling from.
@@ -1130,7 +1135,10 @@ def zap_spider(target: str, max_depth: int = 5, recurse: bool = True) -> Dict[st
     return {"spider_id": _zap().spider(target, max_depth=max_depth, recurse=recurse)}
 
 
-@framework_tool("Get spider progress (0..100) for a given spider_id.")
+@framework_tool(
+    "Get spider progress (0..100) for a given spider_id. Call once only when "
+    "the user requests an update; never poll repeatedly until complete."
+)
 @_zap_error_guard
 def zap_spider_status(scan_id: str) -> Dict[str, Any]:
     """Args:
@@ -1142,8 +1150,9 @@ def zap_spider_status(scan_id: str) -> Dict[str, Any]:
 @framework_tool("Start the AJAX (headless-browser) spider against a URL.")
 @_zap_error_guard
 def zap_ajax_spider(target: str) -> Dict[str, str]:
-    """The AJAX spider is a singleton — there is no per-scan ID.  Poll
-    progress with ``zap_ajax_spider_status`` (it takes no scan-id argument).
+    """The AJAX spider is a singleton — there is no per-scan ID.  Perform one
+    status call to confirm launch, then hand off to the user.  Poll progress
+    again only when the user requests an update.
 
     Args:
         target: Fully qualified URL to start the headless-browser crawl from.
@@ -1155,7 +1164,10 @@ def zap_ajax_spider(target: str) -> Dict[str, str]:
     return {"status": _zap().ajax_spider(target)}
 
 
-@framework_tool("Get AJAX spider progress (running / stopped / finished) for a given spider_id.")
+@framework_tool(
+    "Get AJAX spider progress (running / stopped / finished). Call once only "
+    "when the user requests an update; never poll repeatedly until complete."
+)
 @_zap_error_guard
 def zap_ajax_spider_status() -> Dict[str, str]:
     return {"status": _zap().ajax_spider_status()}

@@ -178,7 +178,12 @@ def launch_job(
         "log_file": log_path,
         "tool": tool_name,
         "started": started,
-        "message": f"poll with the matching {tool_name}_status(job_id) until status == 'done'",
+        "message": (
+            "launch accepted; perform one status poll to confirm the job is "
+            "running, then hand off to the user. Do not poll repeatedly; "
+            f"call {tool_name}_status(job_id) again only when the user requests "
+            "an update."
+        ),
     }
 
 

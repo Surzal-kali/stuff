@@ -420,13 +420,108 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
     return job
 
 
+def _ffuf_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Digest adapter for ``ffuf_status`` — hit summary + status distribution.
+
+    The full ffuf output (hundreds/thousands of path rows) is stored in
+    scratch; the model gets:
+    - job status (running/done) + elapsed
+    - hit count + status code distribution (200, 301, 403, 500, ...)
+    - top hits by interest (200s first, then 3xx redirects, then 403s)
+    - job_id (needed for re-polling)
+    - run meta (URL, method, wordlist)
+
+    The model rarely needs the raw fuzz log to decide the next action — the
+    status distribution + interesting paths ARE the triage signal.  When it
+    needs the full hit list (e.g. to feed specific paths to sqlmap or ZAP),
+    it retrieves from scratch.
+    """
+    parts: list = []
+
+    status = result.get("status", "unknown")
+    parts.append(f"status={status}")
+
+    if result.get("elapsed") is not None:
+        parts.append(f"elapsed={result['elapsed']}s")
+
+    findings = result.get("findings", [])
+    findings_count = result.get("findings_count", len(findings))
+    parts.append(f"hits={findings_count}")
+
+    # Status code distribution — the primary triage signal.
+    if findings:
+        status_counts: Dict[int, int] = {}
+        for f in findings:
+            code = f.get("status")
+            if code is not None:
+                status_counts[code] = status_counts.get(code, 0) + 1
+        if status_counts:
+            dist = ", ".join(
+                f"{code}:{count}" for code, count
+                in sorted(status_counts.items())
+            )
+            parts.append(f"status_dist={dist}")
+
+        # Top hits: 200s first, then 3xx, then 403s — capped at 15.
+        def _interest(f):
+            code = f.get("status", 0)
+            if code == 200:
+                return 0
+            elif 300 <= code < 400:
+                return 1
+            elif code == 403:
+                return 2
+            elif code == 500:
+                return 3
+            return 4
+
+        top = sorted(findings, key=_interest)[:15]
+        hit_lines = "\n  ".join(
+            f"{f.get('status', '?')} {f.get('path', '?')} "
+            f"(size={f.get('size', '?')}, words={f.get('words', '?')})"
+            for f in top
+        )
+        parts.append(f"top_hits:\n  {hit_lines}")
+        if findings_count > 15:
+            parts.append(f"  ... +{findings_count - 15} more (retrieve full list from scratch)")
+
+    job_id = result.get("job_id")
+    if job_id:
+        parts.append(f"job_id={job_id}")
+
+    exit_code = result.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+
+    timed_out = result.get("timed_out")
+    if timed_out:
+        parts.append("timed_out=True")
+
+    # Run meta (compact — URL + method only).
+    meta = result.get("meta", {})
+    if meta.get("URL"):
+        parts.append(f"url={meta['URL'][:120]}")
+    if meta.get("Method"):
+        parts.append(f"method={meta['Method']}")
+
+    summary = " | ".join(parts)
+
+    row_hint = (
+        "scratch_search scratch:<id> --filter '200' "
+        "# pull specific status-code hits from the full output"
+    )
+
+    return {"summary": summary, "row_hint_format": row_hint}
+
+
 @framework_tool(
     "Poll, check, or monitor the progress and results of an existing, "
     "already-launched ffuf fuzzing job: returns running/done, a parsed list "
     "of discovered paths with HTTP status / size / words / lines, run meta "
-    "(URL, method, threads, wordlist), and recent log lines. Call until the "
-    "job reports done.",
+    "(URL, method, threads, wordlist), and recent log lines. Call once only "
+    "when the user requests an update; never poll repeatedly until done.",
     next_hints=["ffuf_status", "report_finding"],
+    result_digest=lambda r: _ffuf_status_digest(r),
 )
 def ffuf_status(job_id: str) -> Dict[str, Any]:
     """Poll the progress of a run launched by ``run_ffuf``.

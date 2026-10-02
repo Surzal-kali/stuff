@@ -97,7 +97,9 @@ def _nmap_target_argv(target: str) -> List[str]:
     "Launch and start a new Nmap port scan on a target, subnet, or CIDR "
     "range: discovers live hosts and enumerates open ports and services. "
     "Non-blocking and detached — starts the scan in the background and "
-    "returns immediately with a scan ID for later retrieval. NSE scripts "
+    "returns immediately with a scan ID for later retrieval. Confirm the "
+    "launch with one status poll, then hand off to the user; poll again only "
+    "when the user requests an update. NSE scripts "
     "(--script) run any of the 600+ installed .nse files — service enum "
     "and version probes (smb-enum-shares, smb-enum-users, ldap-search, "
     "ldap-rootdse), vulnerability checks (smb-vuln-ms17-010, "
@@ -111,8 +113,9 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     """Launch nmap against ``target`` and return immediately.
 
     nmap runs as a detached background subprocess writing to a per-job log
-    file; this call does NOT block on the scan.  Poll the result with
-    ``nmap_status(job_id)`` until it reports ``status: "done"``.
+    file; this call does NOT block on the scan.  Perform one status poll to
+    confirm it is running, then hand off to the user.  Do not poll repeatedly;
+    poll again only when the user requests an update.
 
     ``-Pn`` is the default (hosts that drop ping probes would otherwise
     report "Host seems down" even when their ports are reachable).  Pass
@@ -153,12 +156,78 @@ def run_nmap(target: str, options: str = "-Pn -sV") -> Dict[str, Any]:
     )
 
 
+def _nmap_status_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Digest adapter for ``nmap_status`` — compact port/service summary.
+
+    The full nmap log (which can be thousands of lines for ``-p- -sV``) is
+    stored in scratch; the model gets:
+    - job status (running/done) + elapsed
+    - host state (up/down)
+    - open port count + the full port list (these are small and critical)
+    - job_id (needed for re-polling)
+    - log_file path (operator-side access)
+
+    The model rarely needs the raw log text to decide the next action — the
+    parsed port list IS the actionable signal.  When it does need the full
+    log (e.g. NSE script output), it retrieves it from scratch.
+    """
+    parts: list = []
+
+    status = result.get("status", "unknown")
+    parts.append(f"status={status}")
+
+    if result.get("elapsed") is not None:
+        parts.append(f"elapsed={result['elapsed']}s")
+
+    host_state = result.get("host_state")
+    if host_state:
+        parts.append(f"host={host_state}")
+
+    open_ports = result.get("open_ports", [])
+    if open_ports:
+        parts.append(f"open_ports={len(open_ports)}")
+        # The port list is small and is the primary actionable signal —
+        # include it in full so the model can chain to the right tool
+        # (e.g. ssh_exec on 22, probe_web on 80/443, smb_scanner on 445).
+        port_lines = "\n  ".join(open_ports[:30])
+        parts.append(f"ports:\n  {port_lines}")
+        if len(open_ports) > 30:
+            parts.append(f"  ... +{len(open_ports) - 30} more (retrieve full list from scratch)")
+    else:
+        parts.append("open_ports=0")
+
+    # job_id is critical — the model needs it to re-poll.
+    job_id = result.get("job_id")
+    if job_id:
+        parts.append(f"job_id={job_id}")
+
+    # Exit code on completed scans.
+    exit_code = result.get("exit_code")
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+
+    timed_out = result.get("timed_out")
+    if timed_out:
+        parts.append("timed_out=True")
+
+    summary = " | ".join(parts)
+
+    row_hint = (
+        "scratch_search scratch:<id> --filter 'port' "
+        "# pull specific port entries from the full output"
+    )
+
+    return {"summary": summary, "row_hint_format": row_hint}
+
+
 @framework_tool(
     "Poll, check, or monitor the progress and results of an existing, "
     "already-launched Nmap scan job: returns running/done, a parsed list "
     "of open ports with services, the host up/down verdict, and recent "
-    "log lines. Call until the scan reports done.",
+    "log lines. Call once only when the user requests a status update; never "
+    "poll repeatedly or automatically until the scan finishes.",
     next_hints=["nmap_status", "report_finding"],
+    result_digest=lambda r: _nmap_status_digest(r),
 )
 def nmap_status(job_id: str) -> Dict[str, Any]:
     """Poll the progress of a scan launched by ``run_nmap``.

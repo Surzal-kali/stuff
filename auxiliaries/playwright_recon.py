@@ -153,8 +153,9 @@ def playwright_fetch(
 
 @framework_tool(
     "Launch a bounded rendered-DOM crawl (BFS over same-origin in-scope links) "
-    "via the scope-enforcing playwright sidecar. Returns a job_id — poll with "
-    "playwright_crawl_status. Each visited page yields the same envelope as "
+    "via the scope-enforcing playwright sidecar. Returns a job_id; perform one "
+    "status poll to confirm launch, then hand off to the user. Poll again only "
+    "when the user requests an update. Each visited page yields the same envelope as "
     "playwright_fetch. Out-of-scope links are skipped and reported in "
     "blocked. Same-origin by default (set same_origin=False to follow "
     "cross-origin in-scope links). Scope-gated per navigation at the browser "
@@ -190,7 +191,8 @@ def playwright_crawl(
 
 
 @framework_tool(
-    "Poll a playwright_crawl job for progress + results. Status is running / "
+    "Poll a playwright_crawl job once for progress + results when the user "
+    "requests an update; never poll repeatedly. Status is running / "
     "done / deadline / error. Results (per-page envelopes) are returned once "
     "the crawl finishes; blocked lists out-of-scope links skipped. Pass the "
     "job_id from playwright_crawl.",

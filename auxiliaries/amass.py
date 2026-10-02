@@ -369,8 +369,9 @@ def _get_amass_meta(job_id: str) -> Optional[Dict[str, Any]]:
     "background. PASSIVE by default (no traffic to target). Add '-active' "
     "for zone transfers and cert grabs, '-brute' for DNS brute forcing, "
     "'-alts' for permutation generation. Non-blocking — starts the scan "
-    "and returns immediately with a job_id. Poll with amass_status(job_id) "
-    "until status == 'done'. Allowed flags: -active, -brute, -alts, "
+    "and returns immediately with a job_id. Confirm the launch with one "
+    "status poll, then hand off to the user; poll again only when the user "
+    "requests an update. Allowed flags: -active, -brute, -alts, "
     "-norecursive, -rigid, -w <wordlist>, -timeout <minutes>, "
     "-include <sources>, -exclude <sources>, -max-depth <n>, -p <ports>.",
     next_hints=["amass_status", "subdomain_enum (structured result with alive check)"],
@@ -379,8 +380,9 @@ def run_amass(target, options="", scope_platform=None, scope_handle=None):
     """Launch amass enum against a domain and return immediately.
 
     amass runs as a detached background subprocess writing to a per-job log
-    file; this call does NOT block on the scan.  Poll the result with
-    ``amass_status(job_id)`` until it reports ``status: "done"``.
+    file; this call does NOT block on the scan.  Perform one status poll to
+    confirm it is running, then hand off to the user.  Poll again only when
+    the user requests an update.
 
     In amass v5, the enum subprocess does NOT print names to stdout.  The
     status function handles v5 retrieval (``amass subs -names``) and crt.sh
@@ -466,7 +468,11 @@ def run_amass(target, options="", scope_platform=None, scope_handle=None):
         "job_id": job_id,
         "status": "running",
         "target": target,
-        "message": "poll with amass_status(job_id) until status == 'done'",
+        "message": (
+            "launch accepted; perform one status poll to confirm the job is "
+            "running, then hand off to the user. Poll again only when the "
+            "user requests an update."
+        ),
     }
     if scope_platform and scope_handle:
         resp["scope_filter"] = f"{scope_platform}_{scope_handle}.scope"
@@ -480,8 +486,8 @@ def run_amass(target, options="", scope_platform=None, scope_handle=None):
     "Poll an amass enum job: returns running/done, discovered subdomain "
     "names (retrieved via amass v5's subs command + crt.sh fallback), and "
     "scope-filtered results if a per-company scope file was selected at "
-    "launch. Call until status "
-    "reports done.",
+    "launch. Call once only when the user requests an update; never poll "
+    "repeatedly until done.",
     next_hints=["subdomain_enum", "run_nmap -iL <subdomains>"],
 )
 def amass_status(job_id):
@@ -781,7 +787,8 @@ def _resolve_alive(
     "(scope_platform+scope_handle, e.g. 'bugcrowd'+'tesla' after "
     "load_program_scope(platform=...) — omit to run UNFILTERED). "
     "Non-blocking — starts the scan and returns immediately with a job_id. "
-    "Poll with subdomain_enum_status(job_id) until status == 'done' for a "
+    "Confirm the launch with one status poll, then hand off to the user; "
+    "poll again only when the user requests an update for a "
     "structured JSON result: {subdomains, alive, out_of_scope}. "
     "Passive by default; pass options for active/brute modes.",
     next_hints=["subdomain_enum_status", "run_nmap -iL <alive subdomains>"],
@@ -790,8 +797,9 @@ def subdomain_enum(target, options="", scope_platform=None, scope_handle=None):
     """Launch amass enum + alive-check composite and return immediately.
 
     amass runs as a detached background subprocess; this call does NOT block.
-    Poll the result with ``subdomain_enum_status(job_id)`` until it reports
-    ``status: "done"``.  When done, the status function retrieves names
+    Perform one status poll to confirm it is running, then hand off to the
+    user.  Poll again only when the user requests an update.  When done, the
+    status function retrieves names
     (amass v5 ``amass subs`` + crt.sh fallback), filters against program
     scope, and DNS-resolves in-scope subdomains to check if they're alive.
 
@@ -880,14 +888,19 @@ def subdomain_enum(target, options="", scope_platform=None, scope_handle=None):
         "job_id": job_id,
         "status": "running",
         "target": target,
-        "message": "poll with subdomain_enum_status(job_id) until status == 'done'",
+        "message": (
+            "launch accepted; perform one status poll to confirm the job is "
+            "running, then hand off to the user. Poll again only when the "
+            "user requests an update."
+        ),
     }
 
 
 @framework_tool(
     "Poll a subdomain_enum job: returns running/done plus a structured "
     "JSON result with discovered subdomains, alive (DNS-resolved) hosts, "
-    "and out-of-scope names. Call until status reports done.",
+    "and out-of-scope names. Call once only when the user requests an update; "
+    "never poll repeatedly until done.",
     next_hints=["run_nmap -iL <alive subdomains>", "zap_open_url on discovered hosts"],
 )
 def subdomain_enum_status(job_id):

@@ -519,6 +519,74 @@ def _hints_for(command: str, output: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # The tool
 # ---------------------------------------------------------------------------
+
+def _run_r2_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Digest adapter for ``run_r2`` — command + summary + line count + delta.
+
+    The full r2 output (disassembly blobs, string dumps, function lists) is
+    stored in scratch; the model gets:
+    - status (ok/error) + the r2 command that ran
+    - the one-line summary (already curated by _summarize)
+    - the delta note (what this run surfaced)
+    - line count + truncated flag (so the model knows if there's more)
+    - target name + r2ghidra availability
+
+    The model rarely needs the raw disassembly to decide the next action —
+    the summary + delta + hints are the actionable signal.  When it needs
+    the full output (e.g. reading a specific function's decompiled C), it
+    retrieves from scratch.
+    """
+    parts: list = []
+
+    status = result.get("status", "unknown")
+    parts.append(f"status={status}")
+
+    command = result.get("command", "")
+    if command:
+        parts.append(f"cmd={command}")
+
+    summary = result.get("summary", "")
+    if summary:
+        parts.append(f"summary={summary[:300]}")
+
+    delta = result.get("delta", "")
+    if delta:
+        parts.append(f"delta={delta[:200]}")
+
+    # Line count from the output (how much was produced).
+    output = result.get("output", "")
+    if isinstance(output, str) and output:
+        line_count = len([ln for ln in output.splitlines() if ln.strip()])
+        parts.append(f"lines={line_count}")
+
+    truncated = result.get("truncated", False)
+    if truncated:
+        omitted = result.get("omitted_bytes", 0)
+        parts.append(f"truncated=({omitted} bytes omitted)")
+
+    target = result.get("target", "")
+    if target:
+        parts.append(f"target={os.path.basename(target)}")
+
+    r2ghidra = result.get("r2ghidra")
+    if r2ghidra is not None:
+        parts.append(f"r2ghidra={'yes' if r2ghidra else 'no'}")
+
+    # Include next_hints — they guide the model's next r2 command.
+    hints = result.get("next_hints", [])
+    if hints:
+        parts.append(f"hints: {'; '.join(hints[:3])}")
+
+    summary_text = " | ".join(parts)
+
+    row_hint = (
+        "scratch_search scratch:<id> --filter 'sym.' "
+        "# pull specific symbol/function lines from the full output"
+    )
+
+    return {"summary": summary_text, "row_hint_format": row_hint}
+
+
 @framework_tool(
     "Static binary analysis with radare2: disassemble, decompile (r2ghidra), "
     "enumerate symbols/imports/exports/sections/strings, and query cross-"
@@ -532,6 +600,7 @@ def _hints_for(command: str, output: str) -> List[str]:
     "stated policy — narrow with addr/count or a targeted verb instead of "
     "raising the cap.",
     next_hints=["report_finding"],
+    result_digest=lambda r: _run_r2_digest(r),
 )
 def run_r2(
     target: str,

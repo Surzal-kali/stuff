@@ -579,6 +579,27 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                         # passing an msf: handle to an ssh_exec tool).
                         handle_kinds = getattr(func, "_accepted_handle_kinds", ()) or ()
                         next_hints = getattr(func, "_next_hints", ()) or ()
+                        # Result projection: register the per-tool digest
+                        # adapter (if set via @framework_tool(...,
+                        # result_digest=fn)) under the EXACT tool_id.  The
+                        # decorator registers a provisional key at import
+                        # time; this re-registers under the discovery-
+                        # constructed tool_id so the projection layer finds
+                        # it by the id the model actually calls.
+                        result_digest_fn = getattr(func, "_result_digest", None)
+                        result_digest_ref = None
+                        if callable(result_digest_fn):
+                            result_digest_ref = getattr(
+                                result_digest_fn, "__qualname__",
+                                result_digest_fn.__name__,
+                            )
+                            try:
+                                from utils.result_projection import (
+                                    register_digest_adapter as _reg_digest,
+                                )
+                                _reg_digest(tool_id, result_digest_fn)
+                            except ImportError:
+                                pass
                         manifests.append(
                             ToolManifest(
                                 module_id=tool_id,
@@ -591,6 +612,7 @@ class ToolRegistry(ExecutorMixin, SecretaryMixin):
                                 accepted_handle_kinds=tuple(handle_kinds),
                                 next=list(next_hints),
                                 tags=tags,
+                                result_digest_ref=result_digest_ref,
                             )
                         )
                 except Exception as e:

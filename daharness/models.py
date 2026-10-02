@@ -46,6 +46,13 @@ class ToolManifest(BaseModel):
     # Surfaced in describe_manifest so the secretary sees the category next
     # to every search hit.
     tags: Tuple[str, ...] = Field(default_factory=tuple)
+    # Per-tool digest adapter for the result projection layer
+    # (utils/result_projection.py).  Populated from the
+    # @framework_tool(..., result_digest=fn) decorator.  Stored as the
+    # adapter's qualname string (not the callable itself) so the manifest
+    # stays serializable for ChromaDB metadata.  The registry resolves the
+    # callable at discovery time and registers it with result_projection.
+    result_digest_ref: Optional[str] = None
 
     @classmethod
     def from_output(cls, payload: Any) -> Union["ToolManifest", List["ToolManifest"]]:

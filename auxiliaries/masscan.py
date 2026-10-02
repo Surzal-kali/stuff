@@ -342,7 +342,8 @@ def _parse_masscan_verdict(out_path: str):
     "range, or CIDR (e.g. 10.0.0.0/24, 192.168.0.1-50, or a comma-merged "
     "list). Discovers open TCP/UDP ports at high speed. Non-blocking and "
     "detached — starts the scan in the background and returns immediately "
-    "with a job ID. Poll with masscan_status(job_id) until status == 'done'. "
+    "with a job ID. Confirm the launch with one status poll, then hand off to "
+    "the user; poll again only when the user requests an update. "
     "JSON output is captured to a per-job file and parsed into a structured "
     "list of open ports per host; results survive interruption (truncated "
     "JSON is tolerated). Default rate is masscan's safe 100 pps; pass a "
@@ -365,8 +366,9 @@ def run_masscan(
     """Launch masscan against ``target`` and return immediately.
 
     masscan runs as a detached background subprocess writing JSON to a
-    per-job file; this call does NOT block.  Poll with
-    ``masscan_status(job_id)`` until ``status == "done"``.
+    per-job file; this call does NOT block.  Perform one status poll to confirm
+    it is running, then hand off to the user.  Poll again only when the user
+    requests an update.
 
     Args:
         target: Required. IP, hyphen-range (``a.b.c.d-a.b.c.e``), CIDR
@@ -545,8 +547,9 @@ def run_masscan(
     "already-launched Masscan port scan: returns running/done, a parsed "
     "list of hosts with open ports (port/proto/state/reason/ttl, plus "
     "banner if --banners was used), open-port totals, whether the JSON "
-    "output was truncated (interrupted), and recent log lines. Call until "
-    "the scan reports done. Partial results are returned even if the job "
+    "output was truncated (interrupted), and recent log lines. Call once only "
+    "when the user requests an update; never poll repeatedly until done. "
+    "Partial results are returned even if the job "
     "was interrupted.",
     next_hints=["masscan_status", "run_nmap", "report_finding"],
 )

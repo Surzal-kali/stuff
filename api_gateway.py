@@ -226,6 +226,18 @@ class ToolRequest(BaseModel):
     # Must be a TOP-LEVEL request field, NOT a tool argument (concurrent MCP
     # clients each pass their own; tool schemas stay clean).
     agent_id: Optional[str] = None
+    # Result projection mode: "digest" (default — stores full result in
+    # scratch, returns a compact summary + scratch_ref), "page" (bounded page
+    # of list results + scratch_ref), "full" (raw result, no projection).
+    # Small results (under ~2KB) always pass through in full regardless of
+    # mode — only large outputs trigger projection.  This is an execution-
+    # envelope field — it never reaches the tool body.
+    result_mode: Optional[str] = "digest"
+    # Page-mode parameters (ignored unless result_mode="page").
+    page_offset: Optional[int] = 0
+    page_limit: Optional[int] = 50
+    # Optional chat id for scratch ownership scoping.
+    chat_id: Optional[str] = None
 
 class ToolSearchRequest(BaseModel):
     intent: str
@@ -245,6 +257,13 @@ class MemoryRecallRequest(BaseModel):
     query_embedding: list
     limit: Optional[int] = 5
     agent_id: Optional[str] = None
+
+class ScratchSearchRequest(BaseModel):
+    scratch_ref: str
+    agent_id: Optional[str] = None
+    offset: Optional[int] = 0
+    limit: Optional[int] = 0
+    filter: Optional[str] = None
 
 
 # Input schemas advertised over MCP — kept in sync with the models above so a
@@ -274,6 +293,30 @@ _MCP_TOOL_EXECUTE_SCHEMA = {
         "agent_id": {
             "type": "string",
             "description": "Identity of the running model/agent. Used as the Brain session id so concurrent agents get isolated tool state (e.g. separate msfconsole handles). Omit to use the shared default session.",
+        },
+        "result_mode": {
+            "type": "string",
+            "enum": ["full", "digest", "page"],
+            "default": "digest",
+            "description": (
+                "Result projection mode. 'digest' (default) stores the full "
+                "result in scratch and returns a compact per-tool digest + a "
+                "scratch_ref for later retrieval. 'page' returns a bounded "
+                "page of list results + a scratch_ref. 'full' returns the raw "
+                "tool result with no projection. Small results (under ~2KB) "
+                "always pass through in full regardless of mode. Use 'full' "
+                "only when you need the complete raw output in context."
+            ),
+        },
+        "page_offset": {
+            "type": "integer",
+            "default": 0,
+            "description": "Page offset (page mode only).",
+        },
+        "page_limit": {
+            "type": "integer",
+            "default": 50,
+            "description": "Page size cap (page mode only).",
         },
     },
     # At least one of intent or tool_id must be present; validated in the handler.
@@ -330,6 +373,7 @@ TOOL_EXECUTE = "tools_execute"
 TOOL_SEARCH = "tools_search"
 MEMORY_SEARCH = "memory_search"
 MEMORY_RECALL = "memory_recall"
+SCRATCH_SEARCH = "scratch_search"
 
 
 class APIGateway:
@@ -434,6 +478,22 @@ class APIGateway:
                 manifest, req.arguments or {}, session_id=req.agent_id or "0"
             )
 
+            # Result projection: if result_mode is non-full, store the raw
+            # result in scratch and return a digest/page envelope instead.
+            # This is the context-control layer — see utils/result_projection.py.
+            mode = (req.result_mode or "full").strip().lower()
+            if mode != "full" and isinstance(execution_result, dict):
+                from utils.result_projection import project_result
+                execution_result = project_result(
+                    execution_result,
+                    result_mode=mode,
+                    tool_id=manifest.module_id,
+                    agent_id=req.agent_id or "0",
+                    chat_id=req.chat_id,
+                    page_offset=req.page_offset or 0,
+                    page_limit=req.page_limit or 50,
+                )
+
             # Return the result along with identifying information about the tool used
             logging.info(f"Executed tool {manifest.module_id} for intent '{req.intent}' with result: {execution_result}")
             return {
@@ -462,6 +522,43 @@ class APIGateway:
                     self.tool_registry.describe_manifest(m, lean=True) for m in manifests
                 ],
             }
+
+        @self.app.post("/scratch/search")
+        async def scratch_search(req: ScratchSearchRequest):
+            """Retrieve a stored tool result from the scratch store.
+
+            Called by the OWUI framework_scratch_search wrapper (or any
+            client) to pull the full or filtered output of a prior tool call
+            whose result_mode was 'digest' or 'page'.  Ownership is scoped
+            to agent_id — a ref from another agent returns 'not found'.
+            """
+            from utils.scratch_store import get_store
+            store = get_store()
+            result = store.retrieve(
+                req.scratch_ref,
+                agent_id=req.agent_id or "0",
+                offset=req.offset or 0,
+                limit=req.limit or 0,
+                filter_pattern=req.filter,
+            )
+            if result.get("status") == "error":
+                raise HTTPException(404, result["error"])
+            return result
+
+        @self.app.get("/scratch/list")
+        async def scratch_list(agent_id: str = "", limit: int = 20):
+            """List recent scratch entries for an agent (metadata only)."""
+            from utils.scratch_store import get_store
+            store = get_store()
+            return {"entries": store.list_entries(agent_id or "0", limit=limit)}
+
+        @self.app.get("/scratch/stats")
+        async def scratch_stats(agent_id: str = ""):
+            """Scratch store statistics (global or per-agent)."""
+            from utils.scratch_store import get_store
+            store = get_store()
+            return store.stats(agent_id or None)
+
         logging.basicConfig(level=logging.INFO)
 
         @self.app.post("/memory/search")
@@ -547,6 +644,46 @@ class APIGateway:
                     ),
                     inputSchema=_MCP_MEMORY_RECALL_SCHEMA,
                 ),
+                mcp_types.Tool(
+                    name=SCRATCH_SEARCH,
+                    description=(
+                        "Retrieve the full or filtered output of a prior tool "
+                        "call whose result_mode was 'digest' or 'page'. Pass "
+                        "the scratch_ref (e.g. 'scratch:abc123') returned by "
+                        "tools_execute, plus the agent_id that was used for "
+                        "the original call. Optional offset/limit page list "
+                        "fields; optional filter narrows by case-insensitive "
+                        "substring. Mirrors POST /scratch/search."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "scratch_ref": {
+                                "type": "string",
+                                "description": "The scratch:<hex> reference from a prior tools_execute result.",
+                            },
+                            "agent_id": {
+                                "type": "string",
+                                "description": "The agent_id used for the original call (ownership check).",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Skip the first N items in list-bearing results.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Return at most N items (0 = no limit).",
+                            },
+                            "filter": {
+                                "type": "string",
+                                "description": "Case-insensitive substring filter on list items.",
+                            },
+                        },
+                        "required": ["scratch_ref"],
+                    },
+                ),
             ]
 
         @server.call_tool()
@@ -615,6 +752,19 @@ class APIGateway:
                     result = await self.tool_registry.execute_tool(
                         manifest, tool_args, session_id=session_id
                     )
+                    # Result projection (same as REST path).
+                    mode = (arguments.get("result_mode") or "full").strip().lower()
+                    if mode != "full" and isinstance(result, dict):
+                        from utils.result_projection import project_result
+                        result = project_result(
+                            result,
+                            result_mode=mode,
+                            tool_id=manifest.module_id,
+                            agent_id=session_id,
+                            chat_id=arguments.get("chat_id"),
+                            page_offset=int(arguments.get("page_offset") or 0),
+                            page_limit=int(arguments.get("page_limit") or 50),
+                        )
                     logger.info(
                         "MCP executed tool %s for intent '%s' (session=%s) with result: %s",
                         manifest.module_id, intent, session_id, result,
@@ -657,6 +807,23 @@ class APIGateway:
                         limit=limit,
                         agent_id=agent_id,
                     )
+                    return _mcp_text(result)
+
+                if name == SCRATCH_SEARCH:
+                    scratch_ref = arguments.get("scratch_ref")
+                    if not scratch_ref:
+                        return self._error(f"{SCRATCH_SEARCH}: 'scratch_ref' is required")
+                    from utils.scratch_store import get_store
+                    store = get_store()
+                    result = store.retrieve(
+                        scratch_ref,
+                        agent_id=arguments.get("agent_id") or "0",
+                        offset=int(arguments.get("offset") or 0),
+                        limit=int(arguments.get("limit") or 0),
+                        filter_pattern=arguments.get("filter"),
+                    )
+                    if result.get("status") == "error":
+                        return self._error(result["error"])
                     return _mcp_text(result)
 
                 return self._error(f"Unknown MCP tool: {name}")

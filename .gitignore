@@ -50,3 +50,4 @@ dockered/.env.save
 .vscode/*
 .github/*
 hydra.restore
+scratch.*

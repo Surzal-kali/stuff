@@ -535,11 +535,56 @@ in `schema.md`. The findings table shares this database.
 FastAPI server (port 5000) exposing:
 
 - `GET /health` — framework health check
-- `POST /tools/execute` — semantic tool lookup + execution
+- `POST /tools/execute` — semantic tool lookup + execution (accepts `result_mode`: full|digest|page)
 - `POST /tools/search` — semantic tool search (no execution)
+- `POST /scratch/search` — retrieve a stored tool result from the scratch store
+- `GET /scratch/list` — list recent scratch entries for an agent
+- `GET /scratch/stats` — scratch store statistics
 - `POST /memory/search` — keyword memory search
 - `POST /memory/recall` — vector similarity recall
 - `POST /mcp` — streamable-HTTP MCP endpoint (`tools/list` + `tools/call`)
+
+### Result Projection (`utils/result_projection.py`)
+
+Controls what enters the model's context window vs. what stays in scratch.
+Three modes (execution-envelope parameter, NOT a tool argument):
+
+- **`full`** (default) — raw tool result passes through unchanged. Zero
+  behavior change.
+- **`digest`** — stores the full result in scratch, returns a compact
+  per-tool-family digest + a `scratch_ref` + the retrieval instruction. The
+  model is taught the retrieval move every call.
+- **`page`** — stores the full result in scratch, returns a bounded page of
+  list results + a `scratch_ref` + continuation info.
+
+**Why this is not the parked OWUI trim filter:** the projection runs *before*
+the result enters context (not after); the retrieval instruction is part of
+the return (the model never guesses how to get the full output); per-tool-family
+digest logic is honest because the tool knows its own output structure.
+
+**Digest adapter registration:** tools opt in via
+`@framework_tool(..., result_digest=my_digest_fn)`. The adapter takes the raw
+result dict and returns `{"summary": str, "row_hint_format": str}`. Tools
+without an adapter fall back to a naive head+count preview.
+
+**Pilot adapter:** `nmap_status` — returns open port count + full port list +
+host state + job_id, omitting the raw log text (retrievable from scratch).
+
+### Scratch Store (`utils/scratch_store.py`)
+
+Durable, ownership-scoped storage for raw tool results. NOT vector memory
+(no embeddings, no semantic recall) and NOT the findings store (no lifecycle).
+Deterministic, reference-keyed store the model retrieves from via
+`framework_scratch_search` when it needs the full or filtered output of a
+prior tool call.
+
+- **Storage:** `scratch.db` (SQLite metadata) + `scratch-data/` (compressed JSON payloads, 0700/0600).
+- **IDs:** opaque random values (`scratch:<16-hex>`), never sequential.
+- **Ownership:** every entry is scoped to `agent_id`; a valid-looking ref from the wrong agent returns "not found".
+- **Persistence:** entries survive a framework restart (on-disk).
+- **TTL:** 24h (env `SCRATCH_TTL_HOURS`); cleanup runs on every `store()` call.
+- **Caps:** per-entry 256 MiB (`SCRATCH_MAX_PAYLOAD_MB`), per-agent 1 GiB (`SCRATCH_MAX_AGENT_MB`).
+- **Atomic writes:** payload written to temp → fsync → rename → metadata commit.
 
 Also serves MCP (Model Context Protocol) handlers for tool listing and
 execution. If `GATEWAY_API_KEY` is set, every request is authenticated;
@@ -608,6 +653,9 @@ values; see `.env.example` for the full key list):
 | `SECRETARY_TURN_TIMEOUT` | `600` | Secretary turn wall-clock cap (seconds) |
 | `SQLMAP_TIMEOUT` | `1800` | sqlmap scan wall-clock cap (seconds) |
 | `ROUTER_MAX_DISTANCE` | `1.1` | API-path semantic-match refusal threshold (ChromaDB L2; lower = stricter) |
+| `SCRATCH_TTL_HOURS` | `24` | Scratch store entry TTL (hours); expired entries are cleaned up on every store call |
+| `SCRATCH_MAX_PAYLOAD_MB` | `256` | Per-entry payload cap for the scratch store (MiB) |
+| `SCRATCH_MAX_AGENT_MB` | `1024` | Per-agent total payload cap for the scratch store (MiB) |
 | `ZAP_PROXY_BIND` | `0.0.0.0` | ZAP browser-proxy bind address (daemon API ACL stays loopback) |
 | `ZAP_XMX` | `512m` | ZAP daemon JVM heap size |
 | `INTIGRITI_USERNAME` | — | Intigriti platform username (scope integration) |
