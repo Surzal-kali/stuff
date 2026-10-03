@@ -233,6 +233,8 @@ SAFE_ARGS: Dict[str, Dict[str, Any]] = {
     "utils.paramiko_client.ssh_shell": {"handle": "ssh:sess-0000", "command": "echo test"},
     "utils.paramiko_client.ssh_close": {"handle": "ssh:sess-0000"},
     "utils.paramiko_client.paramiko_client": {"host": "127.0.0.1", "username": "test", "password": "test", "command": "echo test"},
+    "auxiliaries.ldap_search.ldap_rootdse": {"host": "127.0.0.1"},
+    "auxiliaries.ldap_search.ldap_search": {"host": "127.0.0.1", "base_dn": "dc=example,dc=com"},
 }
 
 # Tools that require a live service and should be skipped in --safe sweep
