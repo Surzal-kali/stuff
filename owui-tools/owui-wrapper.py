@@ -167,7 +167,7 @@ class Tools:
         tool_id: str,
         arguments: str = "{}",
         agent_id: str = "",
-        result_mode: str = "digest",
+        result_mode: str = "large",
         page_offset: int = 0,
         page_limit: int = 50,
         __model__: dict | None = None,
@@ -186,14 +186,15 @@ class Tools:
             chats never share tool state. Reuse the same explicit value
             across chats to deliberately share state.
         :param result_mode: Result projection — controls what enters your
-            context window. 'digest' (default) stores the full result in
-            scratch and returns a compact summary + a scratch_ref you can
-            retrieve later with framework_scratch_search. 'page' returns a
-            bounded page of list results + a scratch_ref. 'full' returns the
-            raw tool result with no projection. Small results (under ~2KB)
-            always pass through in full regardless of mode — only large
-            outputs (scans, grep dumps, fuzzing results) trigger projection.
-            Use 'full' only when you need the complete raw output in context.
+            context window. 'large' (default) returns the actual data with
+            field-caps so a single response can't blow up your context —
+            results under 16KB pass through unchanged; larger results are
+            field-truncated and the full copy is stored in scratch
+            (retrievable with framework_scratch_search). 'digest' stores the
+            full result in scratch and returns a compact one-liner summary +
+            a scratch_ref. 'page' returns a bounded page of list results +
+            a scratch_ref. 'full' is gone (aliased to 'large') — it was an
+            unbounded passthrough that could 6x a cloud model's context.
         :param page_offset: Page offset (page mode only).
         :param page_limit: Page size cap (page mode only, default 50).
         """
@@ -205,7 +206,7 @@ class Tools:
             return f"ERROR: 'arguments' is not valid JSON ({e}). Pass a JSON object string."
         payload = {"tool_id": tool_id, "arguments": args}
         payload["agent_id"] = agent_id or self._chat_agent_id(__model__, __metadata__)
-        payload["result_mode"] = result_mode or "digest"
+        payload["result_mode"] = result_mode or "large"
         if result_mode and result_mode.lower() == "page":
             payload["page_offset"] = page_offset
             payload["page_limit"] = page_limit

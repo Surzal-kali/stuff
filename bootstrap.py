@@ -68,6 +68,16 @@ ZAP_PROXY_BIND = os.getenv("ZAP_PROXY_BIND", "0.0.0.0")
 # via shell export before restart, e.g.  export ZAP_XMX=2g
 ZAP_XMX = os.getenv("ZAP_XMX", "512m")
 
+# Burp Suite MCP Server BApp (auxiliaries/burp_mcp.py uses these).  Unlike
+# ZAP/MSF, Burp is NOT launched by this bootstrap — the operator runs the
+# Burp GUI with the MCP Server BApp loaded.  These vars configure where the
+# BApp's SSE endpoint is (default 127.0.0.1:9876, set in the BApp's MCP tab
+# advanced options).  BURP_MCP=1 gates the launch-time healthcheck so the
+# framework boots cleanly when Burp isn't running (the common lab case).
+BURP_MCP_ENABLED = os.getenv("BURP_MCP", "").lower() in ("1", "true", "yes")
+BURP_MCP_HOST = os.getenv("BURP_MCP_HOST", "127.0.0.1")
+BURP_MCP_PORT = int(os.getenv("BURP_MCP_PORT", "9876"))
+
 # --- Async Background Runner ---
 class AsyncBackgroundRunner:
     """Runs an asyncio event loop in a separate background thread."""
@@ -483,6 +493,33 @@ class FrameworkLoader:
                        "zap_* tools will fail until it does", timeout)
         return False
 
+    async def wait_for_burp_mcp(self, timeout=15):
+        """Probe the Burp MCP Server BApp's SSE endpoint.
+
+        Unlike ZAP/MSF, we do NOT launch Burp — it's a GUI app the operator
+        runs with the MCP Server BApp loaded.  This healthcheck just verifies
+        the SSE endpoint is reachable so ``burp_*`` tools won't hang on first
+        call.  Non-fatal: if Burp isn't running, the framework boots fine and
+        ``burp_*`` tools return a structured 'not reachable' error when
+        called.  Only runs when BURP_MCP=1 (opt-in, same pattern as the
+        Playwright sidecar gate).
+        """
+        from auxiliaries.burp_mcp import BurpMCPClient
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if BurpMCPClient.get_instance().healthcheck():
+                    logger.info("[+] Burp MCP server is up at %s:%s",
+                                BURP_MCP_HOST, BURP_MCP_PORT)
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        logger.warning("[!] Burp MCP server did not respond within %ss; "
+                       "burp_* tools will return a not-reachable error until "
+                       "Burp is running with the BApp enabled", timeout)
+        return False
+
     async def start_playwright_sidecar(self, host=None, port=None):
         """Start the scope-enforcing Playwright recon sidecar as a subprocess.
 
@@ -745,6 +782,14 @@ class FrameworkLoader:
         # the spider/ascan tools will otherwise fail their first call with
         # ConnectionError on a half-initialised daemon.
         await self.wait_for_zap()
+
+        # Burp MCP healthcheck (env-gated, opt-in — BURP_MCP=1).  Unlike
+        # ZAP/MSF we do NOT launch Burp; this just verifies the BApp's SSE
+        # endpoint is reachable if the operator said they're running it.
+        # Non-fatal: the framework boots fine without Burp; burp_* tools
+        # return a structured not-reachable error when called.
+        if BURP_MCP_ENABLED:
+            await self.wait_for_burp_mcp()
 
         # Post-launch: if an operator-armed scope exists, mirror it into ZAP
         # (context includes/excludes) and flip mode=protect — ZAP itself then

@@ -241,7 +241,7 @@ class ToolRequest(BaseModel):
     # Small results (under ~2KB) always pass through in full regardless of
     # mode — only large outputs trigger projection.  This is an execution-
     # envelope field — it never reaches the tool body.
-    result_mode: Optional[str] = "digest"
+    result_mode: Optional[str] = "large"
     # Page-mode parameters (ignored unless result_mode="page").
     page_offset: Optional[int] = 0
     page_limit: Optional[int] = 50
@@ -525,11 +525,15 @@ class APIGateway:
                 manifest, req.arguments or {}, session_id=req.agent_id or "0"
             )
 
-            # Result projection: if result_mode is non-full, store the raw
-            # result in scratch and return a digest/page envelope instead.
-            # This is the context-control layer — see utils/result_projection.py.
-            mode = (req.result_mode or "full").strip().lower()
-            if mode != "full" and isinstance(execution_result, dict):
+            # Result projection: ``large`` (default) caps field sizes so a single
+            # response can't blow up the model's context; ``digest`` compacts
+            # to a one-liner; ``page`` returns a bounded page.  ``full`` is
+            # gone — aliased to ``large`` by the projection layer.
+            # See utils/result_projection.py.
+            mode = (req.result_mode or "large").strip().lower()
+            if mode != "large" or True:
+                # Every mode goes through project_result now — large is the
+                # passthrough-with-caps path, not a skip.
                 from utils.result_projection import project_result
                 execution_result = project_result(
                     execution_result,
@@ -823,9 +827,10 @@ class APIGateway:
                     result = await self.tool_registry.execute_tool(
                         manifest, tool_args, session_id=session_id
                     )
-                    # Result projection (same as REST path).
-                    mode = (arguments.get("result_mode") or "full").strip().lower()
-                    if mode != "full" and isinstance(result, dict):
+                    # Result projection (same as REST path).  Default is
+                    # ``large`` — capped passthrough, not unbounded ``full``.
+                    mode = (arguments.get("result_mode") or "large").strip().lower()
+                    if isinstance(result, dict):
                         from utils.result_projection import project_result
                         result = project_result(
                             result,

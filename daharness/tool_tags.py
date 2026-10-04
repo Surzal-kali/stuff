@@ -198,6 +198,32 @@ TOOL_TAGS: Dict[str, Tuple[str, ...]] = {
     "auxiliaries.masscan.run_masscan": ("net.raw",),
     "auxiliaries.masscan.masscan_status": ("net.raw",),
     "auxiliaries.masscan.masscan_cancel": ("net.raw",),
+    # --- Burp Suite MCP integration (precision web testing via BApp) ---------
+    # Burp complements ZAP: ZAP is the autonomous spider/scan workhorse;
+    # Burp is the precision instrument for crafted requests, history grep,
+    # and Repeater/Intruder hand-off.  No active scan via MCP (use ZAP).
+    "auxiliaries.burp_mcp.burp_send_http1_request": ("web.probe",),
+    "auxiliaries.burp_mcp.burp_send_http2_request": ("web.probe",),
+    "auxiliaries.burp_mcp.burp_send_raw": ("web.probe",),
+    "auxiliaries.burp_mcp.burp_get_proxy_history": ("recon.web",),
+    "auxiliaries.burp_mcp.burp_get_proxy_history_regex": ("recon.web",),
+    "auxiliaries.burp_mcp.burp_get_proxy_websocket_history": ("recon.web",),
+    "auxiliaries.burp_mcp.burp_get_proxy_websocket_history_regex": ("recon.web",),
+    "auxiliaries.burp_mcp.burp_create_repeater_tab": ("web.probe",),
+    "auxiliaries.burp_mcp.burp_create_repeater_tab_http2": ("web.probe",),
+    "auxiliaries.burp_mcp.burp_send_to_intruder": ("web.fuzz",),
+    # infra (framework tooling + internals) ---------------------------------
+    "auxiliaries.burp_mcp.burp_set_proxy_intercept": ("infra",),
+    "auxiliaries.burp_mcp.burp_set_task_engine_state": ("infra",),
+    "auxiliaries.burp_mcp.burp_url_encode": ("infra",),
+    "auxiliaries.burp_mcp.burp_url_decode": ("infra",),
+    "auxiliaries.burp_mcp.burp_base64_encode": ("infra",),
+    "auxiliaries.burp_mcp.burp_base64_decode": ("infra",),
+    "auxiliaries.burp_mcp.burp_output_project_options": ("infra",),
+    "auxiliaries.burp_mcp.burp_output_user_options": ("infra",),
+    "auxiliaries.burp_mcp.burp_list_tools": ("infra",),
+    "auxiliaries.burp_mcp.burp_reconnect": ("infra",),
+    "auxiliaries.burp_mcp.burp_health": ("infra",),
     # --- infra (framework tooling + internals) ---------------------------------
     "auxiliaries.framework_status.framework_health": ("infra",),
     "auxiliaries.cert_tools.generate_certs": ("infra",),

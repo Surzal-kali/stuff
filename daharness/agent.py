@@ -706,16 +706,16 @@ async def secretary_execute_tool(
     if isinstance(result, dict) and warnings:
         result = {**result, "argument_warnings": warnings}
 
-    # Result projection: if the caller requested a non-full result_mode,
-    # store the full result in scratch and replace it with a digest/page
-    # envelope.  This runs BEFORE _cap_tool_stdout and _chaining_hint so
-    # the projection owns the context-footprint decision.  The digest
-    # preserves any handles/job_ids the chaining hints depend on (they're
-    # in the summary).  Default is 'digest' — small results pass through
-    # in full automatically (see utils/result_projection.py).  See RFC
-    # 2026-10-01.
-    result_mode = str(args.pop("_result_mode", "digest")).strip().lower()
-    if result_mode != "full" and isinstance(result, dict):
+    # Result projection: ``large`` (default) is capped passthrough — the
+    # model gets the actual data (status, handles, headers, body previews)
+    # with every string field capped so a single response can't blow up
+    # context.  ``digest`` compacts to a one-liner + scratch_ref.  ``full``
+    # is gone — aliased to ``large``.  This runs BEFORE _cap_tool_stdout
+    # and _chaining_hint so the projection owns the context-footprint
+    # decision.  The caps preserve handles/job_ids (short strings pass
+    # through under the char cap).  See RFC 2026-10-01.
+    result_mode = str(args.pop("_result_mode", "large")).strip().lower()
+    if isinstance(result, dict):
         from utils.result_projection import project_result
         result = project_result(
             result,

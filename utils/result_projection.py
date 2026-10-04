@@ -3,11 +3,24 @@
 The projection layer sits between ``execute_tool()`` and the result entering
 the model's conversation history.  It operates in three modes:
 
-    full    — zero behavior change; the raw result passes through unchanged.
+    large   — (default) the raw result with every string field capped to
+              ``LARGE_FIELD_CHAR_CAP`` chars and the total serialized size
+              capped to ``LARGE_MODE_BYTE_CAP`` bytes.  When the result is
+              under the cap it passes through unchanged (zero behavior
+              change for small/medium results).  When it exceeds the cap,
+              the full result is stored in scratch and the capped copy + a
+              scratch_ref is returned — the model gets the actual data it
+              needs (status, handles, headers, body previews) without a
+              single response blowing up its context window.
     digest  — store the full result in scratch, return a compact per-tool-family
               digest + the scratch reference + the retrieval instruction.
     page    — store the full result in scratch, return a bounded page of the
               result (offset/limit) + the scratch reference + continuation info.
+
+``full`` is gone — it was an unbounded passthrough that could deliver a
+100KB+ response wholesale into a cloud model's context.  ``large`` replaces
+it as the "give me the actual data" mode: same data shape, field-capped.
+For backward compatibility ``full`` is silently aliased to ``large``.
 
 The ``result_mode`` is an execution-envelope parameter — it is NOT a tool
 argument and never reaches the tool body.  The gateway and the secretary
@@ -48,6 +61,34 @@ logger = logging.getLogger(__name__)
 # retrieval round-trip for the model.  Only large outputs (nmap logs, ffuf
 # hit lists, grep match dumps) trigger the digest/page projection.
 _SMALL_RESULT_THRESHOLD = int(os.getenv("SCRATCH_SMALL_RESULT_BYTES", "2048"))
+
+# --- Large-mode caps -------------------------------------------------------
+# ``large`` mode is the default for every lane (REST, MCP, secretary, OWUI).
+# It behaves like the old ``full`` passthrough for results under the byte
+# cap, but field-truncates + stores-in-scratch when a single response would
+# otherwise blow up the model's context window.  Two knobs:
+#
+#   LARGE_MODE_BYTE_CAP  — total serialized JSON size (bytes) at which the
+#                          result is stored in scratch and a capped copy is
+#                          returned instead.  Under the cap = zero change.
+#                          Default 16384 (16 KiB) — large enough for a full
+#                          nmap port list + headers + a Burp body_text, but
+#                          small enough that a 100KB HTML dump or a 50KB
+#                          scan log can't enter context wholesale.
+#
+#   LARGE_FIELD_CHAR_CAP — per-string-field truncation length (chars) when
+#                          the byte cap is exceeded.  Each string field in
+#                          the result dict is truncated to this many chars
+#                          with a ``...[truncated N chars]`` marker.  Lists
+#                          are capped to the first N items where N is derived
+#                          from the byte cap.  Default 4096.
+#
+# These caps are deliberately generous — ``large`` is "give me the data",
+# not "summarize it for me".  ``digest`` is the summarize mode.  The caps
+# exist so a pathological single response (raw HTML, huge grep dump) can't
+# 6x the context window before anyone notices.
+_LARGE_MODE_BYTE_CAP = int(os.getenv("LARGE_MODE_BYTE_CAP", "16384"))
+_LARGE_FIELD_CHAR_CAP = int(os.getenv("LARGE_FIELD_CHAR_CAP", "4096"))
 
 
 # --- Digest adapter registry -----------------------------------------------
@@ -132,9 +173,23 @@ def project_result(
         - ``digest`` mode: a digest envelope with a scratch reference.
         - ``page`` mode: a bounded page envelope with a scratch reference.
     """
-    mode = (result_mode or "full").strip().lower()
+    mode = (result_mode or "large").strip().lower()
 
-    if mode == "full" or not isinstance(result, dict):
+    # ``full`` is gone — aliased to ``large`` for backward compat so stale
+    # callers, old tests, and hardcoded ``result_mode='full'`` strings don't
+    # break.  ``full`` was an unbounded passthrough that could deliver a
+    # 100KB+ response wholesale into a cloud model's context; ``large``
+    # replaces it with field-capped data that still carries the actual
+    # values the model needs.
+    if mode == "full":
+        mode = "large"
+
+    if mode == "large":
+        return _project_large(result, mode=mode, tool_id=tool_id,
+                              agent_id=agent_id, chat_id=chat_id,
+                              page_offset=page_offset, page_limit=page_limit)
+
+    if not isinstance(result, dict):
         return result
 
     # Unwrap the executor transport envelope before projecting.
@@ -187,12 +242,12 @@ def project_result(
         )
     except Exception as exc:
         logger.warning(f"[projection] scratch store failed for {tool_id}: {exc}")
-        # Storage failed — return the full result so the model isn't left
-        # with nothing.  This is a graceful degradation, not a silent loss.
+        # Storage failed — return the capped result so the model isn't left
+        # with nothing and a single failure can't blow up context.
         result["_projection_note"] = (
-            f"scratch store unavailable ({exc}); returning full result"
+            f"scratch store unavailable ({exc}); returning capped result"
         )
-        return result
+        return _cap_result_fields(result)
 
     scratch_ref = scratch_info["scratch_ref"]
 
@@ -204,9 +259,129 @@ def project_result(
             offset=page_offset, limit=page_limit,
         )
     else:
-        # Unknown mode — degrade to full.
-        logger.warning(f"[projection] unknown result_mode {result_mode!r}; returning full")
+        # Unknown mode — degrade to large (capped, never unbounded).
+        logger.warning(f"[projection] unknown result_mode {result_mode!r}; degrading to large")
+        return _cap_result_fields(result)
+
+
+# --- Large mode (default: capped passthrough) ------------------------------
+
+def _cap_result_fields(
+    result: Dict[str, Any],
+    *,
+    char_cap: int = _LARGE_FIELD_CHAR_CAP,
+    byte_cap: int = _LARGE_MODE_BYTE_CAP,
+) -> Dict[str, Any]:
+    """Truncate every string field and list in ``result`` to stay under byte_cap.
+
+    Returns a shallow-copied dict with:
+    - Every string value truncated to ``char_cap`` chars (with a marker).
+    - Every list truncated to a derived item count (enough to fill the byte
+      cap, min 10, max 200).
+    - Nested dicts recursed into.
+    - A ``_projection`` sub-dict noting what was capped + the scratch_ref.
+
+    This is the ``large`` mode's core: the model gets the actual data shape
+    with real values, just field-capped so no single response can dominate
+    the context window.
+    """
+    # Derive a list-item cap from the byte cap: assume ~256 bytes per item
+    # on average, but never fewer than 10 or more than 200.
+    list_item_cap = max(10, min(200, byte_cap // 256))
+
+    def _cap_value(val: Any, depth: int = 0) -> Any:
+        if depth > 6:  # prevent infinite recursion on cyclic structures
+            return "<depth_capped>"
+        if isinstance(val, str):
+            if len(val) <= char_cap:
+                return val
+            return val[:char_cap] + f"...[truncated {len(val) - char_cap} chars]"
+        if isinstance(val, list):
+            if len(val) <= list_item_cap:
+                return [_cap_value(v, depth + 1) for v in val]
+            capped = [_cap_value(v, depth + 1) for v in val[:list_item_cap]]
+            capped.append(f"...[{len(val) - list_item_cap} more items truncated]")
+            return capped
+        if isinstance(val, dict):
+            return {k: _cap_value(v, depth + 1) for k, v in val.items()}
+        # Numbers, bools, None — pass through.
+        return val
+
+    return {k: _cap_value(v) for k, v in result.items()}
+
+
+def _project_large(
+    result: Dict[str, Any],
+    *,
+    mode: str,
+    tool_id: str,
+    agent_id: str,
+    chat_id: Optional[str],
+    page_offset: int,
+    page_limit: int,
+) -> Dict[str, Any]:
+    """Large mode: capped passthrough — the default for every lane.
+
+    - Under ``LARGE_MODE_BYTE_CAP``: zero behavior change, raw result
+      returned as-is (same as the old ``full`` mode for normal results).
+    - Over the cap: full result stored in scratch, a field-capped copy +
+      ``scratch_ref`` returned.  The model gets the actual data shape with
+      real values (status, handles, headers, body previews), just truncated
+      so a single pathological response can't blow up context.
+    """
+    # Unwrap executor envelope first (same logic as digest/page path).
+    envelope_status = ""
+    if "result" in result and "stdout" in result and "status" in result:
+        envelope_status = str(result.get("status", "")).lower()
+        result = result["result"]
+        if not isinstance(result, dict):
+            return result
+
+    # Failed results: cap fields but don't store in scratch — the model
+    # needs the error text, and errors are usually small.
+    status = envelope_status or str(result.get("status", "")).lower()
+    if status in ("failed", "error"):
+        return _cap_result_fields(result)
+
+    # Size check: under the cap = passthrough.
+    try:
+        result_size = len(json.dumps(result, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        result_size = 0
+    if result_size <= _LARGE_MODE_BYTE_CAP:
         return result
+
+    # Over the cap: store full result in scratch, return capped copy.
+    store = get_store()
+    try:
+        scratch_info = store.store(
+            result, agent_id=agent_id, tool_id=tool_id, chat_id=chat_id,
+        )
+    except Exception as exc:
+        logger.warning(f"[projection] scratch store failed for {tool_id}: {exc}")
+        result["_projection_note"] = (
+            f"scratch store unavailable ({exc}); returning capped result"
+        )
+        return _cap_result_fields(result)
+
+    scratch_ref = scratch_info["scratch_ref"]
+    capped = _cap_result_fields(result)
+    capped["_projection"] = {
+        "mode": "large",
+        "full_ref": scratch_ref,
+        "retrieval": (
+            f"Call framework_scratch_search with scratch_ref='{scratch_ref}' "
+            f"to retrieve the full uncapped output."
+        ),
+        "stored_bytes": scratch_info.get("stored_bytes", 0),
+        "original_size_bytes": result_size,
+        "byte_cap": _LARGE_MODE_BYTE_CAP,
+        "note": (
+            "Result exceeded the large-mode byte cap and was field-capped. "
+            "The full output is in scratch."
+        ),
+    }
+    return capped
 
 
 # --- Digest builder --------------------------------------------------------
