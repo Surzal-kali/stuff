@@ -67,6 +67,24 @@ class ScratchStore:
         self.db_path = db_path
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Root guard: repair ownership corrupted by a prior root run. ---
+        # When the framework runs as root (masscan/packetcraft need it), every
+        # file the process creates — including scratch.db, scratch.db-wal,
+        # scratch.db-shm, and scratch-data/*.json.gz — becomes root-owned.
+        # The NEXT non-root run then gets "attempt to write a readonly
+        # database" because SQLite WAL mode needs write access to all three
+        # DB files, and the projection layer silently degrades to uncapped
+        # passthrough (the context-blowup root cause we hit on 2026-10-03).
+        #
+        # Fix (mirrors bootstrap.py's ZAP root guard): when we're root, chown
+        # the DB files + data dir back to the user who owns the workspace
+        # root BEFORE opening the connection.  If we're NOT root and the
+        # files are root-owned (a prior root run corrupted them), warn loudly
+        # — the operator needs to chown manually or restart as root once to
+        # trigger the repair.
+        self._repair_ownership_if_needed()
+
         try:
             os.chmod(self.data_dir, 0o700)
         except OSError:
@@ -77,6 +95,103 @@ class ScratchStore:
         self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_table()
+
+    def _repair_ownership_if_needed(self) -> None:
+        """Chown scratch DB + WAL + SHM + data dir back to the workspace owner.
+
+        Runs at construction time.  When the framework is root, root-created
+        files (scratch.db, -wal, -shm, scratch-data/) are chowned back to the
+        user who owns the WORKSPACE_ROOT directory.  When the framework is
+        NOT root but the files are root-owned (corrupted by a prior root run),
+        a warning is logged — the non-root process can't chown, so the
+        operator must either restart as root (which triggers this repair) or
+        chown manually.  Silent on success; never raises (a failed chown is
+        logged but doesn't block the store — the projection layer degrades
+        gracefully to field-capping without scratch).
+        """
+        import logging
+
+        log = logging.getLogger(__name__)
+        db_p = Path(self.db_path)
+        workspace_root = Path(os.getenv("WORKSPACE_ROOT", ".")).resolve()
+
+        # Determine the target owner: the UID of the workspace root dir.
+        try:
+            ws_stat = workspace_root.stat()
+            target_uid = ws_stat.st_uid
+            target_gid = ws_stat.st_gid
+        except OSError:
+            return  # can't stat workspace — nothing to do
+
+        if target_uid == 0:
+            # Workspace is root-owned (e.g. /opt/framework) — no mismatch to
+            # fix; root running on a root-owned workspace is consistent.
+            return
+
+        is_root = os.geteuid() == 0
+        files_to_check = [
+            db_p,
+            db_p.with_suffix(".db-wal"),
+            db_p.with_suffix(".db-shm"),
+            self.data_dir,
+        ]
+
+        needs_repair = False
+        for f in files_to_check:
+            try:
+                if f.exists() and f.stat().st_uid == 0:
+                    needs_repair = True
+                    break
+            except OSError:
+                pass
+
+        if not needs_repair:
+            return
+
+        if not is_root:
+            log.warning(
+                "[scratch] %s and/or WAL/SHM files are root-owned but the "
+                "framework is running as non-root (uid=%d). SQLite WAL mode "
+                "needs write access to all three DB files. The projection "
+                "layer will degrade to field-capping without scratch storage "
+                "(context may blow up on large results). Fix: run once as "
+                "root to trigger the auto-repair, or run: sudo chown -R "
+                "%d:%d %s %s/",
+                db_p, os.geteuid(), target_uid, target_gid, db_p, self.data_dir,
+            )
+            return
+
+        # We're root and the files are root-owned but the workspace owner is
+        # non-root — chown everything back.
+        import subprocess
+
+        chown_spec = f"{target_uid}:{target_gid}"
+        for f in files_to_check:
+            if f.exists():
+                try:
+                    subprocess.run(
+                        ["chown", chown_spec, str(f)],
+                        check=False, capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass  # best-effort; projection degrades gracefully
+
+        # Also chown the data dir contents (compressed payloads).
+        try:
+            subprocess.run(
+                ["chown", "-R", chown_spec, str(self.data_dir)],
+                check=False, capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+        log.info(
+            "[scratch] Root guard: chowned scratch DB + WAL + SHM + data dir "
+            "back to uid=%d (workspace owner). A prior root run had "
+            "root-owned these files, which would make the next non-root run "
+            "fail with 'readonly database'.",
+            target_uid,
+        )
 
     def _init_table(self) -> None:
         self.conn.execute(

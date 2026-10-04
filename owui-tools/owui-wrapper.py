@@ -232,9 +232,16 @@ class Tools:
         __metadata__: dict | None = None,
     ) -> str:
         """Retrieve the full or filtered output of a prior tool call whose
-        result_mode was 'digest' or 'page'. The scratch_ref comes from the
-        result envelope of a framework_run_tool call with result_mode='digest'
-        or result_mode='page'.
+        result_mode was 'large'/'digest'/'page'. The scratch_ref comes from the
+        result envelope of a framework_run_tool call.
+
+        **Important**: retrieved payloads are field-capped the same way as
+        large-mode tool results — a 1.6MB JS file enters your context as
+        ~16KB of capped fields, NOT the full payload. To pull specific
+        content from a large result, ALWAYS use the 'filter' parameter with
+        a substring (e.g. filter='secret_key', filter='endpoint', filter='api')
+        instead of retrieving the full payload. The filter runs server-side
+        on the stored data before it enters your context.
 
         :param scratch_ref: The scratch:<hex> reference from a prior result.
         :param agent_id: Leave empty to use this chat's auto-derived agent id
@@ -242,6 +249,8 @@ class Tools:
         :param offset: Skip the first N items in list-bearing results.
         :param limit: Return at most N items (0 = no limit; use sparingly).
         :param filter: Case-insensitive substring filter on list items.
+            **Always use this for large payloads** — it prevents context
+            blowup by pulling only matching rows instead of the full file.
         """
         payload = {
             "scratch_ref": scratch_ref,

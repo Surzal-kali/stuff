@@ -590,9 +590,19 @@ class APIGateway:
 
             Called by the OWUI framework_scratch_search wrapper (or any
             client) to pull the full or filtered output of a prior tool call
-            whose result_mode was 'digest' or 'page'.  Ownership is scoped
-            to agent_id — a ref from another agent returns 'not found'.
+            whose result_mode was 'large'/'digest'/'page'.  Ownership is
+            scoped to agent_id — a ref from another agent returns 'not found'.
+
+            **Size cap**: the retrieved payload is field-capped the same way
+            as ``large`` mode projection — a retrieved 1.6MB JS file enters
+            context as ~16KB of capped fields + a note that the full payload
+            is still in scratch (filter with the ``filter`` param to pull
+            only the rows you need).  Without this cap, ``scratch_search``
+            was the context-blowup escape hatch: the projection capped the
+            original tool result, but the model retrieved the full uncapped
+            payload via this endpoint and swallowed it wholesale.
             """
+            from utils.result_projection import _cap_result_fields, _LARGE_MODE_BYTE_CAP
             from utils.scratch_store import get_store
             store = get_store()
             result = store.retrieve(
@@ -604,6 +614,25 @@ class APIGateway:
             )
             if result.get("status") == "error":
                 raise HTTPException(404, result["error"])
+            # Cap the retrieved payload so scratch_search can't blow up
+            # context any more than the original tool call could.
+            import json as _json
+            try:
+                result_size = len(_json.dumps(result, default=str).encode("utf-8"))
+            except (TypeError, ValueError):
+                result_size = 0
+            if result_size > _LARGE_MODE_BYTE_CAP:
+                result = _cap_result_fields(result)
+                result["_scratch_search_capped"] = {
+                    "original_size_bytes": result_size,
+                    "byte_cap": _LARGE_MODE_BYTE_CAP,
+                    "note": (
+                        "Retrieved payload exceeded the large-mode byte cap and "
+                        "was field-capped. Use the 'filter' parameter to pull "
+                        "only the rows you need, or increase 'limit' for more "
+                        "list items."
+                    ),
+                }
             return result
 
         @self.app.get("/scratch/list")
@@ -897,7 +926,9 @@ class APIGateway:
                     scratch_ref = arguments.get("scratch_ref")
                     if not scratch_ref:
                         return self._error(f"{SCRATCH_SEARCH}: 'scratch_ref' is required")
+                    from utils.result_projection import _cap_result_fields, _LARGE_MODE_BYTE_CAP
                     from utils.scratch_store import get_store
+                    import json as _json
                     store = get_store()
                     result = store.retrieve(
                         scratch_ref,
@@ -908,6 +939,25 @@ class APIGateway:
                     )
                     if result.get("status") == "error":
                         return self._error(result["error"])
+                    # Cap the retrieved payload — same large-mode field
+                    # capping as the REST path and the original tool call.
+                    # Without this, scratch_search is the context-blowup
+                    # escape hatch (1.6MB JS file retrieved wholesale).
+                    try:
+                        result_size = len(_json.dumps(result, default=str).encode("utf-8"))
+                    except (TypeError, ValueError):
+                        result_size = 0
+                    if result_size > _LARGE_MODE_BYTE_CAP:
+                        result = _cap_result_fields(result)
+                        result["_scratch_search_capped"] = {
+                            "original_size_bytes": result_size,
+                            "byte_cap": _LARGE_MODE_BYTE_CAP,
+                            "note": (
+                                "Retrieved payload exceeded the large-mode byte "
+                                "cap and was field-capped. Use the 'filter' "
+                                "parameter to pull only the rows you need."
+                            ),
+                        }
                     return _mcp_text(result)
 
                 return self._error(f"Unknown MCP tool: {name}")

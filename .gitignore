@@ -56,3 +56,4 @@ dockered/.env.save
 hydra.restore
 scratch.*
 cookie_jar.db*
+scratch-data/*
