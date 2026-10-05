@@ -556,7 +556,7 @@ def _host_from_raw_request(raw_request: str) -> Optional[str]:
 #     for the scratch store (full fidelity) but NOT in the default model
 #     context unless the model retrieves them.
 #
-# The conversion uses BeautifulSoup (bs4, already in requirements.md) — this
+# The conversion uses BeautifulSoup (bs4, already in requirements.txt) — this
 # is the codebase's first bs4 usage.  We import it lazily so the module
 # loads even if bs4 is somehow absent (degrading to a regex strip).
 

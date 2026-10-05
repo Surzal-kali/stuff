@@ -763,7 +763,7 @@ values; see `.env.example` for the full key list):
 
 ```bash
 # Install dependencies
-pip install -r requirements.md
+pip install -r requirements.txt
 
 # Index tools into the vector registry
 python -m daharness.core

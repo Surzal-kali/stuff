@@ -44,15 +44,13 @@ WIP_*.*
 .*.swp
 
 # --- dependency lockfiles ---
-# requirements.md is the tracked canonical freeze; requirements.txt is a
-# synced byte-identical mirror. The exception un-ignores it so the mirror is
-# version-controlled and future drift shows up in git diffs.
+# requirements.txt is the tracked canonical pinned dependency freeze.
+# The exception un-ignores it so it stays version-controlled.
 *.txt
 !requirements.txt
 todo.md
 dockered/.env.save
 .vscode/*
-.github/*
 hydra.restore
 scratch.*
 cookie_jar.db*
