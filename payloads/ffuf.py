@@ -429,9 +429,11 @@ def run_ffuf(url: str, wordlist: str = "", options: str = "",
 
     # ``-u`` and ``-w`` are always explicit so the caller can't accidentally
     # omit the essentials; extra -w / -u in options are allowed by ffuf.
+    # ``-s`` (silent) strips the live progress bar so the job log is just
+    # clean result lines — easier to read and lighter on the verdict parser.
     # ``-of json -o`` goes LAST so it wins over any caller-provided -o.
     command = [
-        "ffuf", "-u", url, "-w", wordlist,
+        "ffuf", "-s", "-u", url, "-w", wordlist,
         *opt_list, "-of", "json", "-o", out_path,
     ]
 

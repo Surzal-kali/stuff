@@ -543,3 +543,253 @@ def _naive_digest(result: Dict[str, Any], scratch_ref: str) -> tuple:
     )
 
     return summary, row_hint
+
+
+# --- Web-result HTML extraction adapter ------------------------------------
+#
+# Web tool results (session_get, session_post, session_request, session_upload,
+# probe_web) carry the page HTML as a big string in ``body_head`` / ``body``.
+# The generic _cap_result_fields truncates it to the first N chars, which is
+# almost never what the model needs — it wants the *structured* content:
+# forms (with their inputs + actions), links, script/src URLs, meta tags,
+# and extracted CSRF tokens.  This adapter parses the HTML and returns those
+# as list fields so the digest/page projection can page+filter them like any
+# other list-bearing result, instead of treating the page as an opaque blob.
+#
+# The adapter is registered for the session_* tool IDs below.  It's used in
+# digest mode (the model gets a structured summary, not a 40KB HTML dump)
+# and as a scratch_search filter target (the model can grep for "form" or
+# "csrf" and get the relevant structured rows, not a raw HTML line).
+#
+# BeautifulSoup is imported lazily — it's in requirements.txt but the module
+# loads even if it's absent (degrading to a regex-based fallback).
+
+_WEB_TOOL_IDS = (
+    "auxiliaries.web_session.session_get",
+    "auxiliaries.web_session.session_post",
+    "auxiliaries.web_session.session_request",
+    "auxiliaries.web_session.session_upload",
+)
+
+
+def _web_html_digest(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-tool digest adapter for web session results.
+
+    Extracts structured content from the HTML body: forms (with inputs,
+    action, method), links, script srcs, meta tags, and CSRF tokens.
+    Returns ``{"summary": str, "row_hint_format": str}`` for the digest
+    envelope, plus the extracted structures are embedded so scratch_search
+    can page/filter them.
+    """
+    body = result.get("body_head") or result.get("body") or ""
+    if not body or not isinstance(body, str):
+        return {"summary": "no HTML body to parse", "row_hint_format": ""}
+
+    extracted = _extract_html_structure(body)
+
+    parts: list = []
+    status = result.get("http_status", "?")
+    url = result.get("final_url") or result.get("url", "?")
+    title = result.get("title") or extracted.get("title", "")
+    parts.append(f"{status} {url}")
+    if title:
+        parts.append(f"title: {title}")
+    if extracted["forms"]:
+        form_summs = []
+        for f in extracted["forms"]:
+            inputs = ", ".join(
+                f'{inp["name"]}({inp["type"]})' for inp in f.get("inputs", [])
+            )
+            form_summs.append(f'{f.get("method","GET")} {f.get("action","?")} [{inputs}]')
+        parts.append(f"forms: {' | '.join(form_summs)}")
+    if extracted["links"]:
+        parts.append(f"links: {len(extracted['links'])}")
+    if extracted["scripts"]:
+        parts.append(f"scripts: {len(extracted['scripts'])}")
+    if extracted["csrf_tokens"]:
+        names = ", ".join(t["name"] for t in extracted["csrf_tokens"])
+        parts.append(f"csrf: {names}")
+
+    summary = " | ".join(parts)
+    hint = (
+        f"structured HTML in scratch; scratch_search {result.get('_scratch_ref','<ref>')} "
+        f"with filter='form' or filter='csrf' to pull specific elements, "
+        f"or fields=forms,links to select structured lists"
+    )
+    return {"summary": summary, "row_hint_format": hint, "_extracted": extracted}
+
+
+def _extract_html_structure(html: str) -> Dict[str, Any]:
+    """Parse HTML and return structured content (forms, links, scripts, metas, CSRF).
+
+    Uses BeautifulSoup when available; falls back to regex extraction.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        return _extract_with_bs4(soup)
+    except ImportError:
+        return _extract_with_regex(html)
+
+
+def _extract_with_bs4(soup) -> Dict[str, Any]:
+    """Structured extraction via BeautifulSoup."""
+    forms: list = []
+    for form in soup.find_all("form"):
+        inputs = []
+        for inp in form.find_all(["input", "textarea", "select"]):
+            inputs.append({
+                "name": inp.get("name", ""),
+                "type": inp.get("type", inp.name),
+                "value": (inp.get("value", "") or "")[:200],
+            })
+        forms.append({
+            "action": form.get("action", ""),
+            "method": (form.get("method", "GET") or "GET").upper(),
+            "inputs": inputs,
+        })
+
+    links = []
+    for a in soup.find_all("a", href=True):
+        links.append(a["href"])
+
+    scripts = []
+    for s in soup.find_all("script", src=True):
+        scripts.append(s["src"])
+
+    metas = []
+    for m in soup.find_all("meta"):
+        metas.append({
+            "name": m.get("name", m.get("property", "")),
+            "content": (m.get("content", "") or "")[:200],
+        })
+
+    # CSRF tokens: hidden inputs with token-like names.
+    csrf_names = {
+        "csrfmiddlewaretoken", "authenticity_token", "_token",
+        "__requestverificationtoken", "csrf_token", "csrf-token",
+        "xsrf_token", "x-csrf-token",
+    }
+    csrf_tokens = []
+    for inp in soup.find_all("input"):
+        name = (inp.get("name", "") or "").lower()
+        if name in csrf_names or "csrf" in name or "token" in name:
+            csrf_tokens.append({
+                "name": inp.get("name", ""),
+                "value": (inp.get("value", "") or "")[:200],
+                "type": inp.get("type", ""),
+            })
+
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+
+    return {
+        "forms": forms,
+        "links": links[:200],  # cap to avoid context blowup
+        "scripts": scripts[:100],
+        "metas": metas[:50],
+        "csrf_tokens": csrf_tokens,
+        "title": title,
+    }
+
+
+def _extract_with_regex(html: str) -> Dict[str, Any]:
+    """Fallback HTML extraction via regex (no BeautifulSoup).
+
+    Less accurate but covers the common cases (forms, inputs, links, scripts).
+    """
+    import re as _re
+
+    forms: list = []
+    for m in _re.finditer(r'<form[^>]*>', html, _re.IGNORECASE):
+        tag = m.group(0)
+        action = ""
+        am = _re.search(r'action=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+        if am:
+            action = am.group(1)
+        method = "GET"
+        mm = _re.search(r'method=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+        if mm:
+            method = mm.group(1).upper()
+        # Find inputs until the closing </form>.
+        end = html.find("</form>", m.end(), _re.IGNORECASE)
+        if end == -1:
+            end = len(html)
+        form_html = html[m.end():end]
+        inputs = []
+        for im in _re.finditer(
+            r'<input[^>]*>', form_html, _re.IGNORECASE
+        ):
+            itag = im.group(0)
+            name = ""
+            nm = _re.search(r'name=["\']([^"\']*)["\']', itag, _re.IGNORECASE)
+            if nm:
+                name = nm.group(1)
+            itype = "text"
+            tm = _re.search(r'type=["\']([^"\']*)["\']', itag, _re.IGNORECASE)
+            if tm:
+                itype = tm.group(1)
+            val = ""
+            vm = _re.search(r'value=["\']([^"\']*)["\']', itag, _re.IGNORECASE)
+            if vm:
+                val = vm.group(1)[:200]
+            inputs.append({"name": name, "type": itype, "value": val})
+        forms.append({"action": action, "method": method, "inputs": inputs})
+
+    links = [
+        m.group(1)
+        for m in _re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html, _re.IGNORECASE)
+    ]
+    scripts = [
+        m.group(1)
+        for m in _re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, _re.IGNORECASE)
+    ]
+    metas = []
+    for m in _re.finditer(r'<meta[^>]+>', html, _re.IGNORECASE):
+        tag = m.group(0)
+        name = ""
+        nm = _re.search(r'(?:name|property)=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+        if nm:
+            name = nm.group(1)
+        content = ""
+        cm = _re.search(r'content=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+        if cm:
+            content = cm.group(1)[:200]
+        metas.append({"name": name, "content": content})
+
+    csrf_tokens = []
+    for m in _re.finditer(r'<input[^>]*>', html, _re.IGNORECASE):
+        tag = m.group(0)
+        name = ""
+        nm = _re.search(r'name=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+        if nm:
+            name = nm.group(1)
+        if "csrf" in name.lower() or "token" in name.lower():
+            val = ""
+            vm = _re.search(r'value=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+            if vm:
+                val = vm.group(1)[:200]
+            itype = ""
+            tm = _re.search(r'type=["\']([^"\']*)["\']', tag, _re.IGNORECASE)
+            if tm:
+                itype = tm.group(1)
+            csrf_tokens.append({"name": name, "value": val, "type": itype})
+
+    title = ""
+    tm = _re.search(r'<title[^>]*>(.*?)</title>', html, _re.IGNORECASE | _re.DOTALL)
+    if tm:
+        title = tm.group(1).strip()
+
+    return {
+        "forms": forms,
+        "links": links[:200],
+        "scripts": scripts[:100],
+        "metas": metas[:50],
+        "csrf_tokens": csrf_tokens,
+        "title": title,
+    }
+
+
+# Register the web adapter for all session_* tool IDs.
+for _tid in _WEB_TOOL_IDS:
+    register_digest_adapter(_tid, _web_html_digest)

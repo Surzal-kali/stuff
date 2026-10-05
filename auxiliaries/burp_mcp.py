@@ -176,7 +176,13 @@ class BurpMCPClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
         self._connected = False
-        self._connect_lock = threading.Lock()
+        self._connect_lock = threading.Lock()  # guards get_instance-style reentry
+        # Async connect serialization, created lazily on the background loop
+        # (asyncio.Lock binds to the running loop on first use). Without this,
+        # concurrent _ensure_connected() callers each tear down the session
+        # the previous one just opened (via _connect's _disconnect), livelocking
+        # the single background loop and freezing every burp_* call.
+        self._async_connect_lock: Optional[asyncio.Lock] = None
         # Cached tool inventory (refreshed on connect / reconnect).
         self._available_tools: Dict[str, Any] = {}
 
@@ -204,10 +210,21 @@ class BurpMCPClient:
         self._loop.run_forever()
 
     def _submit(self, coro, timeout: Optional[float] = None) -> Any:
-        """Run ``coro`` on the background loop and block for its result."""
+        """Run ``coro`` on the background loop and block for its result.
+
+        On timeout the future is *cancelled* so a wedged coroutine (e.g. a
+        ``ClientSession.initialize()`` hanging on an unresponsive BApp) is
+        torn down instead of pinning the single background loop forever —
+        which would freeze every subsequent burp_* call and, through the
+        Brain/gateway, Open Web UI itself.
+        """
         loop = self._ensure_loop()
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise
 
     # -- connection lifecycle ----------------------------------------------
 
@@ -227,23 +244,57 @@ class BurpMCPClient:
 
         stack = AsyncExitStack()
         try:
-            read_stream, write_stream = await stack.enter_async_context(
-                sse_client(
-                    self._url,
-                    timeout=BURP_MCP_CONNECT_TIMEOUT,
-                    sse_read_timeout=BURP_MCP_READ_TIMEOUT,
+            # Bound the ENTIRE connect (SSE handshake + ClientSession +
+            # initialize()). The BApp can accept the TCP/SSE connection and
+            # emit its ``endpoint`` event but then wedge on the JSON-RPC
+            # ``initialize()`` POST (parked approval dialog, Burp GUI thread
+            # blocked by the operator's manual work, target unreachable).
+            # The MCP SDK sends that POST with NO read timeout — ``sse_client``'s
+            # ``timeout`` param covers the SSE stream, not the initialize POST
+            # — so without this bound ``initialize()`` hangs forever, pinning
+            # the single background loop and freezing every burp_* call (and,
+            # through the gateway/Brain, Open Web UI).
+            async def _do_connect():
+                read_stream, write_stream = await stack.enter_async_context(
+                    sse_client(
+                        self._url,
+                        timeout=BURP_MCP_CONNECT_TIMEOUT,
+                        sse_read_timeout=BURP_MCP_READ_TIMEOUT,
+                    )
                 )
+                session = await stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await session.initialize()
+                return session
+
+            session = await asyncio.wait_for(
+                _do_connect(), timeout=BURP_MCP_CONNECT_TIMEOUT
             )
-            session = await stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await session.initialize()
             self._session = session
             self._cm_stack = stack
             self._connected = True
             # Cache the tool inventory so wrappers can probe availability
             # (e.g. Pro-only Collaborator tools).
             await self._refresh_tools()
+        except asyncio.TimeoutError as e:
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+            self._session = None
+            self._cm_stack = None
+            self._connected = False
+            raise BurpMCPError(
+                "connect_failed",
+                f"Timed out connecting to Burp MCP at {self._url} within "
+                f"{BURP_MCP_CONNECT_TIMEOUT:.0f}s. The BApp accepted the "
+                "connection but did not complete the MCP handshake — usually "
+                "a parked approval dialog or a wedged Burp GUI. Disable the "
+                "BApp's requireHttpRequestApproval/requireDataAccessApproval "
+                "toggles (or pre-approve the target) in the MCP tab, then call "
+                "burp_reconnect.",
+            ) from e
         except Exception as e:
             # Clean up the partial stack so a retry is clean.
             try:
@@ -284,11 +335,30 @@ class BurpMCPClient:
             # availability.  Pro-only detection degrades to a runtime error.
             self._available_tools = {}
 
+    async def _get_connect_lock(self) -> asyncio.Lock:
+        """Lazily create the connect-serialization lock on the running loop."""
+        if self._async_connect_lock is None:
+            self._async_connect_lock = asyncio.Lock()
+        return self._async_connect_lock
+
     async def _ensure_connected(self) -> Any:
-        """Lazily connect, or reconnect if the session dropped."""
+        """Lazily connect, or reconnect if the session dropped.
+
+        Serialized by an asyncio.Lock on the background loop so concurrent
+        callers (the Brain's tool pool can fire several burp_* wrappers in
+        parallel threads, each bridging to this loop via _submit) share ONE
+        connect attempt. Without this, each caller's ``_connect`` would
+        ``_disconnect`` the session a sibling just opened, livelocking the
+        single background loop and freezing every burp_* call.
+        """
         if self._session is not None and self._connected:
             return self._session
-        await self._connect()
+        lock = await self._get_connect_lock()
+        async with lock:
+            # Re-check inside the lock — the holder may have just connected.
+            if self._session is not None and self._connected:
+                return self._session
+            await self._connect()
         return self._session
 
     # -- tool discovery / health -------------------------------------------

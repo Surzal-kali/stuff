@@ -228,6 +228,9 @@ class Tools:
         offset: int = 0,
         limit: int = 0,
         filter: str = "",
+        regex: str = "",
+        fields: str = "",
+        context_lines: int = 0,
         __model__: dict | None = None,
         __metadata__: dict | None = None,
     ) -> str:
@@ -238,28 +241,57 @@ class Tools:
         **Important**: retrieved payloads are field-capped the same way as
         large-mode tool results — a 1.6MB JS file enters your context as
         ~16KB of capped fields, NOT the full payload. To pull specific
-        content from a large result, ALWAYS use the 'filter' parameter with
-        a substring (e.g. filter='secret_key', filter='endpoint', filter='api')
-        instead of retrieving the full payload. The filter runs server-side
-        on the stored data before it enters your context.
+        content from a large result, use one of these parameters instead of
+        retrieving the full payload:
+
+        - **filter**: case-insensitive substring that greps long text fields
+          (HTML bodies, logs) line-by-line AND narrows list items. E.g.
+          ``filter='csrf'`` pulls only lines containing "csrf" from a 40KB
+          HTML response.
+        - **regex**: Python regex for pattern extraction. E.g.
+          ``regex='<input[^>]*type=["\\']hidden["\\']'`` extracts all hidden
+          inputs from HTML.
+        - **fields**: comma-separated field names to select (drops all
+          others). E.g. ``fields='body_head,http_status'`` for just the
+          response body and status code.
+        - **context_lines**: N lines of context around each grep match
+          (like ``grep -C``).
+
+        All filters run server-side on the stored data before it enters
+        your context.
 
         :param scratch_ref: The scratch:<hex> reference from a prior result.
         :param agent_id: Leave empty to use this chat's auto-derived agent id
             (must match the agent_id used for the original framework_run_tool call).
         :param offset: Skip the first N items in list-bearing results.
         :param limit: Return at most N items (0 = no limit; use sparingly).
-        :param filter: Case-insensitive substring filter on list items.
-            **Always use this for large payloads** — it prevents context
-            blowup by pulling only matching rows instead of the full file.
+        :param filter: Case-insensitive substring — greps text fields
+            line-by-line and narrows list items.
+        :param regex: Python regex applied to text fields (line-by-line)
+            and list items. Use for pattern extraction.
+        :param fields: Comma-separated field names to select (drops others).
+        :param context_lines: Lines of context around each grep match.
         """
         payload = {
             "scratch_ref": scratch_ref,
             "offset": offset,
             "limit": limit,
+            "context_lines": context_lines,
         }
         if filter:
             payload["filter"] = filter
+        if regex:
+            payload["regex"] = regex
+        if fields:
+            payload["fields"] = fields
         payload["agent_id"] = agent_id or self._chat_agent_id(__model__, __metadata__)
+        # Pass turn_key so scratch_search counts against the same per-turn
+        # tool budget as framework_run_tool (utils/tool_budget.py).
+        md = __metadata__ or getattr(self, "__metadata__", None) or {}
+        chat = md.get("chat_id") or md.get("id")
+        message_id = md.get("message_id")
+        if chat:
+            payload["turn_key"] = f"{chat}:{message_id}" if message_id else str(chat)
         return self._post("/scratch/search", payload)
 
     def framework_memory_search(

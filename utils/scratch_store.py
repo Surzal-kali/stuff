@@ -34,6 +34,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -323,6 +324,9 @@ class ScratchStore:
         offset: int = 0,
         limit: int = 0,
         filter_pattern: Optional[str] = None,
+        regex_pattern: Optional[str] = None,
+        fields: Optional[str] = None,
+        context_lines: int = 0,
     ) -> Dict[str, Any]:
         """Retrieve a stored result by reference.
 
@@ -336,8 +340,22 @@ class ScratchStore:
             offset: Skip the first N items in a list-bearing result.
             limit: Return at most N items (0 = no limit, but the raw payload
                 is still the full stored result).
-            filter_pattern: Optional case-insensitive substring filter
-                applied to string values in list/dict results.
+            filter_pattern: Case-insensitive substring filter applied to
+                list items AND long string fields (line-based grep —
+                matching lines are returned, non-matching dropped).  When
+                ``context_lines`` > 0, that many adjacent lines are kept
+                around each match for readability.
+            regex_pattern: Python regex applied to string fields
+                (line-based).  Takes precedence over ``filter_pattern`` for
+                string fields; list items are matched with ``re.search``.
+                Invalid regex returns an error envelope.
+            fields: Comma-separated field names to select (drops everything
+                else).  Useful for web results where the model only needs
+                ``body_head`` + ``http_status``, not the full cookie/header
+                envelope.  Unknown field names are silently dropped.
+            context_lines: Number of context lines to include before/after
+                each grep match in string fields (``-A``/``-B`` combined,
+                like ``grep -C``).  Default 0 = matches only.
         """
         scratch_id = self._parse_ref(scratch_ref)
         if scratch_id is None:
@@ -388,10 +406,17 @@ class ScratchStore:
                 "error": f"scratch payload corrupted for {scratch_ref!r}: {exc}",
             }
 
-        # Apply paging / filtering if requested.
-        if offset or limit or filter_pattern:
+        # Apply field selection first (reduces work for filter/regex).
+        if fields:
+            wanted = {f.strip() for f in fields.split(",") if f.strip()}
+            result = {k: v for k, v in result.items() if k in wanted}
+
+        # Apply paging / filtering / regex if requested.
+        if offset or limit or filter_pattern or regex_pattern:
             result = self._apply_projection(
-                result, offset=offset, limit=limit, filter_pattern=filter_pattern
+                result, offset=offset, limit=limit,
+                filter_pattern=filter_pattern, regex_pattern=regex_pattern,
+                context_lines=context_lines,
             )
 
         return {
@@ -505,13 +530,23 @@ class ScratchStore:
         offset: int,
         limit: int,
         filter_pattern: Optional[str],
+        regex_pattern: Optional[str] = None,
+        context_lines: int = 0,
     ) -> Dict[str, Any]:
-        """Apply paging/filtering to a retrieved result.
+        """Apply paging/filtering/regex to a retrieved result.
 
         This is the generic fallback projection — it operates on the
-        deserialized JSON structure.  List-bearing fields (e.g. ``open_ports``,
-        ``rows``, ``recent_lines``) are paged and filtered.  Non-list results
-        are returned as-is (paging a dict is meaningless).
+        deserialized JSON structure.  Three field types are handled:
+
+        - **List fields** (``open_ports``, ``rows``, ``recent_lines``):
+          paged and filtered.  ``filter_pattern`` is a case-insensitive
+          substring match; ``regex_pattern`` uses ``re.search``.
+        - **Long string fields** (``body_head``, ``body``, ``log_text``):
+          line-based grep.  Only matching lines are returned (plus
+          ``context_lines`` adjacent lines when > 0).  This is the fix for
+          web results — the model can pull just the CSRF lines out of a
+          40KB HTML blob instead of getting a truncated first-16KB chunk.
+        - **Short strings / non-list, non-string**: returned as-is.
 
         Tool-family digest adapters can produce richer projections, but this
         fallback ensures every stored result is retrievable without a custom
@@ -521,16 +556,37 @@ class ScratchStore:
             return result
 
         pattern_lower = filter_pattern.lower() if filter_pattern else None
+        compiled_re = None
+        if regex_pattern:
+            try:
+                compiled_re = re.compile(regex_pattern, re.IGNORECASE)
+            except re.error as exc:
+                return {
+                    "status": "error",
+                    "error": f"invalid regex pattern {regex_pattern!r}: {exc}",
+                }
+
         paged_keys: List[str] = []
+        grepped_keys: List[str] = []
         out = {}
 
+        # Threshold for treating a string as grepable text vs. a short scalar.
+        # Strings under this length are returned as-is (no point grepping 3
+        # lines).  Tunable via env for edge cases.
+        grep_threshold = int(os.getenv("SCRATCH_GREP_MIN_CHARS", "200"))
+
         for key, value in result.items():
-            if isinstance(value, list) and (offset or limit or pattern_lower):
+            if isinstance(value, list) and (offset or limit or pattern_lower or compiled_re):
                 filtered = value
                 if pattern_lower:
                     filtered = [
                         item for item in filtered
                         if self._item_matches(item, pattern_lower)
+                    ]
+                elif compiled_re:
+                    filtered = [
+                        item for item in filtered
+                        if self._item_matches_regex(item, compiled_re)
                     ]
                 total = len(filtered)
                 if offset:
@@ -540,16 +596,30 @@ class ScratchStore:
                 out[key] = filtered
                 if offset or (limit and total > limit):
                     paged_keys.append(key)
+            elif isinstance(value, str) and (pattern_lower or compiled_re) and len(value) >= grep_threshold:
+                grepped = self._grep_string(value, pattern_lower, compiled_re, context_lines)
+                out[key] = grepped
+                grepped_keys.append(key)
             else:
                 out[key] = value
 
+        meta: Dict[str, Any] = {}
         if paged_keys:
-            out["_paging"] = {
-                "paged_keys": paged_keys,
-                "offset": offset,
-                "limit": limit,
-                "note": "list fields were paged; adjust offset/limit for more",
-            }
+            meta["paged_keys"] = paged_keys
+            meta["offset"] = offset
+            meta["limit"] = limit
+        if grepped_keys:
+            meta["grepped_keys"] = grepped_keys
+            meta["filter"] = filter_pattern or regex_pattern
+            meta["context_lines"] = context_lines
+        if paged_keys or grepped_keys:
+            meta["note"] = (
+                "list fields were paged/filtered; text fields were grep-filtered "
+                "to matching lines. Use offset/limit for more list items, "
+                "or adjust filter/regex for different text matches."
+            )
+        if meta:
+            out["_scratch_projection"] = meta
 
         return out
 
@@ -563,6 +633,62 @@ class ScratchStore:
                 pattern_lower in str(v).lower() for v in item.values()
             )
         return pattern_lower in str(item).lower()
+
+    @staticmethod
+    def _item_matches_regex(item: Any, compiled_re: "re.Pattern[str]") -> bool:
+        """Regex match on a list item (str or dict)."""
+        if isinstance(item, str):
+            return compiled_re.search(item) is not None
+        if isinstance(item, dict):
+            return any(compiled_re.search(str(v)) is not None for v in item.values())
+        return compiled_re.search(str(item)) is not None
+
+    @staticmethod
+    def _grep_string(
+        text: str,
+        pattern_lower: Optional[str],
+        compiled_re: Optional["re.Pattern[str]"],
+        context_lines: int,
+    ) -> str:
+        """Line-based grep on a long string field.
+
+        Returns matching lines joined with ``\\n``.  When ``context_lines``
+        > 0, includes that many lines before/after each match (``grep -C``
+        semantics).  When no lines match, returns a short "no matches"
+        note so the caller knows the filter ran but found nothing (vs. the
+        filter silently doing nothing).
+        """
+        lines = text.split("\n")
+        match_indices: List[int] = []
+        for i, line in enumerate(lines):
+            if compiled_re:
+                if compiled_re.search(line):
+                    match_indices.append(i)
+            elif pattern_lower:
+                if pattern_lower in line.lower():
+                    match_indices.append(i)
+
+        if not match_indices:
+            return f"[no lines matched filter: {pattern_lower or (compiled_re.pattern if compiled_re else '')!r}]"
+
+        if context_lines <= 0:
+            return "\n".join(lines[i] for i in match_indices)
+
+        # Build a set of indices to include (match ± context), preserving order.
+        include: set = set()
+        for idx in match_indices:
+            lo = max(0, idx - context_lines)
+            hi = min(len(lines) - 1, idx + context_lines)
+            include.update(range(lo, hi + 1))
+
+        result_lines: List[str] = []
+        prev = -2
+        for i in sorted(include):
+            if i - prev > 1 and result_lines:
+                result_lines.append("...")
+            result_lines.append(lines[i])
+            prev = i
+        return "\n".join(result_lines)
 
     @staticmethod
     def _parse_ref(ref: str) -> Optional[str]:

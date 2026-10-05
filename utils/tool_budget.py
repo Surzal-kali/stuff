@@ -37,11 +37,13 @@ BUDGET_LAST = "last_call"             # final call of the turn — wrap the resu
 BUDGET_EXHAUSTED = "budget_exhausted" # refused — not a terminal-lane tool
 BUDGET_TERMINAL_LANE = "terminal_lane"  # past limit, but allowed (report tools)
 
-DEFAULT_LIMIT = 10
+DEFAULT_LIMIT = 12
 DEFAULT_IDLE_RESET_MIN = 5.0
 
 # Non-traffic reporting families that stay callable after exhaustion, so the
 # model can write itself up. Prefix match on the tool_id.
+# scratch_search is NOT here — it counts against the budget like a regular
+# tool call (it pulls context into the model, so it must be metered).
 DEFAULT_TERMINAL_ALLOWLIST = "utils.memory_tools.,utils.findings."
 
 _LAST_CALL_DIRECTIVE = (

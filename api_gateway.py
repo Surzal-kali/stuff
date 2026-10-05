@@ -277,6 +277,12 @@ class ScratchSearchRequest(BaseModel):
     offset: Optional[int] = 0
     limit: Optional[int] = 0
     filter: Optional[str] = None
+    regex: Optional[str] = None
+    fields: Optional[str] = None
+    context_lines: Optional[int] = 0
+    # Per-turn tool budget key (utils/tool_budget.py). scratch_search now
+    # counts against the budget — pass the same turn_key as tools_execute.
+    turn_key: Optional[str] = None
 
 
 # Input schemas advertised over MCP — kept in sync with the models above so a
@@ -593,6 +599,12 @@ class APIGateway:
             whose result_mode was 'large'/'digest'/'page'.  Ownership is
             scoped to agent_id — a ref from another agent returns 'not found'.
 
+            **Budget**: scratch_search counts against the per-turn tool
+            budget (``TOOL_BUDGET_PER_TURN``).  Each call consumes one slot —
+            without this, the model could make 20+ scratch_searches in a
+            turn, each delivering up to 16KB, and the budget counter would
+            never move.
+
             **Size cap**: the retrieved payload is field-capped the same way
             as ``large`` mode projection — a retrieved 1.6MB JS file enters
             context as ~16KB of capped fields + a note that the full payload
@@ -602,6 +614,18 @@ class APIGateway:
             original tool result, but the model retrieved the full uncapped
             payload via this endpoint and swallowed it wholesale.
             """
+            # Per-turn tool budget — scratch_search pulls context into the
+            # model, so it counts like a regular tool call.
+            budget_decision, budget_meta = self.tool_budget.pre_dispatch(
+                req.agent_id or "0", req.turn_key, SCRATCH_SEARCH
+            )
+            if budget_decision == BUDGET_EXHAUSTED:
+                logging.info(
+                    "Budget refused scratch_search for agent '%s' (turn %r): %s/%s used",
+                    req.agent_id, req.turn_key,
+                    budget_meta.get("used"), budget_meta.get("limit"),
+                )
+                return budget_meta
             from utils.result_projection import _cap_result_fields, _LARGE_MODE_BYTE_CAP
             from utils.scratch_store import get_store
             store = get_store()
@@ -611,6 +635,9 @@ class APIGateway:
                 offset=req.offset or 0,
                 limit=req.limit or 0,
                 filter_pattern=req.filter,
+                regex_pattern=req.regex,
+                fields=req.fields,
+                context_lines=req.context_lines or 0,
             )
             if result.get("status") == "error":
                 raise HTTPException(404, result["error"])
@@ -628,11 +655,19 @@ class APIGateway:
                     "byte_cap": _LARGE_MODE_BYTE_CAP,
                     "note": (
                         "Retrieved payload exceeded the large-mode byte cap and "
-                        "was field-capped. Use the 'filter' parameter to pull "
-                        "only the rows you need, or increase 'limit' for more "
+                        "was field-capped. Use 'filter' to grep text fields for "
+                        "matching lines, 'regex' for pattern matching, 'fields' "
+                        "to select specific fields, or increase 'limit' for more "
                         "list items."
                     ),
                 }
+            # End-turn directive for the turn's final call.
+            if budget_decision == BUDGET_LAST:
+                result = wrap_result(
+                    result,
+                    terminal_directive(BUDGET_LAST, budget_meta["used"], budget_meta["limit"]),
+                    budget_meta,
+                )
             return result
 
         @self.app.get("/scratch/list")
@@ -742,8 +777,13 @@ class APIGateway:
                         "the scratch_ref (e.g. 'scratch:abc123') returned by "
                         "tools_execute, plus the agent_id that was used for "
                         "the original call. Optional offset/limit page list "
-                        "fields; optional filter narrows by case-insensitive "
-                        "substring. Mirrors POST /scratch/search."
+                        "fields; 'filter' greps text fields line-by-line "
+                        "(case-insensitive substring) AND narrows list items; "
+                        "'regex' applies a Python regex to text fields; "
+                        "'fields' selects specific fields by name "
+                        "(comma-separated, e.g. 'body_head,http_status'); "
+                        "'context_lines' adds N lines of context around each "
+                        "grep match. Mirrors POST /scratch/search."
                     ),
                     inputSchema={
                         "type": "object",
@@ -768,7 +808,20 @@ class APIGateway:
                             },
                             "filter": {
                                 "type": "string",
-                                "description": "Case-insensitive substring filter on list items.",
+                                "description": "Case-insensitive substring filter. Greps long text fields (body_head, body, logs) line-by-line, returning only matching lines. Also narrows list items.",
+                            },
+                            "regex": {
+                                "type": "string",
+                                "description": "Python regex applied to text fields (line-by-line) and list items. Use for pattern extraction: '<input[^>]*type=[\"']hidden[\"']' or 'csrf|token'.",
+                            },
+                            "fields": {
+                                "type": "string",
+                                "description": "Comma-separated field names to select (drops all others). E.g. 'body_head,http_status,url' for just the response body and status.",
+                            },
+                            "context_lines": {
+                                "type": "integer",
+                                "default": 0,
+                                "description": "Lines of context to include before/after each grep match (like grep -C). 0 = matches only.",
                             },
                         },
                         "required": ["scratch_ref"],
@@ -926,16 +979,35 @@ class APIGateway:
                     scratch_ref = arguments.get("scratch_ref")
                     if not scratch_ref:
                         return self._error(f"{SCRATCH_SEARCH}: 'scratch_ref' is required")
+                    # Per-turn tool budget — scratch_search pulls context
+                    # into the model, so it counts like a regular tool call.
+                    # Without this the model could make 20+ scratch_searches
+                    # in a turn, each delivering up to 16KB, and the budget
+                    # counter would never move.
+                    scratch_agent = arguments.get("agent_id") or "0"
+                    budget_decision, budget_meta = self.tool_budget.pre_dispatch(
+                        scratch_agent, arguments.get("turn_key"), SCRATCH_SEARCH
+                    )
+                    if budget_decision == BUDGET_EXHAUSTED:
+                        logging.info(
+                            "Budget refused scratch_search for agent '%s' (turn %r): %s/%s used",
+                            scratch_agent, arguments.get("turn_key"),
+                            budget_meta.get("used"), budget_meta.get("limit"),
+                        )
+                        return _mcp_text(budget_meta)
                     from utils.result_projection import _cap_result_fields, _LARGE_MODE_BYTE_CAP
                     from utils.scratch_store import get_store
                     import json as _json
                     store = get_store()
                     result = store.retrieve(
                         scratch_ref,
-                        agent_id=arguments.get("agent_id") or "0",
+                        agent_id=scratch_agent,
                         offset=int(arguments.get("offset") or 0),
                         limit=int(arguments.get("limit") or 0),
                         filter_pattern=arguments.get("filter"),
+                        regex_pattern=arguments.get("regex"),
+                        fields=arguments.get("fields"),
+                        context_lines=int(arguments.get("context_lines") or 0),
                     )
                     if result.get("status") == "error":
                         return self._error(result["error"])
@@ -954,10 +1026,19 @@ class APIGateway:
                             "byte_cap": _LARGE_MODE_BYTE_CAP,
                             "note": (
                                 "Retrieved payload exceeded the large-mode byte "
-                                "cap and was field-capped. Use the 'filter' "
-                                "parameter to pull only the rows you need."
+                                "cap and was field-capped. Use 'filter' to grep "
+                                "text fields for matching lines, 'regex' for "
+                                "pattern matching, 'fields' to select specific "
+                                "fields, or increase 'limit' for more list items."
                             ),
                         }
+                    # End-turn directive for the turn's final call.
+                    if budget_decision == BUDGET_LAST:
+                        result = wrap_result(
+                            result,
+                            terminal_directive(BUDGET_LAST, budget_meta["used"], budget_meta["limit"]),
+                            budget_meta,
+                        )
                     return _mcp_text(result)
 
                 return self._error(f"Unknown MCP tool: {name}")
