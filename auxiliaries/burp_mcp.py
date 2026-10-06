@@ -212,18 +212,56 @@ class BurpMCPClient:
     def _submit(self, coro, timeout: Optional[float] = None) -> Any:
         """Run ``coro`` on the background loop and block for its result.
 
-        On timeout the future is *cancelled* so a wedged coroutine (e.g. a
-        ``ClientSession.initialize()`` hanging on an unresponsive BApp) is
+        On timeout the coroutine is *cancelled* so a wedged coroutine (e.g.
+        a ``ClientSession.initialize()`` hanging on an unresponsive BApp) is
         torn down instead of pinning the single background loop forever —
         which would freeze every subsequent burp_* call and, through the
         Brain/gateway, Open Web UI itself.
+
+        Implementation detail: ``run_coroutine_threadsafe`` returns a
+        ``concurrent.futures.Future`` whose ``cancel()`` only prevents the
+        callback from running — it does NOT cancel the underlying asyncio
+        coroutine on the background loop.  A wedged coroutine (stuck inside
+        ``session.call_tool`` or ``_connect``) would keep pinning the loop
+        even after ``future.cancel()``.  To actually interrupt it, we wrap
+        the coroutine in an ``asyncio.Task`` on the background loop and
+        cancel that task — ``task.cancel()`` injects a ``CancelledError``
+        at the next ``await`` point in the coroutine, unwinding it.
         """
         loop = self._ensure_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        # Hold the asyncio Task in a mutable container so the cancel
+        # callback (scheduled on timeout) can reach it.  The container is
+        # per-call: each _submit invocation creates its own _task_holder.
+        _task_holder: Dict[str, Any] = {}
+
+        async def _wrap():
+            task = asyncio.ensure_future(coro)
+            _task_holder["task"] = task
+            return await task
+
+        future = asyncio.run_coroutine_threadsafe(_wrap(), loop)
         try:
             return future.result(timeout=timeout)
         except TimeoutError:
+            # Cancel the concurrent future (stops the result callback) AND
+            # schedule task cancellation on the background loop so the
+            # wedged coroutine is actually interrupted at its next await.
             future.cancel()
+
+            async def _cancel_task():
+                task = _task_holder.get("task")
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+            cancel_fut = asyncio.run_coroutine_threadsafe(_cancel_task(), loop)
+            try:
+                cancel_fut.result(timeout=5)
+            except Exception:
+                pass  # never block _submit on cleanup
             raise
 
     # -- connection lifecycle ----------------------------------------------
@@ -277,7 +315,15 @@ class BurpMCPClient:
             # Cache the tool inventory so wrappers can probe availability
             # (e.g. Pro-only Collaborator tools).
             await self._refresh_tools()
-        except asyncio.TimeoutError as e:
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # Timeout: the BApp accepted the SSE connection but did not
+            # complete the MCP handshake within BURP_MCP_CONNECT_TIMEOUT.
+            # CancelledError: _submit's timeout fired and cancelled the
+            # task — the connect coroutine is being unwound.  In both
+            # cases, tear down the partial AsyncExitStack so a retry
+            # starts clean.  Without this, a cancelled connect leaves the
+            # sse_client / ClientSession context managers half-open,
+            # pinning the background loop's task group forever.
             try:
                 await stack.aclose()
             except Exception:
@@ -285,6 +331,17 @@ class BurpMCPClient:
             self._session = None
             self._cm_stack = None
             self._connected = False
+            if isinstance(e, asyncio.CancelledError):
+                # _submit cancelled the connect — don't masquerade as a
+                # timeout.  Re-raise as a connect failure with a clear
+                # message so the caller knows the connect was interrupted.
+                raise BurpMCPError(
+                    "connect_failed",
+                    f"Connect to Burp MCP at {self._url} was cancelled "
+                    f"(the _submit timeout fired during the handshake). "
+                    "The partial session was torn down; the next call "
+                    "will retry cleanly.",
+                ) from e
             raise BurpMCPError(
                 "connect_failed",
                 f"Timed out connecting to Burp MCP at {self._url} within "
@@ -418,7 +475,38 @@ class BurpMCPClient:
                 name, arguments, read_timeout_seconds=read_timeout
             )
         except Exception as e:
-            # Session may have dropped — mark for reconnect on next call.
+            # Distinguish a per-call timeout (the SSE session is still
+            # alive — only this one request exceeded its read_timeout) from
+            # a genuine transport-level session death.  Conflating the two
+            # was the root cause of the "blip" freezes: one slow target
+            # triggered McpError(408) → _connected = False → every
+            # subsequent burp_* call paid a full SSE reconnect (handshake +
+            # initialize + tools/list, 2-10s), queued behind the connect
+            # lock, burning their own _submit timeouts, cascading into
+            # more reconnects.  The BApp processes requests concurrently
+            # and the SSE stream survives a single call's timeout — we
+            # verified this live — so the session must NOT be torn down.
+            from mcp.shared.exceptions import McpError
+            import httpx
+
+            if isinstance(e, McpError) and e.error.code == httpx.codes.REQUEST_TIMEOUT:
+                # Per-call timeout: the session is still valid.  Do NOT
+                # set _connected = False.  Raise a distinct error code so
+                # the hint can tell the secretary "the target was slow,
+                # retry with a longer timeout" instead of "the session
+                # dropped, reconnect."
+                raise BurpMCPError(
+                    "call_timeout",
+                    f"{name}: Burp did not respond within {timeout}s "
+                    f"(BURP_MCP_CALL_TIMEOUT). The SSE session is still "
+                    "alive — this is a per-call timeout, not a connection "
+                    "failure. The target may be unreachable or slow; "
+                    "retry with a longer timeout or a different target.",
+                ) from e
+
+            # Genuine transport-level failure (ConnectionError, OSError,
+            # anyio.ClosedResourceError, etc.) — the session IS dead.
+            # Mark for reconnect on the next call.
             self._connected = False
             raise BurpMCPError("call_failed", f"{name}: {e}") from e
 
@@ -510,6 +598,15 @@ _BURP_ERROR_HINTS = {
         "restarted?) or the tool name is not recognized. The client will "
         "reconnect on the next call. If this persists, check Burp's MCP "
         "tab for errors and verify the extension is still enabled."
+    ),
+    "call_timeout": (
+        "The Burp MCP tool call timed out — Burp did not send a response "
+        "on the SSE stream within BURP_MCP_CALL_TIMEOUT (default 60s). "
+        "The SSE session is still alive (this is a per-call timeout, not "
+        "a connection failure), so subsequent burp_* calls will reuse "
+        "the existing session without reconnecting. The target was likely "
+        "unreachable or slow to respond. Retry with a longer timeout "
+        "(BURP_MCP_CALL_TIMEOUT env) or a different target."
     ),
     "tool_error": (
         "Burp's MCP tool returned an error. The request may have been "
