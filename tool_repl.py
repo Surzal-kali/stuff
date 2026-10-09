@@ -671,6 +671,34 @@ def build_ipython_namespace(
         _scope_command(rest)
     ns["scope_search"] = _scope_search
 
+    # Live keybinding diagnostic: shows what the ESC chord dispatches to in
+    # the currently-running prompt.  Usage: check_trigger(shell or get_ipython())
+    def check_trigger(shell=None):
+        """Show which handler the trigger chord dispatches to (live check)."""
+        if shell is None:
+            try:
+                shell = get_ipython()  # noqa: F821 — defined inside IPython
+            except NameError:
+                print("  pass the shell: check_trigger(get_ipython())")
+                return
+        pt = getattr(shell, "pt_app", None)
+        if pt is None:
+            print("  pt_app not initialized yet — press a key first")
+            return
+        spec = _trigger_key_spec()
+        from prompt_toolkit.keys import Keys as _K
+        def _resolve(tok):
+            if tok.startswith("c-"):
+                return getattr(_K, "Control" + tok[2:].upper(), tok)
+            return _K.Escape if tok == "escape" else tok
+        keys = tuple(
+            getattr(k, "value", k) if isinstance(getattr(k, "value", k), str) else k
+            for k in map(_resolve, spec)
+        )
+        matches = pt.app.key_bindings.get_bindings_for_keys(keys)
+        print(f"  chord {spec} resolves to: {[getattr(m.handler, '__name__', '?') for m in matches]}")
+    ns["check_trigger"] = check_trigger
+
     return ns
 
 
@@ -712,16 +740,41 @@ def build_ipython_namespace(
 
 import threading as _threading_mod
 
+# On-demand Ollama inline completion for the IPython REPL.  Uses IPython's
+# own NavigableAutoSuggestFromHistory (provisional in 8.32+) — history ghost
+# text is automatic, The trigger key fires an Ollama completion on demand.  No
+# prompt freezing because the LLM query is on-demand, not per-keystroke.
+# Disable with OLLAMA_COMPLETION_ENABLED=0.
 _COMPLETION_ENABLED = os.getenv("OLLAMA_COMPLETION_ENABLED", "1").lower() not in ("0", "false", "no", "off")
 _COMPLETION_MODEL = (
     os.getenv("OLLAMA_COMPLETION_MODEL")
     or os.getenv("SECRETARY_MODEL")
     or "qwen2.5-coder:7b"
 )
-_COMPLETION_TIMEOUT_MS = int(os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "3000"))
+_COMPLETION_TIMEOUT_MS = int(os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "6000"))
 _COMPLETION_MIN_PREFIX = int(os.getenv("OLLAMA_COMPLETION_MIN_PREFIX", "3"))
 _COMPLETION_MAX_FAILURES = 5
 _COMPLETION_BACKOFF_COOLDOWN_S = 15.0
+# Token budget for on-demand suggestions. 400 leaves room for a useful
+# multiline block without making the shared Ollama model reserve a larger
+# completion budget than necessary.
+_COMPLETION_NUM_PREDICT = int(os.getenv("OLLAMA_COMPLETION_NUM_PREDICT", "400"))
+# Bound the per-request KV cache and keep the model resident briefly so the
+# IPython and Open WebUI lanes can reuse the same loaded weights.
+_COMPLETION_NUM_CTX = int(os.getenv("OLLAMA_COMPLETION_NUM_CTX", "4096"))
+_COMPLETION_KEEP_ALIVE = os.getenv("OLLAMA_COMPLETION_KEEP_ALIVE", "5m")
+# Max characters of typed context sent to the model (whole buffer: previous
+# lines + the current line — variables from earlier lines are what let the
+# model suggest code that uses them instead of inventing placeholders).
+_COMPLETION_MAX_CONTEXT_CHARS = int(os.getenv("OLLAMA_COMPLETION_MAX_CONTEXT_CHARS", "4000"))
+_COMPLETION_MAX_FAILURES = 5
+_COMPLETION_BACKOFF_COOLDOWN_S = 15.0
+# Debounce: wait this many ms after the last keystroke before firing an
+# Ollama request.  Without this, every keystroke triggers a 1-3s request
+# and the prompt freezes.  With it, only the *final* text after a burst of
+# typing triggers a request — the user types without lag, and the ghost
+# text appears ~400ms after they pause.
+_COMPLETION_DEBOUNCE_MS = int(os.getenv("OLLAMA_COMPLETION_DEBOUNCE_MS", "400"))
 # Max cold-start timeouts before the circuit breaker opens.  Each cold-start
 # attempt uses the longer timeout (10s+); after this many failures the model
 # isn't loading (wrong name, Ollama down, VRAM exhausted) and we stop
@@ -731,325 +784,403 @@ _COLD_START_MAX_ATTEMPTS = 3
 # ~15 chars each is ~3KB — fine for a 14B model's context window.  Set to 0
 # for no limit.
 _COMPLETION_MAX_TOOLS = int(os.getenv("OLLAMA_COMPLETION_MAX_TOOLS", "250"))
+# Think control for reasoning models (GLM, deepseek-r1, qwen3 …).  Ollama's
+# /api/chat takes a top-level ``think`` parameter (bool or thinking level).
+# Suggester calls always send think=False by default: a reasoning model that
+# buries its budget in message.thinking returns EMPTY content and no ghost
+# text (verified against glm-4.7-flash).  Set to "low"|"medium"|"high" to use
+# a thinking level instead, or "auto"/unset to omit the parameter entirely
+# (older Ollama versions reject unknown fields).
+_COMPLETION_THINK = os.getenv("OLLAMA_COMPLETION_THINK", "false").strip().lower()
+# Trigger chord for the on-demand Ollama suggestion.  Every Ctrl+letter is
+# bound by IPython/prompt_toolkit defaults; Ctrl+digits are nominally free
+# but several terminals remap or swallow them (verified: c-7 arrives as
+# backspace / c-h on this driver).  A two-key ESC-prefixed chord is robust:
+# "escape c-o" sends 0x1b 0x0f — unambiguous, free at both binding layers,
+# and can never trigger the bare c-o "open in editor" binding because the
+# parser sees the two-key sequence.  Env override accepts ONE key spec
+# ("c-5", "f5") or a SPACE-separated chord ("escape c-o", "c-x c-o").
+# NOTE: ESC-prefixed chords ("escape c-o") require the second key to arrive
+# while ESC is still the pending prefix; press-ESC-release-then-Ctrl+O
+# collapses to a solo Escape press and the bare c-o editor binding fires
+# instead ("does both" symptom, 2026-10-09).  c-x prefix chords have no such
+# timing dependency — c-x is a dedicated emacs prefix key.
+_COMPLETION_TRIGGER_KEY = os.getenv("OLLAMA_COMPLETION_TRIGGER_KEY", "c-x c-o")
 
 
-def _ollama_generate_url() -> str:
-    """Derive the Ollama ``/api/generate`` endpoint from ``OLLAMA_BASE_URL``.
+def _trigger_key_spec() -> List[str]:
+    """Parse the trigger-key env value into a prompt_toolkit key list."""
+    return [k.strip() for k in _COMPLETION_TRIGGER_KEY.split() if k.strip()]
+
+
+def _ollama_chat_url() -> str:
+    """Derive the Ollama ``/api/chat`` endpoint from ``OLLAMA_BASE_URL``.
 
     ``OLLAMA_BASE_URL`` is the OpenAI-compatible endpoint (``.../v1``).
     Ollama's native chat API lives at ``.../api/chat`` (no ``/v1``).
     """
     base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    # Strip /v1 suffix if present
     if base.endswith("/v1"):
         base = base[:-3]
     return base.rstrip("/") + "/api/chat"
 
 
-# Base class for the suggester — ``AutoSuggest`` if prompt_toolkit is
-# installed, ``object`` otherwise (so the class definition never fails even
-# if prompt_toolkit is missing; ``_make_ollama_suggester`` guards the import).
+def _ollama_query_sync(model: str, system: str, typed_context: str, url: str,
+                       timeout_s: float,
+                       num_predict: int = _COMPLETION_NUM_PREDICT,
+                       timeout_override_ms: Optional[int] = None) -> Optional[str]:
+    """Synchronous Ollama chat request.  Returns the raw completion text or
+    ``None`` on any failure.  Always called from a worker thread.
+
+    ``typed_context`` is the text to continue — the whole buffer up to the
+    cursor (previous lines included), so the model can suggest code that
+    uses variables the operator already typed instead of inventing
+    placeholder names.
+    """
+    import urllib.request
+    import urllib.error
+
+    timeout_s = (timeout_override_ms or _COMPLETION_TIMEOUT_MS) / 1000.0
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": typed_context},
+    ]
+
+    # Assistant priming ("```python\n") forces chat-tuned models to continue
+    # inside a code block — but ONLY works when the model actually thinks
+    # (the primed fence is part of the think-then-write pattern).  With
+    # think=false the model sees a non-sequitur turn and stops immediately
+    # with EMPTY content.  So: prime only when think is enabled, otherwise
+    # rely on the system prompt + fence stripping.
+    thinking_requested = _COMPLETION_THINK in (
+        "true", "yes", "1", "low", "medium", "high", "max"
+    )
+    if thinking_requested:
+        messages.append({"role": "assistant", "content": "```python\n"})
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": _COMPLETION_KEEP_ALIVE,
+        "options": {
+            "num_ctx": _COMPLETION_NUM_CTX,
+            "num_predict": num_predict,  # _COMPLETION_NUM_PREDICT (multiline window)
+            "temperature": 0.2,
+            # `````" keeps the reply inside the primed code block; blank-line
+            # stops are dropped — multiline suggestions need real blank lines
+            # for indentation.  (With think=true the budget also covers think.)
+            # NO stop strings: multi-model testing (2026-10-09) proved
+            # stop:["```"] is fatal without assistant priming — most models
+            # open their reply WITH a fence, the stop string matches on
+            # token 1, and generation halts with an empty payload
+            # (qwen3.8:27b: eval_count=1, content="").  Fence cleanup is
+            # handled downstream in the reply parsing instead.
+            "stop": [],
+        },
+    }
+
+    # Force no-think on every suggester call (unless overridden).  Reasoning
+    # models with think enabled burn their budget in message.thinking and
+    # return EMPTY content — no ghost text.  "auto"/"" omits the field for
+    # Ollama builds that predate the parameter.
+    if _COMPLETION_THINK and _COMPLETION_THINK != "auto":
+        payload["think"] = (
+            True if _COMPLETION_THINK in ("true", "yes", "1")
+            else _COMPLETION_THINK if _COMPLETION_THINK in ("low", "medium", "high", "max")
+            else False
+        )
+
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Socket timeout must exceed the caller's asyncio.wait_for budget so the
+    # async timeout fires first (cleaner failure accounting).  +5s headroom.
+    _sock_timeout = max(timeout_s + 5.0, 20.0)
+    try:
+        with urllib.request.urlopen(req, timeout=_sock_timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return None
+
+    msg = body.get("message") or {}
+    raw = (msg.get("content") or "").strip()
+    if not raw:
+        return None
+
+    # Thinking models (GLM flash, deepseek-r1, …) may spend their whole
+    # token budget inside <think>…</think> — the visible content is then
+    # empty.  Strip the block before deciding the response is useless.
+    if "<think>" in raw:
+        import re as _re
+        raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        # Dangling <think> with no closer (budget exhausted mid-reasoning)
+        if raw.startswith("<think>"):
+            raw = ""
+
+    if not raw:
+        return None
+    # Strip markdown fences
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    return raw if raw else None
+
+
+def _trim_completion(completion: str, typed_prefix: str = "") -> str:
+    """Clean a model reply into displayable ghost text.
+
+    Multiline-aware: keeps interior lines/indentation (the renderer emits
+    them as ghost lines below the prompt), strips markdown fences, and
+    removes any echo of what the operator already typed.
+    """
+    raw = completion.strip()
+    if not raw:
+        return ""
+    # Strip a full markdown code block if the model re-emitted one
+    lines = raw.split("\n")
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    completion = "\n".join(lines).rstrip()
+    if not completion:
+        return ""
+    # Strip the typed prefix if the model echoed it (per-line, so an echoed
+    # first line is removed but interior lines with their own indentation
+    # survive untouched)
+    if typed_prefix:
+        c_lines = completion.split("\n")
+        if c_lines[0].startswith(typed_prefix.split("\n")[-1]):
+            c_lines[0] = c_lines[0][len(typed_prefix.split("\n")[-1]):]
+        completion = "\n".join(c_lines).rstrip("\n")
+    return completion
+
+
+# ── On-demand Ollama inline completion via IPython's NavigableAutoSuggest ──
+#
+# IPython 8.32+ has a provisional LLM suggestion API built into
+# ``NavigableAutoSuggestFromHistory``.  The design is **on-demand**: the
+# operator presses a key (default Ctrl+X then Ctrl+O) to trigger an LLM completion,
+# and IPython manages the async task lifecycle — no prompt freezing.
+#
+# The upstream implementation requires ``jupyter_ai_magics`` and the
+# ``jupyter_ai.completions.models`` protocol.  We bypass that entirely by
+# subclassing and overriding ``_trigger_llm`` / ``_trigger_llm_core`` to
+# call Ollama directly.  No jupyter-ai dependency needed.
+#
+# History-based ghost text (instant, no Ollama) still works automatically —
+# the LLM completion is a separate, on-demand action.
+
 try:
-    from prompt_toolkit.auto_suggest import AutoSuggest as _AutoSuggestBase
+    from IPython.terminal.shortcuts.auto_suggest import (
+        NavigableAutoSuggestFromHistory as _NavSuggest,
+    )
+    _HAS_NAV_SUGGEST = True
 except ImportError:
-    _AutoSuggestBase = object  # type: ignore[misc,assignment]
+    _HAS_NAV_SUGGEST = False
 
 
-class OllamaAutoSuggest(_AutoSuggestBase):
-    """prompt_toolkit ``AutoSuggest`` backed by a local Ollama model.
-    
-    Produces inline ghost-text completions for the IPython prompt.  The
-    suggestion is context-aware: the prompt includes the available tool
-    aliases and their parameter names so the model suggests real tool calls
-    with correct arguments (including ``await`` for async wrappers).
-    
-    Falls back gracefully when Ollama is unreachable or busy — no suggestion
-    is shown, and the circuit breaker prevents retry storms.
+class OllamaNavigableSuggest(_NavSuggest if _HAS_NAV_SUGGEST else object):
+    """``NavigableAutoSuggestFromHistory`` with on-demand Ollama completions.
+
+    History matching works automatically (instant ghost text from IPython
+    history).  Press the trigger key (Ctrl+X, Ctrl+O) to trigger an Ollama-powered
+    completion that knows about framework tool names and signatures.
     """
 
-    def __init__(self, tool_aliases: List[str], timeout_ms: int = _COMPLETION_TIMEOUT_MS):
-        from prompt_toolkit.auto_suggest import Suggestion
-        
-        self._Suggestion = Suggestion
+    def __init__(self, tool_aliases: List[str],
+                 tool_specs: Optional[Dict[str, Dict[str, Any]]] = None):
+        super().__init__()
         self._tool_aliases = sorted(tool_aliases)
-        self._timeout_s = timeout_ms / 1000.0
-        self._url = _ollama_generate_url()
+        self._tool_specs = tool_specs or {}
+        self._url = _ollama_chat_url()
         self._model = _COMPLETION_MODEL
-        
-        # Circuit breaker state
-        self._failures = 0
-        self._cooldown_until = 0.0
-        self._lock = _threading_mod.Lock()
-        
-        # Cold-start state: the first request to Ollama may take 5-10s while
-        # the model loads into VRAM. Don't count that as a failure — give it
-        # a longer timeout on the first call, and don't let early timeouts
-        # open the circuit breaker.  But if the model never responds within
-        # ``_COLD_START_MAX_ATTEMPTS`` cold-window timeouts, give up and open
-        # the breaker — otherwise every keystroke hangs for 10s retrying a
-        # model that isn't loading (wrong model name, Ollama down, etc.).
-        self._first_call = True
-        self._cold_start_attempts = 0
-        self._cold_start_timeout_s = max(self._timeout_s * 3, 10.0)
-        
-        # Last-suggestion cache: (prefix, suggestion_text)
-        self._cached_prefix: str = ""
-        self._cached_suggestion: str = ""
+        # Timeout scales with the token budget: 512 tok at a conservative
+        # 45 tok/s (local 14B, mid-burst) = ~11s of pure generation; +3s
+        # overhead for load/queue/prompt-eval.  An explicit
+        # OLLAMA_COMPLETION_TIMEOUT_MS in .env overrides the computed value.
+        _env_timeout = os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "").strip()
+        _computed_ms = int(1000 * (_COMPLETION_NUM_PREDICT / 45 + 3))
+        self._timeout_s = (int(_env_timeout) if _env_timeout.isdigit()
+                           else _computed_ms) / 1000.0
+        # Shell handle is wired in by _embed() after the shell exists; the
+        # debug flag surfaces otherwise-silent failure paths.  Output goes
+        # through patch_stdout so it renders above the active prompt.
+        self._shell = None
+        self._debug = os.getenv("OLLAMA_COMPLETION_DEBUG", "1").lower() not in ("0", "false", "no", "off")
 
-        # Build a compact system prompt listing available tools.
-        # _COMPLETION_MAX_TOOLS caps the list size (0 = no limit); 190+ tool
-        # aliases at ~15 chars each is ~3KB, well within context budget.
-        if _COMPLETION_MAX_TOOLS > 0:
-            tools_list = ", ".join(self._tool_aliases[:_COMPLETION_MAX_TOOLS])
-        else:
-            tools_list = ", ".join(self._tool_aliases)
+        # Number of requests issued (stale-response guard)
+        self._request_number = 0
+
         self._system = (
-            "You are a code completion engine. OUTPUT RULES: output ONLY raw "
-            "Python code that continues the user's line. No explanations, no "
-            "markdown, no backticks, no comments, no prose. If the user typed "
-            "'await nmap(' you output 'target=...'. If you cannot complete the "
-            "code, output nothing. Available async tool callables (prefix with "
-            "await): " + tools_list + ". Sync functions: scope_on, scope_off, "
-            "scope_status, scope_search, sessions."
+            "You are an inline code-completion engine for a security-testing "
+            "REPL. Continue the operator's code at the cursor. OUTPUT RULES: "
+            "raw Python only — no explanations, no markdown, no comments, no "
+            "prose. You may emit MULTIPLE lines (a short block, 1-8 lines, "
+            "with correct 4-space indentation) when that is the natural "
+            "continuation. Reuse the names of variables the operator already "
+            "defined — never invent placeholder names like target_ip or "
+            "result1. If you cannot continue the code, output nothing. "
+            "Async tool callables (call with await): "
+            + self._tools_list() + ". Use these exact short aliases; never "
+            "invent a dotted module path. "
+            "Sync operator functions: scope_on, scope_off, scope_status, "
+            "scope_search, sessions."
         )
 
-    def _should_attempt(self) -> bool:
-        """Circuit breaker: are we allowed to try?"""
-        if not _COMPLETION_ENABLED:
-            return False
-        with self._lock:
-            if self._failures >= _COMPLETION_MAX_FAILURES:
-                if time.monotonic() < self._cooldown_until:
-                    return False
-                # Cooldown expired — reset and try again
-                self._failures = 0
-                self._cooldown_until = 0.0
-            return True
+    def _tools_list(self) -> str:
+        """Compact alias + parameter catalog for the system prompt."""
+        aliases = (self._tool_aliases[:_COMPLETION_MAX_TOOLS]
+                   if _COMPLETION_MAX_TOOLS > 0 else self._tool_aliases)
+        entries = []
+        for alias in aliases:
+            schema = self._tool_specs.get(alias) or {}
+            properties = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            params = []
+            for name in properties:
+                params.append(name + ("*" if name in required else ""))
+            entries.append(f"{alias}({', '.join(params)})")
+        return ", ".join(entries)
 
-    def _record_success(self):
-        with self._lock:
-            self._failures = 0
+    def _dbg(self, msg: str) -> None:
+        """One-line debug print, rendered above the active prompt.
 
-    def _record_failure(self):
-        with self._lock:
-            self._failures += 1
-            if self._failures >= _COMPLETION_MAX_FAILURES:
-                self._cooldown_until = time.monotonic() + _COMPLETION_BACKOFF_COOLDOWN_S
-
-    def _query_ollama(self, current_line: str) -> Optional[str]:
-        """Send a completion request to Ollama.  Returns the completion text
-        (what follows the cursor) or ``None`` on any failure/timeout.
-        
-        This is a *synchronous* HTTP call — it's always invoked from a worker
-        thread (via ``get_suggestion_async``) so it never blocks the prompt
-        event loop.
+        IPython's ``prompt_for_code`` runs the prompt under prompt_toolkit's
+        ``patch_stdout``, which routes prints from tasks/threads through the
+        prompt renderer — safe to call from the background LLM task.
         """
-        import urllib.request
-        import urllib.error
+        if self._debug:
+            print(f"\n[ollama] {msg}", flush=True)
 
-        # Use the chat endpoint with a primed assistant turn — this is far
-        # more reliable than the raw generate endpoint for chat-tuned models
-        # (qwen2.5-coder, etc.) which otherwise wrap output in markdown fences
-        # or produce conversational preambles. The assistant priming message
-        # ("```python\n") makes the model continue inside a code block; we
-        # strip the fence markers from the response.
-        payload = json.dumps({
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": self._system},
-                {"role": "user", "content": current_line},
-                {"role": "assistant", "content": "```python\n"},
-            ],
-            "stream": False,
-            "options": {
-                "num_predict": 40,       # short completion, not a paragraph
-                "temperature": 0.2,      # deterministic-ish
-                "stop": ["\n\n", "\nimport ", "\nfrom ", "\nclass ", "\ndef ", "```"],
-            },
-        }).encode("utf-8")
+    async def _trigger_llm(self, buffer) -> None:
+        """On-demand LLM completion — bypasses the jupyter-ai check.
 
-        req = urllib.request.Request(
-            self._url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            # Socket timeout must be >= the async wrapper's timeout so the
-            # async timeout fires first (cleaner circuit-breaker accounting).
-            # Use the cold-start timeout on the first call to allow model
-            # loading; subsequent calls use the normal timeout.
-            sock_timeout = (self._cold_start_timeout_s if self._first_call else self._timeout_s) + 2
-            with urllib.request.urlopen(req, timeout=sock_timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as e:
-            self._record_failure()
-            return None
-
-        # Chat endpoint: {"message": {"content": "..."}}.
-        # The assistant was primed with "```python\n" so the model continues
-        # inside a code block. Strip any fence markers and take the content.
-        msg = body.get("message") or {}
-        raw = (msg.get("content") or "").strip()
-        if not raw:
-            self._record_failure()
-            return None
-
-        # Strip markdown code fences if present (the priming already opened
-        # one, but the model might re-emit it in some contexts)
-        if raw.startswith("```"):
-            # Remove opening fence line
-            lines = raw.split("\n")
-            if lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            # Remove closing fence if present
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            raw = "\n".join(lines).strip()
-
-        if not raw:
-            self._record_failure()
-            return None
-
-        self._record_success()
-        return raw
-
-    def _trim_to_line(self, completion: str, document, typed_prefix: str = "") -> str:
-        """Trim the completion to the first line and strip any echoed prefix.
-        
-        Chat-tuned models often regenerate the entire line (e.g. ``await
-        nmap(target=...)``) even though the user already typed ``await nmap(``.
-        Ghost text should show only what comes *after* the cursor, so we
-        strip the typed prefix from the beginning of the completion.
+        Cancels any running LLM task, then starts a new one.  IPython's
+        ``@_only_one_at_a_time`` + ``asyncio.create_task`` manages the
+        lifecycle — the prompt is not blocked during the request.
         """
-        # Only the first line is useful for ghost text
-        completion = completion.split("\n")[0]
-        # Strip trailing whitespace
-        completion = completion.rstrip()
-        if not completion:
-            return ""
-        # Strip the typed prefix if the model echoed it back
-        if typed_prefix and completion.startswith(typed_prefix):
-            completion = completion[len(typed_prefix):]
-        # Also strip text after the cursor if the completion overlaps it
-        text_after_cursor = document.text_after_cursor.split("\n")[0]
-        if text_after_cursor and completion.startswith(text_after_cursor):
-            completion = completion[len(text_after_cursor):]
-        return completion
+        self._cancel_running_llm_task()
 
-    def get_suggestion(self, buffer, document):
-        """Synchronous path — not used by IPython (it calls the async override),
-        but required by the ``AutoSuggest`` ABC.
+        async def _run():
+            try:
+                await self._trigger_llm_core(buffer)
+            except Exception as e:
+                self._dbg(f"completion error: {e!r}")
+
+        self._llm_task = asyncio.create_task(_run())
+
+    async def _trigger_llm_core(self, buffer) -> None:
+        """Query Ollama and push the suggestion into the buffer.
+
+        This replaces the upstream implementation that uses
+        ``jupyter_ai.completions.models.InlineCompletionRequest``.  We call
+        Ollama's ``/api/chat`` endpoint directly and set
+        ``buffer.suggestion`` + ``buffer.on_suggestion_set.fire()`` — the
+        same mechanism the upstream code uses to render ghost text.
         """
-        if not self._should_attempt():
-            return None
+        from prompt_toolkit.auto_suggest import Suggestion
 
-        line = document.text_before_cursor.split("\n")[-1]
+        doc = buffer.document
+        line = doc.text_before_cursor.split("\n")[-1]
         if len(line) < _COMPLETION_MIN_PREFIX:
-            return None
+            self._dbg(f"line too short ({len(line)} chars), skipping")
+            return
 
-        # Cache hit: the current line extends the cached prefix
-        if self._cached_suggestion and line.startswith(self._cached_prefix) and len(line) > len(self._cached_prefix):
-            remaining = line[len(self._cached_prefix):]
-            if self._cached_suggestion.startswith(remaining):
-                trimmed = self._cached_suggestion[len(remaining):]
-                if trimmed:
-                    return self._Suggestion(trimmed)
+        # Whole-buffer context: everything the operator typed up to the
+        # cursor, truncated to the tail.  Earlier lines carry the variables
+        # (sess handle, target host, discovered creds) that the suggestion
+        # should reference instead of inventing placeholders.
+        typed_context = doc.text_before_cursor[-_COMPLETION_MAX_CONTEXT_CHARS:]
 
-        result = self._query_ollama(line)
-        if result is None:
-            return None
+        # Live namespace signal: the operator's variables + tool callables,
+        # so the model knows `sess = "ssh:..."` exists to be reused.
+        ns_hint = ""
+        shell = self._shell
+        if shell is not None:
+            try:
+                hints = []
+                for name, val in shell.user_ns.items():
+                    if name.startswith("_") or name in self._system or not isinstance(val, (str, int, float, bool, list, dict)):
+                        continue
+                    if callable(val):
+                        continue
+                    preview = repr(val)[:60]
+                    hints.append(f"{name} = {preview}")
+                if hints:
+                    ns_hint = "Operator's live variables: " + "; ".join(hints[:12]) + ". "
+            except Exception:
+                pass
 
-        trimmed = self._trim_to_line(result, document, typed_prefix=line)
-        if not trimmed:
-            return None
+        self._request_number += 1
+        request_number = self._request_number
 
-        # Cache for next keystroke
-        self._cached_prefix = line
-        self._cached_suggestion = trimmed
-
-        return self._Suggestion(trimmed)
-
-    async def get_suggestion_async(self, buff, document):
-        """Asynchronous path — this is what prompt_toolkit/IPython calls.
-        
-        Runs the synchronous Ollama query in a worker thread with a hard
-        wall-clock timeout.  If the timeout fires (Ollama is busy), returns
-        ``None`` (no ghost text) and records a failure for the circuit breaker.
-        """
-        line = document.text_before_cursor.split("\n")[-1]
-
-        if not self._should_attempt():
-            return None
-
-        if len(line) < _COMPLETION_MIN_PREFIX:
-            return None
-
-        # Cache hit
-        if self._cached_suggestion and line.startswith(self._cached_prefix) and len(line) > len(self._cached_prefix):
-            remaining = line[len(self._cached_prefix):]
-            if self._cached_suggestion.startswith(remaining):
-                trimmed = self._cached_suggestion[len(remaining):]
-                if trimmed:
-                    return self._Suggestion(trimmed)
-
-        # Use a longer timeout on the first call to allow cold model loading
-        # (qwen2.5-coder:14b takes 5-6s to load into VRAM on first request).
-        # After the first successful response, switch to the normal timeout.
-        current_timeout = self._cold_start_timeout_s if self._first_call else self._timeout_s
-
+        self._dbg(f"querying {self._model!r} for {typed_context[-80:]!r}")
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(self._query_ollama, line),
-                timeout=current_timeout,
+                asyncio.to_thread(
+                    _ollama_query_sync,
+                    self._model,
+                    ns_hint + self._system,
+                    typed_context,
+                    self._url,
+                    self._timeout_s,
+                    _COMPLETION_NUM_PREDICT,
+                ),
+                timeout=self._timeout_s + 2,
             )
-            self._first_call = False
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            if self._first_call:
-                # Cold-start timeout — the model is still loading.  Don't
-                # count as a normal failure, but track attempts so we
-                # eventually give up if the model never responds (wrong name,
-                # Ollama down, VRAM exhausted).  After _COLD_START_MAX_ATTEMPTS
-                # cold timeouts, open the circuit breaker to stop hanging the
-                # prompt on every keystroke.
-                self._cold_start_attempts += 1
-                if self._cold_start_attempts >= _COLD_START_MAX_ATTEMPTS:
-                    self._first_call = False  # cold start is over (failed)
-                    self._record_failure()
-            else:
-                self._record_failure()
-            return None
-        except Exception as _exc:
-            if not self._first_call:
-                self._record_failure()
-            return None
+        except asyncio.TimeoutError:
+            self._dbg(f"timeout after {self._timeout_s:.0f}s — model cold or busy")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._dbg(f"query error: {exc!r}")
+            return
+
+        # Stale check — if a newer request was triggered, discard this one
+        if self._request_number != request_number:
+            self._dbg("stale response discarded (newer request took over)")
+            return
 
         if result is None:
-            return None
+            self._dbg("no usable reply: unreachable, empty, all-<think>, or unfenced noise")
+            return
 
-        trimmed = self._trim_to_line(result, document, typed_prefix=line)
+        self._dbg(f"raw reply: {result[:120]!r}")
+
+        trimmed = _trim_completion(result, typed_prefix=line)
         if not trimmed:
-            return None
+            self._dbg(f"completion fully overlapped the typed text — nothing to show ({result[:80]!r})")
+            return
 
-        self._cached_prefix = line
-        self._cached_suggestion = trimmed
+        # Only set if the buffer hasn't changed since we started
+        if buffer.document == doc:
+            self._dbg(f"suggesting: {trimmed!r}")
+            buffer.suggestion = Suggestion(trimmed)
+            buffer.on_suggestion_set.fire()
+        else:
+            self._dbg("buffer changed during query — discarding")
 
-        return self._Suggestion(trimmed)
 
-
-def _make_ollama_suggester(tool_aliases: List[str]):
-    """Build an ``OllamaAutoSuggest`` if enabled, else ``None``.
-    
-    Returns ``None`` when completions are disabled (``OLLAMA_COMPLETION_ENABLED=0``)
-    or when prompt_toolkit is not installed — IPython falls back to its
-    built-in history suggester.
-    """
-    if not _COMPLETION_ENABLED:
+def _make_ollama_suggester(
+    tool_aliases: List[str],
+    tool_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+):
+    """Build an ``OllamaNavigableSuggest`` if enabled, else ``None``."""
+    if not _COMPLETION_ENABLED or not _HAS_NAV_SUGGEST:
         return None
     try:
-        return OllamaAutoSuggest(tool_aliases)
-    except ImportError:
+        return OllamaNavigableSuggest(tool_aliases, tool_specs=tool_specs)
+    except Exception:
         return None
 
 
@@ -1860,11 +1991,42 @@ async def repl_loop(manifests: List[ToolManifest]):
                 print()
                 print("  Also: tools  (dict of all wrappers),  manifests  (list),")
                 print("        manifest_by_id('full.tool.id'),  run_tool,  resolve_callable")
-                if _COMPLETION_ENABLED:
-                    print(f"  Ghost text: Ollama auto-suggest (model={_COMPLETION_MODEL}, "
-                          f"timeout={_COMPLETION_TIMEOUT_MS}ms, backoff after "
-                          f"{_COMPLETION_MAX_FAILURES} failures)")
+
+                # Build the Ollama suggester BEFORE the print block that
+                # references it.  The suggester is a
+                # ``NavigableAutoSuggestFromHistory`` subclass — IPython's
+                # own on-demand LLM suggestion API (provisional in 8.32+).
+                # History matching works automatically (instant ghost text
+                # from past commands).  The trigger key fires an Ollama-powered
+                # completion that knows about framework tool names and
+                # signatures.  No prompt freezing because the LLM completion
+                # is on-demand, not per-keystroke.
+                tool_alias_names = sorted(
+                    k for k, v in user_ns.items()
+                    if callable(v) and hasattr(v, "__manifest__")
+                )
+                tool_specs = {
+                    k: getattr(v, "__manifest__").parameters
+                    for k, v in user_ns.items()
+                    if callable(v) and hasattr(v, "__manifest__")
+                }
+                suggester = _make_ollama_suggester(
+                    tool_alias_names,
+                    tool_specs=tool_specs,
+                )
+
+                if suggester is not None:
+                    _keyname = " + ".join(
+                        k.replace("c-", "Ctrl+").replace("escape", "Esc").upper()
+                        for k in _trigger_key_spec()
+                    )
+                    print(f"  Ollama completion: {_keyname} triggers on-demand ghost text")
+                    print(f"    model={_COMPLETION_MODEL}, budget={_COMPLETION_NUM_PREDICT}tok "
+                          f"(multiline), timeout={_COMPLETION_TIMEOUT_MS}ms")
+                    print("    Suggestions see your whole cell + live variables.")
+                    print("    History ghost text is automatic; Ollama is on-demand.")
                     print("    Set OLLAMA_COMPLETION_ENABLED=0 to disable.")
+                print("  check_trigger() inside IPython verifies the chord dispatch.")
                 print("  Ctrl+D / exit() to return.\n")
 
                 # IPython.embed() → prompt_toolkit → asyncio.run() crashes with
@@ -1873,25 +2035,9 @@ async def repl_loop(manifests: List[ToolManifest]):
                 # so it gets a clean event-loop context.  asyncio.to_thread()
                 # blocks this coroutine until the user exits IPython.
                 #
-                # We use InteractiveShellEmbed directly (instead of the bare
-                # ``embed()`` convenience) so we can explicitly enable
-                # ``%autoawait asyncio`` before the interactive loop starts.
-                # Without this, ``await nmap(...)`` at the top level can fail
-                # with "SyntaxError: await outside function" — embed() in a
-                # separate thread doesn't always inherit the default autoawait
-                # policy, depending on IPython version.
-                #
-                # We also inject an ``OllamaAutoSuggest`` (ghost-text inline
-                # completions) onto the shell after it initializes its
-                # prompt_toolkit app — the ``pt_app`` attribute holds the
-                # ``PromptSession``, and setting ``auto_suggest`` there wires
-                # our suggester into the prompt's rendering loop.
-                tool_alias_names = sorted(
-                    k for k, v in user_ns.items()
-                    if callable(v) and hasattr(v, "__manifest__")
-                )
-                suggester = _make_ollama_suggester(tool_alias_names)
-
+                # We use InteractiveShellEmbed directly so we can explicitly
+                # enable ``%autoawait asyncio`` and inject the Ollama
+                # suggester before the interactive loop starts.
                 def _embed():
                     shell = InteractiveShellEmbed(user_ns=user_ns, header="")
                     # Force asyncio autoawait so ``await tool(...)`` works at
@@ -1901,30 +2047,38 @@ async def repl_loop(manifests: List[ToolManifest]):
                     # need since the main loop is in the other thread).
                     shell.loop_manager = "asyncio"
                     shell.enable_gui("asyncio")
-                    # Inject the Ollama ghost-text suggester.
-                    #
-                    # IPython's ``_extra_prompt_options()`` builds the kwargs
-                    # dict passed to ``pt_app.prompt()``.  Critically, it does
-                    # NOT include ``auto_suggest`` — prompt_toolkit's
-                    # ``PromptSession.prompt()`` only activates auto-suggest
-                    # when the ``auto_suggest`` parameter is explicitly passed
-                    # to ``prompt()``, NOT when ``self.auto_suggest`` is set
-                    # on the session.  Setting ``shell.auto_suggest`` or
-                    # ``shell.pt_app.auto_suggest`` alone has no effect.
-                    #
-                    # The fix: wrap ``_extra_prompt_options`` to inject
-                    # ``auto_suggest`` into the returned dict.  This is the
-                    # single point where the suggester flows into the actual
-                    # prompt rendering loop.
+                    # Inject the Ollama suggester.  Using
+                    # ``_set_autosuggestions`` is IPython's own wiring path —
+                    # it sets ``shell.auto_suggest`` and syncs to ``pt_app``
+                    # when it exists.  We pass "NavigableAutoSuggestFromHistory"
+                    # to trigger IPython's setup (connect/disconnect handlers,
+                    # key bindings), then swap in our subclass.
                     if suggester is not None:
+                        suggester._shell = shell
+                        shell.autosuggestions_provider = "NavigableAutoSuggestFromHistory"
+                        shell._set_autosuggestions()
+                        # Swap IPython's instance for our Ollama-aware subclass
                         shell.auto_suggest = suggester  # type: ignore[assignment]
-                        _orig_opts = shell._extra_prompt_options
-                        _suggester_ref = suggester  # capture for closure
-                        def _opts_with_suggest(*a, **kw):
-                            opts = _orig_opts(*a, **kw)
-                            opts["auto_suggest"] = _suggester_ref
-                            return opts
-                        shell._extra_prompt_options = _opts_with_suggest  # type: ignore[assignment]
+                        if shell.pt_app is not None:
+                            shell.pt_app.auto_suggest = suggester  # type: ignore[assignment]
+
+                        # Bind Ctrl+O to IPython's built-in
+                        # ``llm_autosuggestion`` command (bound to the trigger key), which calls
+                        # ``provider._trigger_llm(event.current_buffer)``.
+                        # We add it via ``shell.shortcuts`` — IPython's
+                        # intended extension point for keybinding
+                        # registration.  The command is in
+                        # ``UNASSIGNED_ALLOWED_COMMANDS`` (no default key),
+                        # so ``create=True`` adds a new binding without
+                        # displacing existing ones.
+                        from IPython.terminal.shortcuts.auto_suggest import (
+                            llm_autosuggestion as _llm_cmd,
+                        )
+                        shell.shortcuts = list(shell.shortcuts) + [{
+                            "command": "IPython:auto_suggest.llm_autosuggestion",
+                            "new_keys": _trigger_key_spec(),
+                            "create": True,
+                        }]
                     shell()
 
                 await asyncio.to_thread(_embed)
