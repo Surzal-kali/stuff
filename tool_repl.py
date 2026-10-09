@@ -22,6 +22,7 @@ discovered at startup) for type coercion — no hardcoded type maps.
 import asyncio
 import inspect
 import json
+import os
 import shlex
 import struct
 import sys
@@ -32,6 +33,15 @@ from typing import Any, Dict, List, Optional
 
 # Make project root importable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Load .env (same as bootstrap.py) so OLLAMA_COMPLETION_MODEL and other
+# env-tunable knobs are visible. tool_repl.py is a standalone entry point —
+# without this, os.getenv() only sees the system environment, not .env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+except ImportError:
+    pass
 
 from constants import TransportType
 from daharness.models import ToolManifest
@@ -248,6 +258,773 @@ REQUIRES_SERVICE = {
     "payloads.searchsploiting.search_exploit",
     "payloads.sqlmap.run_sqlmap",
 }
+
+
+# ── IPython kitted namespace: aliases + signature-bearing wrappers ──────────
+#
+# The plain ``ipython`` command used to inject a flat ``List[ToolManifest]``
+# and a single ``quick_run("dotted.tool.id", **kw)`` helper.  Jedi completions
+# never fired because tool ids are *quoted strings*, not Python symbols — the
+# completer has nothing to index.  This section builds, per discovered tool,
+# an ``async def`` wrapper that:
+#
+#   • lives in the IPython namespace under a short, ergonomic alias
+#   • carries an ``inspect.Signature`` built from the manifest's JSON-schema
+#     parameters so IPython shows ``target*``, ``options``, ``port`` with
+#     type + description tooltips on ``(<Tab>``
+#   • has a ``__doc__`` assembled from the manifest's semantic capability +
+#     per-parameter descriptions so ``tool?`` / ``tool??`` work
+#   • dispatches through ``run_tool`` (→ executor → transport dispatch →
+#     scope gate + preflight) — never through raw ``resolve_callable`` — so
+#     the safety invariants that the REPL's ``run`` command enforces are
+#     identical inside IPython.
+#
+# The wrappers are plain ``async def`` closures; IPython's ``%autoawait
+# asyncio`` (the default) lets the operator write ``await nmap(target=...)``
+# at the top level, same as the old ``quick_run``.
+
+# Curated short aliases for the most-used tools.  Keyed by the full
+# ``module_id`` (so a rename in the source tree breaks loudly here, not
+# silently at the keyboard).  Tools not in this map fall through to
+# auto-derivation below.
+_TOOL_ALIASES: Dict[str, str] = {
+    # auxiliaries/
+    "auxiliaries.nmap.run_nmap": "nmap",
+    "auxiliaries.masscan.run_masscan": "masscan",
+    "auxiliaries.ffuf_tools.run_ffuf": "ffuf",
+    "auxiliaries.smb_scanner.check_null_session": "smb_null",
+    "auxiliaries.smb_scanner.run_smb_recon": "smb_recon",
+    "auxiliaries.ftp_recon.run_ftp_recon": "ftp_recon",
+    "auxiliaries.dns_lookup.run_dns_lookup": "dns_lookup",
+    "auxiliaries.tls_info.run_tls_info": "tls_info",
+    "auxiliaries.cors_probe.run_cors_probe": "cors_probe",
+    "auxiliaries.ssrf_probe.run_ssrf_probe": "ssrf_probe",
+    "auxiliaries.web_probe.run_web_probe": "web_probe",
+    "auxiliaries.web_login_brute.run_web_login_brute": "web_brute",
+    "auxiliaries.ldap_search.ldap_rootdse": "ldap_rootdse",
+    "auxiliaries.ldap_search.ldap_search": "ldap_search",
+    "auxiliaries.ssh_exec.run_ssh_exec": "ssh_exec",
+    "auxiliaries.impacket_suite.secretsdump": "secretsdump",
+    "auxiliaries.impacket_suite.psexec_exec": "psexec",
+    "auxiliaries.impacket_suite.wmiexec_exec": "wmiexec",
+    "auxiliaries.impacket_suite.atexec_exec": "atexec",
+    "auxiliaries.impacket_suite.smb_enum_shares": "smb_enum_shares",
+    "auxiliaries.impacket_suite.smb_read_file": "smb_read_file",
+    "auxiliaries.amass.run_amass": "amass",
+    "auxiliaries.archived_urls.run_archived_urls": "archived_urls",
+    "auxiliaries.cert_tools.run_cert_tools": "cert_tools",
+    "auxiliaries.radare2.run_radare2": "radare2",
+    "auxiliaries.jadx.run_jadx": "jadx",
+    "auxiliaries.playwright_recon.run_playwright_recon": "pw_recon",
+    "auxiliaries.playwright_sidecar.run_playwright_sidecar": "pw_sidecar",
+    "auxiliaries.burp_mcp.run_burp_mcp": "burp_mcp",
+    "auxiliaries.zap.run_zap": "zap",
+    "auxiliaries.framework_status.run_framework_status": "framework_status",
+    "auxiliaries.program_scope.search_programs": "scope_search_programs",
+    # payloads/
+    "payloads.ffuf.run_ffuf": "ffuf_payload",
+    "payloads.hydra.run_hydra": "hydra",
+    "payloads.sqlmap.run_sqlmap": "sqlmap",
+    "payloads.hash_crack.run_hash_crack": "hash_crack",
+    "payloads.searchsploiting.search_exploit": "searchsploit",
+    "payloads.js_recon.run_js_recon": "js_recon",
+    "payloads.wordlists.run_wordlists": "wordlists",
+    "payloads.metasploiting.MetasploitClient.index_modules": "msf_index",
+    "payloads.metasploiting.MetasploitClient.dispatch_metasploit": "msf_dispatch",
+    "payloads.metasploiting.MetasploitClient.get_options": "msf_options",
+    "payloads.metasploiting.MetasploitClient.set_payload": "msf_set_payload",
+    "payloads.metasploiting.MetasploitClient.list_sessions": "msf_sessions",
+    "payloads.metasploiting.MetasploitClient.interact_session": "msf_interact",
+    "payloads.metasploiting.MetasploitClient.close_msf_session": "msf_close",
+    "payloads.msfvenom_tools.generate_payload": "msfvenom",
+    "payloads.msfvenom_tools.msfvenom_menu": "msfvenom_menu",
+    "payloads.msfvenom_tools.list_dropbox": "list_dropbox",
+    "payloads.fastcgi.run_fastcgi": "fastcgi",
+    # listeners/
+    "listeners.listening.TCPListener.open_listener": "listen_tcp",
+    "listeners.listening.TCPListener.close_listener": "close_listener",
+    "listeners.listening.TCPListener.send_to_brain": "send_to_brain",
+    "listeners.raw_scan.syn_scan": "syn_scan",
+    "listeners.collaborator.run_collaborator": "collaborator",
+    "listeners.execution_tracker.run_execution_tracker": "execution_tracker",
+    "listeners.brain_control.run_brain_control": "brain_control",
+    # utils/
+    "utils.memory_tools.remember_text": "remember",
+    "utils.memory_tools.search_text": "mem_search",
+    "utils.memory_tools.recall_text": "mem_recall",
+    "utils.memory_tools.get_text": "mem_get",
+    "utils.memory_tools.forget_text": "mem_forget",
+    "utils.session_manager.list_sessions": "list_sessions",
+    "utils.cookie_jar.jar_state": "jar_state",
+    "utils.cookie_jar.jar_store_cookie": "jar_store_cookie",
+    "utils.cookie_jar.jar_store_token": "jar_store_token",
+    "utils.cookie_jar.jar_clear": "jar_clear",
+    "utils.cookie_jar.jar_cookie_header": "jar_cookie_header",
+    "auxiliaries.web_session.session_get": "session_get",
+    "auxiliaries.web_session.session_post": "session_post",
+    "auxiliaries.web_session.session_request": "session_request",
+    "auxiliaries.web_session.session_upload": "session_upload",
+    "utils.findings.report_finding": "report_finding",
+    "utils.findings.list_findings": "list_findings",
+    "utils.log_reader.read_logs": "read_logs",
+}
+
+# Prefixes stripped during auto-derivation of short aliases.
+_ALIAS_STRIP_PREFIXES = ("run_", "check_", "exec_", "do_", "perform_")
+# Suffixes stripped during auto-derivation.
+_ALIAS_STRIP_SUFFIXES = ("_tool",)
+
+
+def _derive_alias(module_id: str) -> str:
+    """Derive a short alias from a ``module_id`` when no curated one exists.
+
+    Strategy: take the last dotted segment, strip common verb prefixes and
+    ``_tool`` suffixes, and if it's a method on a class (``Class.method``),
+    prefer the method name alone — unless it's generic (``run``, ``check``,
+    ``list``), in which case prefix with a snake-cased class name.
+
+    Collisions are *not* resolved here — the caller collects all aliases and
+    de-duplicates by appending a module qualifier when two tools claim the
+    same short name.
+    """
+    parts = module_id.split(".")
+    last = parts[-1]
+
+    # Strip common prefixes
+    for pfx in _ALIAS_STRIP_PREFIXES:
+        if last.startswith(pfx):
+            last = last[len(pfx):]
+            break
+    # Strip common suffixes
+    for sfx in _ALIAS_STRIP_SUFFIXES:
+        if last.endswith(sfx):
+            last = last[: -len(sfx)]
+            break
+
+    # If the last segment is too generic and there's a class name before it,
+    # qualify with the class.
+    if last.lower() in ("run", "check", "list", "exec", "scan", "status", "info") and len(parts) >= 3:
+        cls_seg = parts[-2]
+        last = f"{cls_seg.lower()}_{last}"
+
+    return last
+
+
+def build_tool_aliases(manifests: List[ToolManifest]) -> Dict[str, ToolManifest]:
+    """Return ``{alias: manifest}`` for all discovered tools.
+
+    Curated aliases from ``_TOOL_ALIASES`` win.  Unmatched tools get
+    auto-derived aliases.  Collisions are resolved by appending the
+    top-level module name (``auxiliaries``, ``payloads``, etc.) as a
+    prefix — if that *also* collides, append a numeric suffix.
+    """
+    result: Dict[str, ToolManifest] = {}
+    # First pass: curated aliases (explicit, may collide → resolved later)
+    pending: List[tuple] = []  # (alias, manifest)
+    for m in manifests:
+        curated = _TOOL_ALIASES.get(m.module_id)
+        if curated:
+            pending.append((curated, m))
+        else:
+            pending.append((_derive_alias(m.module_id), m))
+
+    for alias, m in pending:
+        if alias not in result:
+            result[alias] = m
+            continue
+        # Collision — prefix with the top-level module segment
+        top = m.module_id.split(".")[0]
+        qualified = f"{top}_{alias}"
+        if qualified not in result:
+            result[qualified] = m
+            continue
+        # Still colliding — numeric suffix
+        i = 2
+        while f"{qualified}_{i}" in result:
+            i += 1
+        result[f"{qualified}_{i}"] = m
+    return result
+
+
+def _schema_type_to_py(schema_type: str) -> type:
+    """Map a JSON-schema type string to a Python type for ``Signature``."""
+    if schema_type in ("integer", "int"):
+        return int
+    if schema_type in ("number", "float"):
+        return float
+    if schema_type in ("boolean", "bool"):
+        return bool
+    if schema_type in ("array", "list"):
+        return list
+    if schema_type in ("object", "dict"):
+        return dict
+    return str
+
+
+def _build_signature(manifest: ToolManifest) -> inspect.Signature:
+    """Build an ``inspect.Signature`` from the manifest's parameter schema.
+
+    Required parameters become positional-or-keyword with no default;
+    optional parameters get ``None`` as a sentinel default.  Each parameter
+    carries an ``annotation`` from the schema type, so IPython's tooltip
+    shows ``target: str``, ``port: int``, etc.
+    """
+    if not manifest.parameters:
+        return inspect.Signature()
+    props = manifest.parameters.get("properties", {})
+    required = set(manifest.parameters.get("required", []))
+    params: List[inspect.Parameter] = []
+    # Required first (so positional order matches declaration), then optional
+    ordered = sorted(props.items(), key=lambda kv: (kv[0] not in required, kv[0]))
+    for pname, pdef in ordered:
+        stype = pdef.get("type", "string") if isinstance(pdef, dict) else "string"
+        py_type = _schema_type_to_py(stype)
+        default = inspect.Parameter.empty if pname in required else None
+        params.append(
+            inspect.Parameter(
+                pname,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default,
+                annotation=py_type,
+            )
+        )
+    return inspect.Signature(params)
+
+
+def _build_docstring(manifest: ToolManifest) -> str:
+    """Assemble a readable ``__doc__`` from the manifest's semantic capability
+    and per-parameter descriptions.
+
+    This is what ``tool?`` prints in IPython — the operator's quick reference.
+    """
+    lines = [manifest.internal_semantic_capability.strip(), ""]
+    lines.append(f"    tool_id:    {manifest.module_id}")
+    lines.append(f"    transport:  {manifest.transport.value}")
+    lines.append(f"    path:        {manifest.implementation_path}")
+    if manifest.tags:
+        lines.append(f"    tags:        {', '.join(manifest.tags)}")
+    if manifest.parameters:
+        props = manifest.parameters.get("properties", {})
+        required = set(manifest.parameters.get("required", []))
+        if props:
+            lines.append("")
+            lines.append("    Parameters")
+            lines.append("    ----------")
+            for pname, pdef in props.items():
+                stype = pdef.get("type", "string") if isinstance(pdef, dict) else "string"
+                req = "*" if pname in required else " "
+                desc = (pdef.get("description", "") if isinstance(pdef, dict) else "")[:80]
+                lines.append(f"    {req} {pname} : {stype}  {desc}".rstrip())
+    if manifest.next:
+        lines.append("")
+        lines.append("    Next steps")
+        lines.append("    ----------")
+        for hint in manifest.next:
+            lines.append(f"    → {hint}")
+    return "\n".join(lines)
+
+
+def _make_tool_wrapper(manifest: ToolManifest, manifests_list: List[ToolManifest]):
+    """Create an ``async def`` closure that dispatches a single tool through
+    ``run_tool`` with a real ``Signature`` and ``__doc__``.
+
+    The wrapper accepts ``**kwargs`` at the Python level but advertises its
+    signature via ``__signature__`` so IPython/Jedi complete the named
+    parameters.  Unknown kwargs are passed straight to ``run_tool``, which
+    sends them through preflight validation — bad keys are rejected there,
+    not silently dropped.
+    """
+    tool_id = manifest.module_id
+    sig = _build_signature(manifest)
+    doc = _build_docstring(manifest)
+
+    async def _wrapper(**kwargs):
+        return await run_tool(tool_id, kwargs, manifests_list)
+
+    # Attach the metadata that makes IPython completions + introspection work
+    _wrapper.__name__ = _TOOL_ALIASES.get(tool_id) or _derive_alias(tool_id)
+    _wrapper.__qualname__ = _wrapper.__name__
+    _wrapper.__doc__ = doc
+    _wrapper.__signature__ = sig
+    # Stash the manifest for tools that want to introspect the wrapper
+    _wrapper.__manifest__ = manifest  # type: ignore[attr-defined]
+    return _wrapper
+
+
+def build_ipython_namespace(
+    manifests: List[ToolManifest],
+) -> Dict[str, Any]:
+    """Build the full kitted-out IPython user namespace.
+
+    Returns a dict suitable for ``IPython.embed(user_ns=...)`` containing:
+      • One ``async def`` wrapper per discovered tool, keyed by short alias
+      • ``manifests`` — the flat list (still available for advanced use)
+      • ``manifest_by_id(id)`` — lookup helper
+      ``registry`` — bare executor instance
+      • ``run_tool``, ``discover_tools``, ``resolve_callable`` — raw helpers
+      • ``ToolManifest``, ``ToolRegistry`` — model classes
+      • ``tools`` — ``{alias: wrapper}`` dict (same objects as the top-level
+        aliases, collected for ``tools.<Tab>`` browsing)
+      • ``sessions()``, ``scope_on()``, ``scope_off()``, ``scope_status()``,
+        ``scope_search()`` — operator command wrappers
+    """
+    ns: Dict[str, Any] = {}
+
+    # ── Tool wrappers ───────────────────────────────────────────────────
+    alias_map = build_tool_aliases(manifests)
+    tools: Dict[str, Any] = {}
+    for alias, m in alias_map.items():
+        wrapper = _make_tool_wrapper(m, manifests)
+        ns[alias] = wrapper
+        tools[alias] = wrapper
+    ns["tools"] = tools
+    ns["manifests"] = manifests
+    ns["registry"] = _make_executor()
+
+    def manifest_by_id(tool_id: str) -> Optional[ToolManifest]:
+        """Look up a manifest by its full ``module_id``."""
+        return next((m for m in manifests if m.module_id == tool_id), None)
+    ns["manifest_by_id"] = manifest_by_id
+
+    # ── Raw helpers (unchanged from the old namespace) ──────────────────
+    ns["run_tool"] = run_tool
+    ns["discover_tools"] = discover_tools
+    ns["resolve_callable"] = resolve_callable
+    ns["ToolManifest"] = ToolManifest
+    ns["ToolRegistry"] = ToolRegistry
+
+    # ── Operator command wrappers (sync, print directly) ────────────────
+    # These wrap the existing REPL command bodies so the operator has the
+    # same control surface inside IPython without typing ``!`` shell escapes.
+
+    def _sessions():
+        """Show Brain-held (shared) vs REPL-local sessions — same as the ``sessions`` REPL command."""
+        # _sessions_command is async; run it in the current loop via ensure_future
+        import asyncio as _a
+        try:
+            loop = _a.get_event_loop()
+        except RuntimeError:
+            loop = _a.new_event_loop()
+            _a.set_event_loop(loop)
+        # If we're inside IPython's autoawait loop, create_task works; otherwise
+        # run_until_complete in a fresh loop.  Using a coroutine wrapper keeps
+        # it simple — the operator types ``sessions()`` (no await).
+        coro = _sessions_command(manifests)
+        if loop.is_running():
+            task = loop.create_task(coro)
+            # IPython's autoawait would normally handle this, but since this is
+            # a sync wrapper, we use run_until_complete on a nested loop.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(_a.run, coro).result()
+        else:
+            loop.run_until_complete(coro)
+    ns["sessions"] = _sessions
+
+    def _scope_on(handle: str, platform: str = "h1", strict: bool = True,
+                  ip_boundary: bool = False):
+        """Arm the packet-scope gate.  Operator-only — not exposed to the agent.
+
+        Example::
+
+            scope_on("starbucks", platform="h1")
+        """
+        flags = []
+        if not strict:
+            flags.append("--no-strict")
+        if ip_boundary:
+            flags.append("--ip-boundary")
+        flags.append(f"--platform={platform}")
+        rest = f"on {handle} {' '.join(flags)}"
+        _scope_command(rest)
+    ns["scope_on"] = _scope_on
+
+    def _scope_off():
+        """Disarm the packet-scope gate (lab mode — sends unrestricted)."""
+        _scope_command("off")
+    ns["scope_off"] = _scope_off
+
+    def _scope_status():
+        """Show the armed state, asset counts, and manifest age."""
+        _scope_command("status")
+    ns["scope_status"] = _scope_status
+
+    def _scope_search(query: str, platform: str = "all", assets: bool = False,
+                      handle: str = "", refresh: bool = False, limit: int = 10,
+                      as_json: bool = False):
+        """Query bug-bounty boards for matching programs.
+
+        Example::
+
+            scope_search("starbucks", assets=True)
+        """
+        flags = [f"--platform={platform}", f"--limit={limit}"]
+        if assets:
+            flags.append("--assets")
+        if handle:
+            flags.append(f"--handle={handle}")
+        if refresh:
+            flags.append("--refresh")
+        if as_json:
+            flags.append("--json")
+        rest = f"search {query} {' '.join(flags)}"
+        _scope_command(rest)
+    ns["scope_search"] = _scope_search
+
+    return ns
+
+
+# ── Ollama-powered inline auto-suggest (ghost text) for IPython ─────────────
+#
+# prompt_toolkit's ``AutoSuggest`` produces the grayed inline "ghost text"
+# you see in VS Code.  IPython ships with ``AutoSuggestFromHistory`` (matches
+# previous inputs) — this subclass queries the local Ollama model instead,
+# so the suggestion knows about framework tool names, signatures, and the
+# ``await`` prefix that async wrappers need.
+#
+# Adaptive backoff design (the concurrency-safe part):
+#
+#   • Short timeout (``OLLAMA_COMPLETION_TIMEOUT_MS``, default 800ms).
+#     If Ollama is busy (secretary agent turn, OWUI chat, embeddings), the
+#     request simply times out → no ghost text this keystroke.  The operator
+#     keeps typing; the next idle moment catches up.
+#   • Circuit breaker: after ``_MAX_CONSECUTIVE_FAILURES`` (3) consecutive
+#     timeouts/errors, the suggester goes quiet for ``_BACKOFF_COOLDOWN_S``
+#     (30s) before trying again.  This prevents log spam and avoids
+#     hammering a busy Ollama with completion requests it can't service.
+#   • Minimum prefix: no request is sent until the current line has at least
+#     ``_MIN_PREFIX`` (3) characters — avoids firing on every keystroke of a
+#     fresh prompt.
+#   • Cache: the last ``(line_prefix → suggestion)`` pair is cached.  If the
+#     user types a character that extends the cached prefix, the cached
+#     suggestion is trimmed and re-used — zero Ollama round-trips.
+#   • Thread-pool dispatch: ``get_suggestion`` runs in a worker thread via
+#     ``get_suggestion_async`` so it never blocks the prompt's event loop.
+#     The sync ``get_suggestion`` uses a short ``threading`` timeout; the
+#     async override (which IPython/prompt_toolkit actually calls) uses
+#     ``asyncio.wait_for``.
+#
+# The model is configurable via ``OLLAMA_COMPLETION_MODEL`` (falls back to
+# ``SECRETARY_MODEL``, then to ``qwen2.5-coder:7b`` as a sane default — a
+# small coder model is fast enough for ghost text and doesn't contend with
+# the secretary's own slots).  Disable entirely with
+# ``OLLAMA_COMPLETION_ENABLED=0``.
+
+import threading as _threading_mod
+
+_COMPLETION_ENABLED = os.getenv("OLLAMA_COMPLETION_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+_COMPLETION_MODEL = (
+    os.getenv("OLLAMA_COMPLETION_MODEL")
+    or os.getenv("SECRETARY_MODEL")
+    or "qwen2.5-coder:7b"
+)
+_COMPLETION_TIMEOUT_MS = int(os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "3000"))
+_COMPLETION_MIN_PREFIX = int(os.getenv("OLLAMA_COMPLETION_MIN_PREFIX", "3"))
+_COMPLETION_MAX_FAILURES = 5
+_COMPLETION_BACKOFF_COOLDOWN_S = 15.0
+
+
+def _ollama_generate_url() -> str:
+    """Derive the Ollama ``/api/generate`` endpoint from ``OLLAMA_BASE_URL``.
+
+    ``OLLAMA_BASE_URL`` is the OpenAI-compatible endpoint (``.../v1``).
+    Ollama's native chat API lives at ``.../api/chat`` (no ``/v1``).
+    """
+    base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+    # Strip /v1 suffix if present
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/") + "/api/chat"
+
+
+# Base class for the suggester — ``AutoSuggest`` if prompt_toolkit is
+# installed, ``object`` otherwise (so the class definition never fails even
+# if prompt_toolkit is missing; ``_make_ollama_suggester`` guards the import).
+try:
+    from prompt_toolkit.auto_suggest import AutoSuggest as _AutoSuggestBase
+except ImportError:
+    _AutoSuggestBase = object  # type: ignore[misc,assignment]
+
+
+class OllamaAutoSuggest(_AutoSuggestBase):
+    """prompt_toolkit ``AutoSuggest`` backed by a local Ollama model.
+    
+    Produces inline ghost-text completions for the IPython prompt.  The
+    suggestion is context-aware: the prompt includes the available tool
+    aliases and their parameter names so the model suggests real tool calls
+    with correct arguments (including ``await`` for async wrappers).
+    
+    Falls back gracefully when Ollama is unreachable or busy — no suggestion
+    is shown, and the circuit breaker prevents retry storms.
+    """
+
+    def __init__(self, tool_aliases: List[str], timeout_ms: int = _COMPLETION_TIMEOUT_MS):
+        from prompt_toolkit.auto_suggest import Suggestion
+        
+        self._Suggestion = Suggestion
+        self._tool_aliases = sorted(tool_aliases)
+        self._timeout_s = timeout_ms / 1000.0
+        self._url = _ollama_generate_url()
+        self._model = _COMPLETION_MODEL
+        
+        # Circuit breaker state
+        self._failures = 0
+        self._cooldown_until = 0.0
+        self._lock = _threading_mod.Lock()
+        
+        # Cold-start state: the first request to Ollama may take 5-10s while
+        # the model loads into VRAM. Don't count that as a failure — give it
+        # a longer timeout on the first call, and don't let early timeouts
+        # open the circuit breaker.
+        self._first_call = True
+        self._cold_start_timeout_s = max(self._timeout_s * 3, 10.0)
+        
+        # Last-suggestion cache: (prefix, suggestion_text)
+        self._cached_prefix: str = ""
+        self._cached_suggestion: str = ""
+
+        # Build a compact system prompt listing available tools
+        # (kept under ~2000 chars to avoid bloating every completion request)
+        tools_list = ", ".join(self._tool_aliases[:80])
+        self._system = (
+            "You are a code completion engine. OUTPUT RULES: output ONLY raw "
+            "Python code that continues the user's line. No explanations, no "
+            "markdown, no backticks, no comments, no prose. If the user typed "
+            "'await nmap(' you output 'target=...'. If you cannot complete the "
+            "code, output nothing. Available async tool callables (prefix with "
+            "await): " + tools_list + ". Sync functions: scope_on, scope_off, "
+            "scope_status, scope_search, sessions."
+        )
+
+    def _should_attempt(self) -> bool:
+        """Circuit breaker: are we allowed to try?"""
+        if not _COMPLETION_ENABLED:
+            return False
+        with self._lock:
+            if self._failures >= _COMPLETION_MAX_FAILURES:
+                if time.monotonic() < self._cooldown_until:
+                    return False
+                # Cooldown expired — reset and try again
+                self._failures = 0
+                self._cooldown_until = 0.0
+            return True
+
+    def _record_success(self):
+        with self._lock:
+            self._failures = 0
+
+    def _record_failure(self):
+        with self._lock:
+            self._failures += 1
+            if self._failures >= _COMPLETION_MAX_FAILURES:
+                self._cooldown_until = time.monotonic() + _COMPLETION_BACKOFF_COOLDOWN_S
+
+    def _query_ollama(self, current_line: str) -> Optional[str]:
+        """Send a completion request to Ollama.  Returns the completion text
+        (what follows the cursor) or ``None`` on any failure/timeout.
+        
+        This is a *synchronous* HTTP call — it's always invoked from a worker
+        thread (via ``get_suggestion_async``) so it never blocks the prompt
+        event loop.
+        """
+        import urllib.request
+        import urllib.error
+
+        # Use the chat endpoint with a primed assistant turn — this is far
+        # more reliable than the raw generate endpoint for chat-tuned models
+        # (qwen2.5-coder, etc.) which otherwise wrap output in markdown fences
+        # or produce conversational preambles. The assistant priming message
+        # ("```python\n") makes the model continue inside a code block; we
+        # strip the fence markers from the response.
+        payload = json.dumps({
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": self._system},
+                {"role": "user", "content": current_line},
+                {"role": "assistant", "content": "```python\n"},
+            ],
+            "stream": False,
+            "options": {
+                "num_predict": 40,       # short completion, not a paragraph
+                "temperature": 0.2,      # deterministic-ish
+                "stop": ["\n\n", "\nimport ", "\nfrom ", "\nclass ", "\ndef ", "```"],
+            },
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            self._url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            # Socket timeout must be >= the async wrapper's timeout so the
+            # async timeout fires first (cleaner circuit-breaker accounting).
+            # Use the cold-start timeout on the first call to allow model
+            # loading; subsequent calls use the normal timeout.
+            sock_timeout = (self._cold_start_timeout_s if self._first_call else self._timeout_s) + 2
+            with urllib.request.urlopen(req, timeout=sock_timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as e:
+            self._record_failure()
+            return None
+
+        # Chat endpoint: {"message": {"content": "..."}}.
+        # The assistant was primed with "```python\n" so the model continues
+        # inside a code block. Strip any fence markers and take the content.
+        msg = body.get("message") or {}
+        raw = (msg.get("content") or "").strip()
+        if not raw:
+            self._record_failure()
+            return None
+
+        # Strip markdown code fences if present (the priming already opened
+        # one, but the model might re-emit it in some contexts)
+        if raw.startswith("```"):
+            # Remove opening fence line
+            lines = raw.split("\n")
+            if lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            # Remove closing fence if present
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        if not raw:
+            self._record_failure()
+            return None
+
+        self._record_success()
+        return raw
+
+    def _trim_to_line(self, completion: str, document, typed_prefix: str = "") -> str:
+        """Trim the completion to the first line and strip any echoed prefix.
+        
+        Chat-tuned models often regenerate the entire line (e.g. ``await
+        nmap(target=...)``) even though the user already typed ``await nmap(``.
+        Ghost text should show only what comes *after* the cursor, so we
+        strip the typed prefix from the beginning of the completion.
+        """
+        # Only the first line is useful for ghost text
+        completion = completion.split("\n")[0]
+        # Strip trailing whitespace
+        completion = completion.rstrip()
+        if not completion:
+            return ""
+        # Strip the typed prefix if the model echoed it back
+        if typed_prefix and completion.startswith(typed_prefix):
+            completion = completion[len(typed_prefix):]
+        # Also strip text after the cursor if the completion overlaps it
+        text_after_cursor = document.text_after_cursor.split("\n")[0]
+        if text_after_cursor and completion.startswith(text_after_cursor):
+            completion = completion[len(text_after_cursor):]
+        return completion
+
+    def get_suggestion(self, buffer, document):
+        """Synchronous path — not used by IPython (it calls the async override),
+        but required by the ``AutoSuggest`` ABC.
+        """
+        if not self._should_attempt():
+            return None
+
+        line = document.text_before_cursor.split("\n")[-1]
+        if len(line) < _COMPLETION_MIN_PREFIX:
+            return None
+
+        # Cache hit: the current line extends the cached prefix
+        if self._cached_suggestion and line.startswith(self._cached_prefix) and len(line) > len(self._cached_prefix):
+            remaining = line[len(self._cached_prefix):]
+            if self._cached_suggestion.startswith(remaining):
+                trimmed = self._cached_suggestion[len(remaining):]
+                if trimmed:
+                    return self._Suggestion(trimmed)
+
+        result = self._query_ollama(line)
+        if result is None:
+            return None
+
+        trimmed = self._trim_to_line(result, document, typed_prefix=line)
+        if not trimmed:
+            return None
+
+        # Cache for next keystroke
+        self._cached_prefix = line
+        self._cached_suggestion = trimmed
+
+        return self._Suggestion(trimmed)
+
+    async def get_suggestion_async(self, buff, document):
+        """Asynchronous path — this is what prompt_toolkit/IPython calls.
+        
+        Runs the synchronous Ollama query in a worker thread with a hard
+        wall-clock timeout.  If the timeout fires (Ollama is busy), returns
+        ``None`` (no ghost text) and records a failure for the circuit breaker.
+        """
+        line = document.text_before_cursor.split("\n")[-1]
+
+        if not self._should_attempt():
+            return None
+
+        if len(line) < _COMPLETION_MIN_PREFIX:
+            return None
+
+        # Cache hit
+        if self._cached_suggestion and line.startswith(self._cached_prefix) and len(line) > len(self._cached_prefix):
+            remaining = line[len(self._cached_prefix):]
+            if self._cached_suggestion.startswith(remaining):
+                trimmed = self._cached_suggestion[len(remaining):]
+                if trimmed:
+                    return self._Suggestion(trimmed)
+
+        # Use a longer timeout on the first call to allow cold model loading
+        # (qwen2.5-coder:14b takes 5-6s to load into VRAM on first request).
+        # After the first successful response, switch to the normal timeout.
+        current_timeout = self._cold_start_timeout_s if self._first_call else self._timeout_s
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._query_ollama, line),
+                timeout=current_timeout,
+            )
+            self._first_call = False
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # Don't count cold-start timeouts as failures — the model is just
+            # loading. Only count failures after the first successful response.
+            if not self._first_call:
+                self._record_failure()
+            return None
+        except Exception as _exc:
+            if not self._first_call:
+                self._record_failure()
+            return None
+
+        if result is None:
+            return None
+
+        trimmed = self._trim_to_line(result, document, typed_prefix=line)
+        if not trimmed:
+            return None
+
+        self._cached_prefix = line
+        self._cached_suggestion = trimmed
+
+        return self._Suggestion(trimmed)
+
+
+def _make_ollama_suggester(tool_aliases: List[str]):
+    """Build an ``OllamaAutoSuggest`` if enabled, else ``None``.
+    
+    Returns ``None`` when completions are disabled (``OLLAMA_COMPLETION_ENABLED=0``)
+    or when prompt_toolkit is not installed — IPython falls back to its
+    built-in history suggester.
+    """
+    if not _COMPLETION_ENABLED:
+        return None
+    try:
+        return OllamaAutoSuggest(tool_aliases)
+    except ImportError:
+        return None
 
 
 # ── Argument parsing: --flag value, using manifest schema for coercion ──────
@@ -601,7 +1378,9 @@ Tool REPL commands:
   sweep [--safe|--force] Run all tools with safe defaults
   safe-args [tool_id]    Show safe-sweep args for a tool (or all)
   reindex                Re-discover tools
-  ipython                Drop into IPython with tools preloaded (Jedi completions)
+  ipython                Drop into IPython with tools as named async callables
+                         (Tab-completion on tool names + params, tool? introspection,
+                         cell-based chaining).  await nmap(target=...), await ffuf(...), etc.
   scope on <handle> [--platform h1|bugcrowd|intigriti] [--no-strict] [--ip-boundary]
                          Arm the packet-scope gate (send_packet refuses
                          out-of-scope destinations; operator-only, not exposed
@@ -1035,26 +1814,31 @@ async def repl_loop(manifests: List[ToolManifest]):
         elif cmd == "ipython":
             try:
                 from IPython import embed
+                from IPython.terminal.embed import InteractiveShellEmbed
 
-                async def quick_run(tool_id: str, **kwargs):
-                    """Convenience wrapper: await quick_run("aux.nmap.run_nmap", target="127.0.0.1")"""
-                    return await run_tool(tool_id, kwargs, manifests)
+                user_ns = build_ipython_namespace(manifests)
 
-                user_ns = {
-                    "manifests": manifests,
-                    "registry": _make_executor(),
-                    "run_tool": run_tool,
-                    "quick_run": quick_run,
-                    "discover_tools": discover_tools,
-                    "resolve_callable": resolve_callable,
-                    "ToolManifest": ToolManifest,
-                    "ToolRegistry": ToolRegistry,
-                }
-                print("  Dropping into IPython (Jedi completions + rich display).")
-                print("  Available: manifests, registry, run_tool, quick_run,")
-                print("             discover_tools, resolve_callable, ToolManifest, ToolRegistry")
-                print("  quick_run:  await quick_run(id, target=x, port=y)")
-                print("  run_tool:   await run_tool(id, args_dict, manifests)")
+                tool_count = sum(1 for v in user_ns.values()
+                                 if callable(v) and hasattr(v, "__manifest__"))
+                print(f"  Dropping into IPython — {tool_count} tools as top-level callables.")
+                print("  Tab-completes tool names + parameter keywords.")
+                print("  tool?  → manifest + params    tool??  → source")
+                print()
+                print("  await nmap(target='10.0.0.1', options='-Pn -p 22,80')")
+                print("  await ffuf(url='http://10.0.0.1', wordlist='...')")
+                print("  await smb_recon(host='10.0.0.1')")
+                print()
+                print("  Operator functions:")
+                print("    scope_on(handle, platform='h1')   scope_off()   scope_status()")
+                print("    scope_search('kw', assets=True)   sessions()")
+                print()
+                print("  Also: tools  (dict of all wrappers),  manifests  (list),")
+                print("        manifest_by_id('full.tool.id'),  run_tool,  resolve_callable")
+                if _COMPLETION_ENABLED:
+                    print(f"  Ghost text: Ollama auto-suggest (model={_COMPLETION_MODEL}, "
+                          f"timeout={_COMPLETION_TIMEOUT_MS}ms, backoff after "
+                          f"{_COMPLETION_MAX_FAILURES} failures)")
+                    print("    Set OLLAMA_COMPLETION_ENABLED=0 to disable.")
                 print("  Ctrl+D / exit() to return.\n")
 
                 # IPython.embed() → prompt_toolkit → asyncio.run() crashes with
@@ -1062,8 +1846,60 @@ async def repl_loop(manifests: List[ToolManifest]):
                 # asyncio.run(repl_loop(...)).  Run embed() in a separate thread
                 # so it gets a clean event-loop context.  asyncio.to_thread()
                 # blocks this coroutine until the user exits IPython.
+                #
+                # We use InteractiveShellEmbed directly (instead of the bare
+                # ``embed()`` convenience) so we can explicitly enable
+                # ``%autoawait asyncio`` before the interactive loop starts.
+                # Without this, ``await nmap(...)`` at the top level can fail
+                # with "SyntaxError: await outside function" — embed() in a
+                # separate thread doesn't always inherit the default autoawait
+                # policy, depending on IPython version.
+                #
+                # We also inject an ``OllamaAutoSuggest`` (ghost-text inline
+                # completions) onto the shell after it initializes its
+                # prompt_toolkit app — the ``pt_app`` attribute holds the
+                # ``PromptSession``, and setting ``auto_suggest`` there wires
+                # our suggester into the prompt's rendering loop.
+                tool_alias_names = sorted(
+                    k for k, v in user_ns.items()
+                    if callable(v) and hasattr(v, "__manifest__")
+                )
+                suggester = _make_ollama_suggester(tool_alias_names)
+
                 def _embed():
-                    embed(user_ns=user_ns, header="")
+                    shell = InteractiveShellEmbed(user_ns=user_ns, header="")
+                    # Force asyncio autoawait so ``await tool(...)`` works at
+                    # the top level.  IPython rewrites the cell into an async
+                    # function and runs it on its own event loop (created in
+                    # this thread, which has no running loop — exactly what we
+                    # need since the main loop is in the other thread).
+                    shell.loop_manager = "asyncio"
+                    shell.enable_gui("asyncio")
+                    # Inject the Ollama ghost-text suggester.
+                    #
+                    # IPython's ``_extra_prompt_options()`` builds the kwargs
+                    # dict passed to ``pt_app.prompt()``.  Critically, it does
+                    # NOT include ``auto_suggest`` — prompt_toolkit's
+                    # ``PromptSession.prompt()`` only activates auto-suggest
+                    # when the ``auto_suggest`` parameter is explicitly passed
+                    # to ``prompt()``, NOT when ``self.auto_suggest`` is set
+                    # on the session.  Setting ``shell.auto_suggest`` or
+                    # ``shell.pt_app.auto_suggest`` alone has no effect.
+                    #
+                    # The fix: wrap ``_extra_prompt_options`` to inject
+                    # ``auto_suggest`` into the returned dict.  This is the
+                    # single point where the suggester flows into the actual
+                    # prompt rendering loop.
+                    if suggester is not None:
+                        shell.auto_suggest = suggester  # type: ignore[assignment]
+                        _orig_opts = shell._extra_prompt_options
+                        _suggester_ref = suggester  # capture for closure
+                        def _opts_with_suggest(*a, **kw):
+                            opts = _orig_opts(*a, **kw)
+                            opts["auto_suggest"] = _suggester_ref
+                            return opts
+                        shell._extra_prompt_options = _opts_with_suggest  # type: ignore[assignment]
+                    shell()
 
                 await asyncio.to_thread(_embed)
             except ImportError:
