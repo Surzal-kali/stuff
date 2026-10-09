@@ -722,6 +722,11 @@ _COMPLETION_TIMEOUT_MS = int(os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "3000"))
 _COMPLETION_MIN_PREFIX = int(os.getenv("OLLAMA_COMPLETION_MIN_PREFIX", "3"))
 _COMPLETION_MAX_FAILURES = 5
 _COMPLETION_BACKOFF_COOLDOWN_S = 15.0
+# Max cold-start timeouts before the circuit breaker opens.  Each cold-start
+# attempt uses the longer timeout (10s+); after this many failures the model
+# isn't loading (wrong name, Ollama down, VRAM exhausted) and we stop
+# retrying to avoid hanging the prompt on every keystroke.
+_COLD_START_MAX_ATTEMPTS = 3
 # Max tool aliases included in the completion system prompt.  190+ tools at
 # ~15 chars each is ~3KB — fine for a 14B model's context window.  Set to 0
 # for no limit.
@@ -779,8 +784,12 @@ class OllamaAutoSuggest(_AutoSuggestBase):
         # Cold-start state: the first request to Ollama may take 5-10s while
         # the model loads into VRAM. Don't count that as a failure — give it
         # a longer timeout on the first call, and don't let early timeouts
-        # open the circuit breaker.
+        # open the circuit breaker.  But if the model never responds within
+        # ``_COLD_START_MAX_ATTEMPTS`` cold-window timeouts, give up and open
+        # the breaker — otherwise every keystroke hangs for 10s retrying a
+        # model that isn't loading (wrong model name, Ollama down, etc.).
         self._first_call = True
+        self._cold_start_attempts = 0
         self._cold_start_timeout_s = max(self._timeout_s * 3, 10.0)
         
         # Last-suggestion cache: (prefix, suggestion_text)
@@ -997,9 +1006,18 @@ class OllamaAutoSuggest(_AutoSuggestBase):
             )
             self._first_call = False
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            # Don't count cold-start timeouts as failures — the model is just
-            # loading. Only count failures after the first successful response.
-            if not self._first_call:
+            if self._first_call:
+                # Cold-start timeout — the model is still loading.  Don't
+                # count as a normal failure, but track attempts so we
+                # eventually give up if the model never responds (wrong name,
+                # Ollama down, VRAM exhausted).  After _COLD_START_MAX_ATTEMPTS
+                # cold timeouts, open the circuit breaker to stop hanging the
+                # prompt on every keystroke.
+                self._cold_start_attempts += 1
+                if self._cold_start_attempts >= _COLD_START_MAX_ATTEMPTS:
+                    self._first_call = False  # cold start is over (failed)
+                    self._record_failure()
+            else:
                 self._record_failure()
             return None
         except Exception as _exc:
