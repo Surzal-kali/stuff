@@ -722,6 +722,10 @@ _COMPLETION_TIMEOUT_MS = int(os.getenv("OLLAMA_COMPLETION_TIMEOUT_MS", "3000"))
 _COMPLETION_MIN_PREFIX = int(os.getenv("OLLAMA_COMPLETION_MIN_PREFIX", "3"))
 _COMPLETION_MAX_FAILURES = 5
 _COMPLETION_BACKOFF_COOLDOWN_S = 15.0
+# Max tool aliases included in the completion system prompt.  190+ tools at
+# ~15 chars each is ~3KB — fine for a 14B model's context window.  Set to 0
+# for no limit.
+_COMPLETION_MAX_TOOLS = int(os.getenv("OLLAMA_COMPLETION_MAX_TOOLS", "250"))
 
 
 def _ollama_generate_url() -> str:
@@ -783,9 +787,13 @@ class OllamaAutoSuggest(_AutoSuggestBase):
         self._cached_prefix: str = ""
         self._cached_suggestion: str = ""
 
-        # Build a compact system prompt listing available tools
-        # (kept under ~2000 chars to avoid bloating every completion request)
-        tools_list = ", ".join(self._tool_aliases[:80])
+        # Build a compact system prompt listing available tools.
+        # _COMPLETION_MAX_TOOLS caps the list size (0 = no limit); 190+ tool
+        # aliases at ~15 chars each is ~3KB, well within context budget.
+        if _COMPLETION_MAX_TOOLS > 0:
+            tools_list = ", ".join(self._tool_aliases[:_COMPLETION_MAX_TOOLS])
+        else:
+            tools_list = ", ".join(self._tool_aliases)
         self._system = (
             "You are a code completion engine. OUTPUT RULES: output ONLY raw "
             "Python code that continues the user's line. No explanations, no "
