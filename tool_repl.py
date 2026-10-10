@@ -733,6 +733,24 @@ _IPYTHON_RPROMPT_ENABLED = os.getenv("IPYTHON_RPROMPT", "1").lower() not in ("0"
 _IPYTHON_TOOLBAR_MAX_VARS = int(os.getenv("IPYTHON_TOOLBAR_MAX_VARS", "6"))
 # Max repr length per variable in the toolbar.
 _IPYTHON_TOOLBAR_REPR_LEN = int(os.getenv("IPYTHON_TOOLBAR_REPR_LEN", "20"))
+# Sanitize newlines/tabs in toolbar previews so the single-line bar doesn't
+# break.  "expand" (default) shows ↵/→· glyphs; "collapse" replaces with
+# spaces; "off" leaves raw (multi-line toolbar, may garble the display).
+_IPYTHON_TOOLBAR_NEWLINES = os.getenv("IPYTHON_TOOLBAR_NEWLINES", "expand").lower()
+
+
+def _sanitize_preview(text: str) -> str:
+    """Replace newlines/tabs in a preview string so the toolbar stays one line.
+
+    - ``expand`` (default): ``\n`` → ``↵``, ``\t`` → ``→·`` — visible but compact.
+    - ``collapse``: replace with single spaces — clean but lossy.
+    - ``off`` / anything else: return unchanged (may break the single-line bar).
+    """
+    if _IPYTHON_TOOLBAR_NEWLINES == "expand":
+        return text.replace("\n", "↵").replace("\t", "→·")
+    if _IPYTHON_TOOLBAR_NEWLINES == "collapse":
+        return text.replace("\n", " ").replace("\t", " ")
+    return text
 # Mouse support: click to position cursor inside the input buffer.
 # Tradeoff: when ON, the terminal's native drag-to-select is captured by
 # the app — hold Shift while dragging to force terminal-native selection
@@ -819,6 +837,7 @@ def _cell_local_vars(cell_text: str, cursor_row: int = -1) -> List[tuple]:
                     preview = rhs[eq_idx + 1:].strip() if eq_idx >= 0 else "?"
                     if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
                         preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                    preview = _sanitize_preview(preview)
                     results.append((target.id, preview))
         elif isinstance(node, _ast.AnnAssign):
             # ``x: int = 42``
@@ -831,6 +850,7 @@ def _cell_local_vars(cell_text: str, cursor_row: int = -1) -> List[tuple]:
                     preview = rhs[eq_idx + 1:].strip() if eq_idx >= 0 else "?"
                     if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
                         preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                    preview = _sanitize_preview(preview)
                     results.append((node.target.id, preview))
         elif isinstance(node, (_ast.AugAssign,)):
             # ``x += 1`` — x must already exist, but we still track it
@@ -876,6 +896,7 @@ def _cell_local_vars_regex(cell_text: str, cursor_row: int = -1) -> List[tuple]:
             preview = m.group(2).strip()
             if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
                 preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+            preview = _sanitize_preview(preview)
             results.append((name, preview))
     return results
 
@@ -947,7 +968,7 @@ def _bottom_toolbar(shell):
                 parts.append(("class:toolbar.cellvars", f" {len(cell_vars)} in-cell "))
                 previews = []
                 for name, preview in cell_vars[:_IPYTHON_TOOLBAR_MAX_VARS]:
-                    previews.append(f"{name}={preview}")
+                    previews.append(f"{name}={_sanitize_preview(preview)}")
                 preview_str = "  ".join(previews)
                 if len(cell_vars) > _IPYTHON_TOOLBAR_MAX_VARS:
                     preview_str += " …"
@@ -969,6 +990,7 @@ def _bottom_toolbar(shell):
                     rv = "<?>"
                 if len(rv) > _IPYTHON_TOOLBAR_REPR_LEN:
                     rv = rv[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                rv = _sanitize_preview(rv)
                 previews.append(f"{name}={rv}")
             preview_str = "  ".join(previews)
             if len(globs) > _IPYTHON_TOOLBAR_MAX_VARS:
@@ -2713,6 +2735,7 @@ async def repl_loop(manifests: List[ToolManifest]):
                 if _IPYTHON_TOOLBAR_ENABLED:
                     print("    Bottom toolbar: cursor L:C, cell overview + in-cell vars, globals, scope/brain")
                     print("      F1 → dump all variables (in-cell uncommitted + committed globals)")
+                    print(f"      Newlines: {_IPYTHON_TOOLBAR_NEWLINES}  (IPYTHON_TOOLBAR_NEWLINES=expand|collapse|off)")
                 if _IPYTHON_RPROMPT_ENABLED:
                     print("    Right prompt: missing required params shown inside tool()")
                 if _IPYTHON_MOUSE_SUPPORT:
