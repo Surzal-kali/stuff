@@ -22,6 +22,10 @@ Every tool is a ghost-text-completing async callable built from its manifest:
 - **`await tool(...)`** returns the `stdout` string from the tool body (most tools return str/JSON-as-str).
 - **`print(f"{_!r}")`** on the value shows the envelope, including `_elapsed_s` and any `degraded` flags.
 - **`tool?`** prints the manifest: full param schema with descriptions. **`tool??`** prints the tool's source.
+- **Syntax highlighting** is ON (Pygments `IPythonPTLexer` + `colors="linux"`). Override with `IPYTHON_COLORS=neutral|lightbg|nocolor|pride|gruvbox-dark`.
+- **Bottom toolbar** shows cursor `L:col`, a compact cell overview (`[first line … (+NL)]`), **in-cell variables** (uncommitted — parsed from the current cell text above your cursor, not yet executed), committed globals count + previews, scope-armed marker, and Brain socket status — re-renders every keystroke. Disable with `IPYTHON_TOOLBAR=0`.
+- **F1** dumps all user variables — both **in-cell** (uncommitted, parsed via `ast`) and **committed globals** — above the prompt with type names and repr/preview values.
+- **Right prompt** shows missing required params when the cursor is inside a `tool(` call — live, right-aligned. Disable with `IPYTHON_RPROMPT=0`.
 - **Bad kwarg names are rejected, not dropped** — `run_tool` goes through `preflight.validate_against_manifest` (unknown-key rejection), so a typo produces an explicit error envelope from a healthy run, not a silent no-op.
 - **`scope off` is implied**: REPL-local runs bypass the agent-facing scope gate by design (`run_tool` calls `execute_tool` directly; operator-only gate lives in `scope on/off` commands). Know what lane you're in before you fire.
 
@@ -231,6 +235,16 @@ print(out)
 `OLLAMA_COMPLETION_ENABLED=0` to kill ghost-text if a local model keeps lagging the prompt.
 
 `OLLAMA_COMPLETION_MODEL` → falls back SECRETARY_MODEL → `qwen2.5-coder:7b`. Circuit breaker: 5 failures → 15s cooldown. Cold-start: first call gets an extended (10s+) timeout, 3 cold failures then the breaker opens (protects wrong model names / VRAM exhaustion).
+
+**FIM (fill-in-the-middle):** the suggester sends both the text **before** and **after** the cursor, separated by a `<CURSOR>` marker. This lets the model see closing brackets/dedent and know what construct it's completing inside (e.g. `]` after a blank line in `payloads = [...]`). If the model echoes the after-cursor text, `_trim_completion` strips it. Knobs: `OLLAMA_COMPLETION_MAX_AFTER_CHARS` (default 500), `OLLAMA_COMPLETION_CURSOR_MARKER` (default `\n<CURSOR>\n`).
+
+**UI env knobs (all default ON):**
+- `IPYTHON_COLORS` — Pygments color scheme: `linux` (default, dark terminal) | `neutral` | `lightbg` | `nocolor` | `pride` | `gruvbox-dark`. Syntax highlighting is always wired (IPythonPTLexer); this controls the style palette.
+- `IPYTHON_TOOLBAR=0` — disable the bottom status bar (cursor position, live globals, scope/brain status).
+- `IPYTHON_RPROMPT=0` — disable the right-aligned param hints inside tool calls.
+- `IPYTHON_TOOLBAR_MAX_VARS=6` — max variable previews shown in the toolbar compact line.
+- `IPYTHON_TOOLBAR_REPR_LEN=20` — max repr length per variable in the toolbar.
+- `IPYTHON_MOUSE=0` — disable click-to-position-cursor (mouse capture off; terminal-native drag-to-select works without Shift). Default ON: click to move cursor, **Shift+drag** to select text.
 
 ### 9.4 The full alias table
 
@@ -583,6 +597,7 @@ IPython (the `ipython` prompt inside `tool_repl.py`) uses GNU readline under the
 | **★** `Ctrl-L` | clear screen (does not clear history) |
 | `Ctrl-D` | delete char under cursor; on empty line = EOF / exit |
 | `Ctrl-H` / `Backspace` | delete char before cursor |
+| **★** `F1` | dump all user variables (globals from above the current cell) above the prompt |
 
 ## B.2 History & recall
 

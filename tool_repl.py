@@ -702,6 +702,493 @@ def build_ipython_namespace(
     return ns
 
 
+# ── IPython bottom toolbar + globals overlay + rprompt ───────────────────────
+#
+# These are pure prompt_toolkit decorations layered on top of IPython's
+# existing ``pt_app`` (a ``PromptSession``).  No Jupyter, no kernel — just
+# ``FormattedText`` callables and a ``KeyBindings`` entry.
+#
+#   • ``_bottom_toolbar(shell)`` — re-renders every keystroke; shows cursor
+#     line:col, count of user-assigned globals, scope-armed marker, and the
+#     word under cursor if it matches a tool alias (so you see the tool's
+#     manifest snippet while typing its name).
+#   • ``_rprompt(shell)`` — right-aligned next to the input line; when the
+#     cursor is inside ``alias(``, shows the remaining **required** params
+#     with their types — the same info as ``tool?`` but live and contextual.
+#   • F1 keybinding — prints a formatted dump of all user globals (the
+#     variables set above the current cell) above the active prompt.
+#   • Syntax highlighting — IPython's ``IPythonPTLexer`` (Pygments
+#     ``PythonLexer``) is already wired into ``pt_app``; the only reason
+#     colours are off is ``InteractiveShellEmbed`` defaults to
+#     ``colors="nocolor"``.  Passing ``colors="linux"`` flips the Pygments
+#     style on.
+
+import builtins as _builtins
+
+# Env knobs for the toolbar / globals display.
+_IPYTHON_COLORS = os.getenv("IPYTHON_COLORS", "linux")  # linux|neutral|lightbg|nocolor|pride|gruvbox-dark
+_IPYTHON_TOOLBAR_ENABLED = os.getenv("IPYTHON_TOOLBAR", "1").lower() not in ("0", "false", "no", "off")
+_IPYTHON_RPROMPT_ENABLED = os.getenv("IPYTHON_RPROMPT", "1").lower() not in ("0", "false", "no", "off")
+# Max globals shown in the toolbar's compact line (F1 shows all).
+_IPYTHON_TOOLBAR_MAX_VARS = int(os.getenv("IPYTHON_TOOLBAR_MAX_VARS", "6"))
+# Max repr length per variable in the toolbar.
+_IPYTHON_TOOLBAR_REPR_LEN = int(os.getenv("IPYTHON_TOOLBAR_REPR_LEN", "20"))
+# Mouse support: click to position cursor inside the input buffer.
+# Tradeoff: when ON, the terminal's native drag-to-select is captured by
+# the app — hold Shift while dragging to force terminal-native selection
+# (works in GNOME Terminal, iTerm2, Windows Terminal, Konsole, etc.).
+_IPYTHON_MOUSE_SUPPORT = os.getenv("IPYTHON_MOUSE", "1").lower() not in ("0", "false", "no", "off")
+
+
+def _user_globals(shell) -> List[tuple]:
+    """Return ``[(name, value), ...]`` for user-assigned globals in the shell.
+
+    Filters out dunder names, callables (tool wrappers, functions), classes,
+    modules, and IPython internals (``__name__``, ``In``, ``Out``, etc.).
+    Sorted by insertion order approximation (Python 3.7+ dicts preserve it;
+    ``user_ns`` is a regular dict).
+    """
+    ns = shell.user_ns
+    _skip = {"__builtin__", "__builtins__", "_", "__", "___", "_dh",
+             "_ih", "_oh", "_sh", "In", "Out", "exit", "quit",
+              "get_ipython", "user_ns", "tools", "manifests", "registry"}
+    result = []
+    for k, v in ns.items():
+        if k.startswith("_") or k in _skip:
+            continue
+        if callable(v) and not hasattr(v, "__manifest__"):
+            continue
+        import types as _types_mod
+        if isinstance(v, type) or isinstance(v, _types_mod.ModuleType):
+            continue
+        # Skip the tool-wrapper callables (they carry __manifest__)
+        if hasattr(v, "__manifest__"):
+            continue
+        result.append((k, v))
+    return result
+
+
+def _cell_local_vars(cell_text: str, cursor_row: int = -1) -> List[tuple]:
+    """Extract variable names assigned in the current (unexecuted) cell text.
+
+    Uses ``ast`` to walk assignment targets — ``ast.parse`` is safe on
+    incomplete code because we append a dummy line so the parser sees a
+    complete module.  Returns ``[(name, preview_str), ...]`` sorted by
+    line number, where ``preview_str`` is a best-effort literal preview
+    (the RHS source text truncated, since we can't eval unexecuted code).
+
+    Only names assigned **before** ``cursor_row`` (if given) are returned —
+    you don't want completions for variables defined below your cursor.
+    """
+    import ast as _ast
+
+    # Pad with a newline so an incomplete last line doesn't break the parser
+    text = cell_text
+    if not text.endswith("\n"):
+        text += "\n"
+
+    try:
+        tree = _ast.parse(text)
+    except SyntaxError:
+        # Try wrapping in a try block — handles bare ``await`` at top level
+        # which is only valid inside async def.  IPython rewrites it, but ast
+        # doesn't.  Fallback: regex for ``name =`` patterns.
+        return _cell_local_vars_regex(cell_text, cursor_row)
+
+    results = []
+    for node in _ast.iter_child_nodes(tree):
+        if isinstance(node, _ast.Assign):
+            # ``x = 42`` → targets are Names
+            for target in node.targets:
+                if isinstance(target, _ast.Name):
+                    if cursor_row >= 0 and node.lineno > cursor_row + 1:
+                        continue
+                    rhs = _ast.get_source_segment(text, node) or ""
+                    # Strip the ``name = `` prefix for the preview
+                    eq_idx = rhs.find("=")
+                    preview = rhs[eq_idx + 1:].strip() if eq_idx >= 0 else "?"
+                    if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
+                        preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                    results.append((target.id, preview))
+        elif isinstance(node, _ast.AnnAssign):
+            # ``x: int = 42``
+            if isinstance(node.target, _ast.Name):
+                if cursor_row >= 0 and node.lineno > cursor_row + 1:
+                    continue
+                if node.value is not None:
+                    rhs = _ast.get_source_segment(text, node) or ""
+                    eq_idx = rhs.find("=")
+                    preview = rhs[eq_idx + 1:].strip() if eq_idx >= 0 else "?"
+                    if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
+                        preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                    results.append((node.target.id, preview))
+        elif isinstance(node, (_ast.AugAssign,)):
+            # ``x += 1`` — x must already exist, but we still track it
+            if isinstance(node.target, _ast.Name):
+                if cursor_row >= 0 and node.lineno > cursor_row + 1:
+                    continue
+                results.append((node.target.id, "<aug>"))
+        # ``with ... as x:`` and ``for x in ...:`` targets
+        elif isinstance(node, _ast.With):
+            for item in node.items:
+                if item.optional_vars and isinstance(item.optional_vars, _ast.Name):
+                    if cursor_row >= 0 and node.lineno > cursor_row + 1:
+                        continue
+                    results.append((item.optional_vars.id, "<with>"))
+        elif isinstance(node, _ast.For):
+            if isinstance(node.target, _ast.Name):
+                if cursor_row >= 0 and node.lineno > cursor_row + 1:
+                    continue
+                results.append((node.target.id, "<loop>"))
+
+    return results
+
+
+def _cell_local_vars_regex(cell_text: str, cursor_row: int = -1) -> List[tuple]:
+    """Fallback regex-based extraction when ``ast.parse`` fails.
+
+    Catches ``name = ...`` and ``name: type = ...`` patterns.  Less accurate
+    than AST (misses unpacking, ignores indentation context) but handles
+    incomplete code with bare ``await`` that ast.parse rejects.
+    """
+    import re as _re
+
+    results = []
+    lines = cell_text.split("\n")
+    for i, line in enumerate(lines):
+        if cursor_row >= 0 and i > cursor_row:
+            break
+        # ``name = value`` or ``name: type = value`` — top-level (no leading
+        # whitespace) or indented inside a block we don't track.
+        m = _re.match(r"^(\w+)\s*(?::\s*\S+)?\s*=\s*(.+)", line)
+        if m:
+            name = m.group(1)
+            preview = m.group(2).strip()
+            if len(preview) > _IPYTHON_TOOLBAR_REPR_LEN:
+                preview = preview[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+            results.append((name, preview))
+    return results
+
+
+def _cell_overview(cell_text: str, max_lines: int = 3) -> str:
+    """Compact one-line overview of the current cell.
+
+    Shows the first non-empty line (truncated) and the total line count.
+    If the cell is multi-line, includes a ``… (+N lines)`` suffix.
+    """
+    lines = cell_text.split("\n")
+    # Find the first non-empty, non-comment line
+    first = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            first = stripped
+            break
+    if not first:
+        first = lines[0].strip() if lines else ""
+    if len(first) > 40:
+        first = first[:37] + "…"
+    total = len(lines)
+    if total > 1:
+        return f"{first} … (+{total - 1}L)"
+    return first
+
+
+def _bottom_toolbar(shell):
+    """Bottom status bar: cursor position + cell-local vars + globals + status.
+
+    Returns ``FormattedText`` (list of ``(style, text)`` tuples) that
+    prompt_toolkit re-renders on every keystroke via ``bottom_toolbar``.
+
+    The toolbar shows **two tiers** of variables:
+      1. **Cell-local** (uncommitted) — names assigned in the current cell
+         text above the cursor, parsed via ``ast``.  These aren't in
+         ``user_ns`` yet (the cell hasn't executed) but they're what you're
+         actively working with.  Rendered in a distinct colour.
+      2. **Globals** (committed) — variables in ``user_ns`` from previously
+         executed cells.  The existing behaviour.
+    """
+    from prompt_toolkit.formatted_text import FormattedText
+
+    parts = []
+    cell_text = ""
+    cursor_row = -1
+
+    # ── Cursor position + cell overview ────────────────────────────────
+    try:
+        buf = shell.pt_app.app.current_buffer
+        doc = buf.document
+        row = doc.cursor_position_row + 1
+        col = doc.cursor_position_col + 1
+        cell_text = buf.text
+        cursor_row = doc.cursor_position_row
+        parts.append(("class:toolbar.cursor", f" L{row}:C{col} "))
+        if cell_text.strip():
+            overview = _cell_overview(cell_text)
+            parts.append(("class:toolbar.cell", f" [{overview}] "))
+    except Exception:
+        parts.append(("", " L-:C- "))
+
+    # ── Cell-local (uncommitted) variables ─────────────────────────────
+    if cell_text.strip():
+        try:
+            cell_vars = _cell_local_vars(cell_text, cursor_row)
+            if cell_vars:
+                parts.append(("class:toolbar.cellvars", f" {len(cell_vars)} in-cell "))
+                previews = []
+                for name, preview in cell_vars[:_IPYTHON_TOOLBAR_MAX_VARS]:
+                    previews.append(f"{name}={preview}")
+                preview_str = "  ".join(previews)
+                if len(cell_vars) > _IPYTHON_TOOLBAR_MAX_VARS:
+                    preview_str += " …"
+                parts.append(("class:toolbar.cellpreview", f" {preview_str} "))
+        except Exception:
+            pass
+
+    # ── Committed globals count + compact preview ──────────────────────
+    try:
+        globs = _user_globals(shell)
+        parts.append(("class:toolbar.vars", f" {len(globs)} globals "))
+        if globs:
+            recent = globs[-_IPYTHON_TOOLBAR_MAX_VARS:]
+            previews = []
+            for name, val in recent:
+                try:
+                    rv = repr(val)
+                except Exception:
+                    rv = "<?>"
+                if len(rv) > _IPYTHON_TOOLBAR_REPR_LEN:
+                    rv = rv[:_IPYTHON_TOOLBAR_REPR_LEN] + "~"
+                previews.append(f"{name}={rv}")
+            preview_str = "  ".join(previews)
+            if len(globs) > _IPYTHON_TOOLBAR_MAX_VARS:
+                preview_str += " …"
+            parts.append(("class:toolbar.preview", f" {preview_str} "))
+    except Exception:
+        pass
+
+    # ── Scope-armed marker ─────────────────────────────────────────────
+    try:
+        from utils.scope_gate import is_armed as _is_armed
+        if _is_armed():
+            parts.append(("class:toolbar.scope", " [SCOPE ARMED] "))
+    except Exception:
+        pass
+
+    # ── Brain socket status ────────────────────────────────────────────
+    try:
+        sock = Path("/tmp/brain.sock")
+        if sock.exists():
+            parts.append(("class:toolbar.brain", " brain:✓ "))
+        else:
+            parts.append(("class:toolbar.brain.down", " brain:✗ "))
+    except Exception:
+        pass
+
+    return FormattedText(parts)
+
+
+def _rprompt(shell):
+    """Right-prompt: show remaining required params when inside a tool call.
+
+    Detects ``alias(`` in the text before the cursor and, if the alias is a
+    known tool wrapper, renders the **required** params that haven't been
+    supplied yet — live, right-aligned on the input line.
+    """
+    from prompt_toolkit.formatted_text import FormattedText
+
+    try:
+        buf = shell.pt_app.app.current_buffer
+        text = buf.document.text_before_cursor
+    except Exception:
+        return FormattedText([])
+
+    # Find the last unclosed ``(`` — are we inside a call?
+    paren_depth = 0
+    open_paren_idx = -1
+    for i, ch in enumerate(text):
+        if ch == "(":
+            paren_depth += 1
+            open_paren_idx = i
+        elif ch == ")":
+            paren_depth -= 1
+    if paren_depth <= 0 or open_paren_idx < 0:
+        return FormattedText([])
+
+    # Extract the word immediately before the ``(`` (the function/alias name)
+    before_paren = text[:open_paren_idx]
+    # Strip trailing whitespace
+    stripped = before_paren.rstrip()
+    if not stripped:
+        return FormattedText([])
+    # Walk backwards to the first non-identifier char
+    end = len(stripped)
+    start = end
+    while start > 0 and (stripped[start - 1].isalnum() or stripped[start - 1] == "_"):
+        start -= 1
+    alias = stripped[start:end]
+    if not alias:
+        return FormattedText([])
+
+    # Strip a leading ``await`` — the alias is the word after it
+    if alias == "await":
+        remainder = stripped[:start].rstrip()
+        end2 = len(remainder)
+        start2 = end2
+        while start2 > 0 and (remainder[start2 - 1].isalnum() or remainder[start2 - 1] == "_"):
+            start2 -= 1
+        alias = remainder[start2:end2]
+
+    if not alias:
+        return FormattedText([])
+
+    # Look up the tool wrapper in user_ns
+    wrapper = shell.user_ns.get(alias)
+    if wrapper is None or not hasattr(wrapper, "__manifest__"):
+        return FormattedText([])
+
+    manifest = wrapper.__manifest__
+    if not manifest.parameters:
+        return FormattedText([])
+
+    props = manifest.parameters.get("properties", {})
+    required = set(manifest.parameters.get("required", []))
+    if not required:
+        return FormattedText([])
+
+    # Which required params have already been supplied?
+    args_section = text[open_paren_idx + 1:]
+    supplied = set()
+    for pname in props:
+        if f"{pname}=" in args_section or f"{pname} =" in args_section:
+            supplied.add(pname)
+
+    missing = [p for p in required if p not in supplied]
+    if not missing:
+        return FormattedText([("class:rprompt.done", " ✓ all required ")])
+
+    # Build the hint: ``target: str, options: str``
+    pieces = []
+    for pname in missing:
+        pdef = props.get(pname, {})
+        ptype = pdef.get("type", "str") if isinstance(pdef, dict) else "str"
+        pieces.append(f"{pname}: {ptype}")
+    hint = "  ".join(pieces)
+    if len(hint) > 60:
+        hint = hint[:57] + "…"
+
+    return FormattedText([
+        ("class:rprompt.missing", "missing: "),
+        ("class:rprompt.params", hint),
+    ])
+
+
+def _install_toolbar_and_keybindings(shell) -> None:
+    """Wire the bottom toolbar, rprompt, and F1 globals overlay into ``shell.pt_app``.
+
+    Called after ``init_prompt_toolkit_cli()`` has created ``pt_app`` (i.e.
+    inside ``_embed()``, after the shell is constructed but before the
+    interactive loop starts).
+    """
+    from prompt_toolkit.key_binding import KeyBindings
+
+    pt_app = shell.pt_app
+    if pt_app is None:
+        return
+
+    # ── Bottom toolbar ─────────────────────────────────────────────────
+    if _IPYTHON_TOOLBAR_ENABLED:
+        pt_app.bottom_toolbar = lambda: _bottom_toolbar(shell)
+
+    # ── Right prompt (param hints) ─────────────────────────────────────
+    if _IPYTHON_RPROMPT_ENABLED:
+        pt_app.rprompt = lambda: _rprompt(shell)
+
+    # ── Mouse support: click to position cursor ───────────────────────
+    # IPython defaults to mouse_support=False (terminal handles mouse
+    # natively → drag-to-select works but click doesn't move the cursor).
+    # Setting True enables click-to-position, but captures mouse events so
+    # native drag-to-select needs Shift+drag (standard in most terminals).
+    if _IPYTHON_MOUSE_SUPPORT:
+        pt_app.mouse_support = True
+
+    # ── F1: dump all user globals above the prompt ─────────────────────
+    kb = KeyBindings()
+
+    @kb.add("f1")
+    def _dump_globals(event):
+        """Print all user variables — both cell-local (uncommitted) and globals."""
+        # ── Cell-local (uncommitted) variables ─────────────────────────
+        try:
+            buf = shell.pt_app.app.current_buffer
+            cell_text = buf.text
+            cursor_row = buf.document.cursor_position_row
+            cell_vars = _cell_local_vars(cell_text, cursor_row)
+        except Exception:
+            cell_vars = []
+
+        if cell_vars:
+            print(f"  ── {len(cell_vars)} in-cell variable(s) (uncommitted) ──")
+            for name, preview in cell_vars:
+                print(f"  {name:25s} := {preview}")
+            print()
+
+        # ── Committed globals ──────────────────────────────────────────
+        globs = _user_globals(shell)
+        if not globs and not cell_vars:
+            print("  (no user variables yet)")
+            return
+        if globs:
+            print(f"  ── {len(globs)} global variable(s) (committed) ──")
+            for name, val in globs:
+                try:
+                    rv = repr(val)
+                except Exception:
+                    rv = "<?>"
+                # Truncate long reprs but show enough to be useful
+                if len(rv) > 80:
+                    rv = rv[:77] + "…"
+                # Show the type name for non-trivial values
+                tn = type(val).__name__
+                print(f"  {name:25s} {tn:6s} = {rv}")
+        print()
+
+    # Merge our keybindings with IPython's existing set.
+    # ``merge_key_bindings`` produces a ``_MergedKeyBindings`` that checks
+    # both registries — the original bindings (Ctrl+L, Ctrl+R, Tab, etc.)
+    # stay live, and F1 is added alongside them.
+    from prompt_toolkit.key_binding import merge_key_bindings as _merge_kb
+    existing_kb = pt_app.key_bindings
+    if existing_kb is not None:
+        pt_app.key_bindings = _merge_kb([existing_kb, kb])
+    else:
+        pt_app.key_bindings = kb
+
+
+def _ipython_toolbar_styles() -> Dict[str, str]:
+    """Return Pygments style overrides for the toolbar/rprompt classes.
+
+    Merged into ``shell.highlighting_style_overrides`` so the toolbar's
+    ``class:toolbar.*`` and ``class:rprompt.*`` tokens get colours.
+    """
+    return {
+        # Toolbar — dark background, muted text
+        "toolbar.cursor": "bg:#333333 fg:#66aaff",
+        "toolbar.cell": "bg:#333333 fg:#aa88cc",
+        "toolbar.cellvars": "bg:#333333 fg:#ddaa44",
+        "toolbar.cellpreview": "bg:#333333 fg:#aa7733",
+        "toolbar.vars": "bg:#333333 fg:#66cc66",
+        "toolbar.preview": "bg:#333333 fg:#888888",
+        "toolbar.scope": "bg:#553333 fg:#ff6666 bold",
+        "toolbar.brain": "bg:#333333 fg:#66cc66",
+        "toolbar.brain.down": "bg:#333333 fg:#cc6666",
+        # Right prompt — dim, right-aligned
+        "rprompt.missing": "fg:#cc9933",
+        "rprompt.params": "fg:#66aaff",
+        "rprompt.done": "fg:#66cc66",
+    }
+
+
 # ── Ollama-powered inline auto-suggest (ghost text) for IPython ─────────────
 #
 # prompt_toolkit's ``AutoSuggest`` produces the grayed inline "ghost text"
@@ -767,6 +1254,17 @@ _COMPLETION_KEEP_ALIVE = os.getenv("OLLAMA_COMPLETION_KEEP_ALIVE", "5m")
 # lines + the current line — variables from earlier lines are what let the
 # model suggest code that uses them instead of inventing placeholders).
 _COMPLETION_MAX_CONTEXT_CHARS = int(os.getenv("OLLAMA_COMPLETION_MAX_CONTEXT_CHARS", "4000"))
+# Max chars of text AFTER the cursor sent to the model.  The closing
+# brackets / dedent / following lines tell the model what construct it's
+# inside (e.g. ``]`` after a blank line inside ``payloads = [``).  Without
+# this the model only sees the prefix and doesn't know what to complete to.
+_COMPLETION_MAX_AFTER_CHARS = int(os.getenv("OLLAMA_COMPLETION_MAX_AFTER_CHARS", "500"))
+# Cursor marker inserted between before-cursor and after-cursor text in the
+# FIM (fill-in-the-middle) prompt.  Coder models are trained on this pattern;
+# non-coder models still understand it as "continue here".  The marker must
+# be distinctive enough that the model doesn't echo it back — ``<CURSOR>``
+# is unambiguous and rarely appears in real code.
+_COMPLETION_CURSOR_MARKER = os.getenv("OLLAMA_COMPLETION_CURSOR_MARKER", "\n<CURSOR>\n")
 _COMPLETION_MAX_FAILURES = 5
 _COMPLETION_BACKOFF_COOLDOWN_S = 15.0
 # Debounce: wait this many ms after the last keystroke before firing an
@@ -934,12 +1432,23 @@ def _ollama_query_sync(model: str, system: str, typed_context: str, url: str,
     return raw if raw else None
 
 
-def _trim_completion(completion: str, typed_prefix: str = "") -> str:
+def _trim_completion(completion: str, typed_prefix: str = "",
+                     after_cursor: str = "",
+                     before_cursor: str = "") -> str:
     """Clean a model reply into displayable ghost text.
 
     Multiline-aware: keeps interior lines/indentation (the renderer emits
-    them as ghost lines below the prompt), strips markdown fences, and
-    removes any echo of what the operator already typed.
+    them as ghost lines below the prompt), strips markdown fences, removes
+    any echo of what the operator already typed (the **whole** before-cursor
+    buffer, not just the current line), and strips any echo of the text
+    **after** the cursor (the FIM suffix).
+
+    The model was given ``before_cursor`` + ``<CURSOR>`` + ``after_cursor``.
+    A well-behaved model outputs only the completion (what goes in the
+    cursor's place).  But many models echo part or all of the prefix —
+    especially the current line and the last few lines before the cursor.
+    We strip echoed prefix lines from the **head** of the completion,
+    working backwards line-by-line until we find a line that isn't an echo.
     """
     raw = completion.strip()
     if not raw:
@@ -953,14 +1462,107 @@ def _trim_completion(completion: str, typed_prefix: str = "") -> str:
     completion = "\n".join(lines).rstrip()
     if not completion:
         return ""
-    # Strip the typed prefix if the model echoed it (per-line, so an echoed
-    # first line is removed but interior lines with their own indentation
-    # survive untouched)
+
+    # Strip echoed before-cursor text from the head of the completion.
+    # The model was given the full before_cursor + <CURSOR> + after_cursor.
+    # A well-behaved model outputs only what replaces <CURSOR>.  But many
+    # models echo part or all of the before-cursor text.  We need to find
+    # the longest tail of before_cursor that appears as a head of the
+    # completion and strip it.
+    #
+    # Example: before = "x = 42\nawait nmap("
+    #           reply = "x = 42\nawait nmap(target=x)"
+    # The echoed prefix is "x = 42\nawait nmap(" — the entire before_cursor.
+    # After stripping: "target=x)"
+    #
+    # Example: before = "x = 42\nawait nmap("
+    #           reply = "await nmap(target=x)"
+    # The echoed prefix is "await nmap(" — just the last line.
+    # After stripping: "target=x)"
+    if before_cursor:
+        before_lines = before_cursor.split("\n")
+        c_lines = completion.split("\n")
+        # Find the longest tail of before_cursor that matches a head of the
+        # completion.  The model may echo the full prefix or just the last
+        # few lines.  The LAST matched line (the "boundary") may be a
+        # prefix of the completion line — the model echoed it AND continued
+        # it (e.g. ``await nmap(`` → ``await nmap(target=x)``).  In that
+        # case we strip the echoed part and keep the continuation.  All
+        # earlier matched lines must be exact echoes.
+        best_strip_lines = 0
+        best_partial_keep = ""  # continuation text from the boundary line
+        for start_idx in range(len(before_lines)):
+            candidate = before_lines[start_idx:]
+            if len(candidate) > len(c_lines):
+                continue
+            matched = True
+            partial_keep = None
+            ci = 0  # completion line index (advances separately because
+                    # empty before-lines don't consume a completion line)
+            for j, b_line in enumerate(candidate):
+                b_stripped = b_line.rstrip()
+                if not b_stripped:
+                    # Empty before-line — don't consume a completion line
+                    continue
+                if ci >= len(c_lines):
+                    matched = False
+                    break
+                c_line = c_lines[ci]
+                if j < len(candidate) - 1:
+                    # Non-boundary lines must match exactly
+                    if c_line.rstrip() == b_stripped:
+                        ci += 1
+                        continue
+                    matched = False
+                    break
+                else:
+                    # Boundary (last) line: completion may equal it
+                    # (exact echo) or start with it (echo + continuation).
+                    if c_line.rstrip() == b_stripped:
+                        partial_keep = ""  # exact echo, nothing to keep
+                        ci += 1
+                    elif c_line.startswith(b_stripped):
+                        # Model continued the line — keep the continuation
+                        partial_keep = c_line[len(b_stripped):]
+                        ci += 1
+                    else:
+                        matched = False
+                    break
+            if matched and ci > best_strip_lines:
+                best_strip_lines = ci
+                best_partial_keep = partial_keep or ""
+
+        if best_strip_lines > 0:
+            remaining = c_lines[best_strip_lines:]
+            if best_partial_keep:
+                remaining = [best_partial_keep] + remaining
+            completion = "\n".join(remaining).lstrip("\n").rstrip()
+            if not completion:
+                return ""
+
+    # Fallback: strip the typed prefix (current line only) if the model
+    # echoed just that and we didn't catch it above.
     if typed_prefix:
         c_lines = completion.split("\n")
-        if c_lines[0].startswith(typed_prefix.split("\n")[-1]):
-            c_lines[0] = c_lines[0][len(typed_prefix.split("\n")[-1]):]
-        completion = "\n".join(c_lines).rstrip("\n")
+        typed_last = typed_prefix.split("\n")[-1]
+        if c_lines and c_lines[0].startswith(typed_last):
+            c_lines[0] = c_lines[0][len(typed_last):]
+            completion = "\n".join(c_lines).lstrip("\n").rstrip("\n")
+    # Strip any echoed after-cursor suffix.  The model was given the text
+    # after <CURSOR> as context; a well-behaved model stops before it, but
+    # some models reproduce it.  We trim from the first point where the
+    # completion's tail matches the after-cursor text's head.
+    if after_cursor.strip():
+        after_stripped = after_cursor.lstrip()
+        # Check if the completion ends with (or contains) the after-cursor text
+        if completion.endswith(after_stripped):
+            completion = completion[: -len(after_stripped)].rstrip()
+        else:
+            # Try a partial match — the model may have echoed just the
+            # first line of the after-cursor text (e.g. ``]`` or ``)``)
+            after_first_line = after_stripped.split("\n")[0].strip()
+            if after_first_line and completion.endswith(after_first_line):
+                completion = completion[: -len(after_first_line)].rstrip()
     return completion
 
 
@@ -1022,13 +1624,21 @@ class OllamaNavigableSuggest(_NavSuggest if _HAS_NAV_SUGGEST else object):
 
         self._system = (
             "You are an inline code-completion engine for a security-testing "
-            "REPL. Continue the operator's code at the cursor. OUTPUT RULES: "
-            "raw Python only — no explanations, no markdown, no comments, no "
-            "prose. You may emit MULTIPLE lines (a short block, 1-8 lines, "
-            "with correct 4-space indentation) when that is the natural "
-            "continuation. Reuse the names of variables the operator already "
-            "defined — never invent placeholder names like target_ip or "
-            "result1. If you cannot continue the code, output nothing. "
+            "REPL. Continue the operator's code at the cursor. "
+            "FILL-IN-THE-MIDDLE: the user message contains the code before "
+            "the cursor, a <CURSOR> marker showing exactly where to "
+            "continue, and the code after the cursor (closing brackets, "
+            "following lines). Your output replaces the <CURSOR> marker — "
+            "do NOT repeat the text before or after it. Use the text after "
+            "the cursor to understand what construct you're inside (a list, "
+            "a function body, a dict, etc.) and match its indentation. "
+            "OUTPUT RULES: raw Python only — no explanations, no markdown, "
+            "no comments, no prose. You may emit MULTIPLE lines (a short "
+            "block, 1-8 lines, with correct 4-space indentation) when that "
+            "is the natural continuation. Reuse the names of variables the "
+            "operator already defined — never invent placeholder names like "
+            "target_ip or result1. If you cannot continue the code, output "
+            "nothing. "
             "Async tool callables (call with await): "
             + self._tools_list() + ". Use these exact short aliases; never "
             "invent a dotted module path. "
@@ -1091,15 +1701,49 @@ class OllamaNavigableSuggest(_NavSuggest if _HAS_NAV_SUGGEST else object):
 
         doc = buffer.document
         line = doc.text_before_cursor.split("\n")[-1]
-        if len(line) < _COMPLETION_MIN_PREFIX:
-            self._dbg(f"line too short ({len(line)} chars), skipping")
-            return
-
         # Whole-buffer context: everything the operator typed up to the
         # cursor, truncated to the tail.  Earlier lines carry the variables
         # (sess handle, target host, discovered creds) that the suggestion
         # should reference instead of inventing placeholders.
-        typed_context = doc.text_before_cursor[-_COMPLETION_MAX_CONTEXT_CHARS:]
+        before_cursor = doc.text_before_cursor[-_COMPLETION_MAX_CONTEXT_CHARS:]
+        # Text AFTER the cursor — the closing brackets, dedent, following
+        # lines that tell the model what construct it's inside.  Without
+        # this, the model doesn't know it's completing inside ``payloads = [``
+        # because it can't see the ``]`` that follows.
+        after_cursor = doc.text_after_cursor[:_COMPLETION_MAX_AFTER_CHARS]
+
+        # Build a FIM-style (fill-in-the-middle) context: prefix + cursor
+        # marker + suffix.  Coder models (qwen2.5-coder, deepseek-coder, etc.)
+        # are trained on this pattern.  Non-coder models still benefit —
+        # the marker makes the continuation point unambiguous.
+        if after_cursor.strip():
+            typed_context = (
+                before_cursor
+                + _COMPLETION_CURSOR_MARKER
+                + after_cursor
+            )
+        else:
+            # Nothing after the cursor — plain continuation, no marker needed.
+            typed_context = before_cursor
+
+        # Gate: require a minimum prefix to avoid firing on a fresh prompt.
+        # BUT — when the cursor is on a short/blank line inside a multi-line
+        # construct (e.g. inside ``payloads = [`` ... ``]`` with a blank
+        # line between items), the *current line* is empty while the *cell*
+        # has plenty of context.  In that case, gate on the whole-buffer
+        # length instead of the current-line length.
+        if len(line) < _COMPLETION_MIN_PREFIX:
+            if len(typed_context.strip()) >= _COMPLETION_MIN_PREFIX:
+                # On a blank line inside a multi-line cell — query anyway.
+                # The model continues from the cursor position, which may
+                # be a fresh line inside a list/dict/function body.
+                self._dbg(
+                    f"line short ({len(line)} chars) but buffer has "
+                    f"{len(typed_context.strip())} chars — querying with cell context"
+                )
+            else:
+                self._dbg(f"line too short ({len(line)} chars) and buffer empty, skipping")
+                return
 
         # Live namespace signal: the operator's variables + tool callables,
         # so the model knows `sess = "ssh:..."` exists to be reused.
@@ -1123,7 +1767,10 @@ class OllamaNavigableSuggest(_NavSuggest if _HAS_NAV_SUGGEST else object):
         self._request_number += 1
         request_number = self._request_number
 
-        self._dbg(f"querying {self._model!r} for {typed_context[-80:]!r}")
+        self._dbg(
+            f"querying {self._model!r} | before={before_cursor[-60:]!r} "
+            f"| after={after_cursor[:40]!r}"
+        )
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1157,7 +1804,12 @@ class OllamaNavigableSuggest(_NavSuggest if _HAS_NAV_SUGGEST else object):
 
         self._dbg(f"raw reply: {result[:120]!r}")
 
-        trimmed = _trim_completion(result, typed_prefix=line)
+        # Trim the model reply: strip any echoed before-cursor prefix,
+        # strip the typed current-line prefix, strip any echoed after-cursor
+        # suffix, strip markdown fences.
+        trimmed = _trim_completion(result, typed_prefix=line,
+                                   after_cursor=after_cursor,
+                                   before_cursor=before_cursor)
         if not trimmed:
             self._dbg(f"completion fully overlapped the typed text — nothing to show ({result[:80]!r})")
             return
@@ -1991,6 +2643,16 @@ async def repl_loop(manifests: List[ToolManifest]):
                 print()
                 print("  Also: tools  (dict of all wrappers),  manifests  (list),")
                 print("        manifest_by_id('full.tool.id'),  run_tool,  resolve_callable")
+                print()
+                print("  ── UI upgrades ──")
+                print(f"    Syntax highlighting: ON (colors={_IPYTHON_COLORS})")
+                if _IPYTHON_TOOLBAR_ENABLED:
+                    print("    Bottom toolbar: cursor L:C, cell overview + in-cell vars, globals, scope/brain")
+                    print("      F1 → dump all variables (in-cell uncommitted + committed globals)")
+                if _IPYTHON_RPROMPT_ENABLED:
+                    print("    Right prompt: missing required params shown inside tool()")
+                if _IPYTHON_MOUSE_SUPPORT:
+                    print("    Mouse: click to position cursor (Shift+drag to select text)")
 
                 # Build the Ollama suggester BEFORE the print block that
                 # references it.  The suggester is a
@@ -2039,7 +2701,27 @@ async def repl_loop(manifests: List[ToolManifest]):
                 # enable ``%autoawait asyncio`` and inject the Ollama
                 # suggester before the interactive loop starts.
                 def _embed():
-                    shell = InteractiveShellEmbed(user_ns=user_ns, header="")
+                    # colors="linux" flips Pygments syntax highlighting ON.
+                    # InteractiveShellEmbed defaults to "nocolor" which
+                    # disables the IPythonPTLexer's Pygments styling — the
+                    # lexer is already wired into pt_app, it just has no
+                    # colour style to apply.  "linux" = dark-terminal theme.
+                    # Override via IPYTHON_COLORS env (linux|neutral|lightbg|
+                    # nocolor|pride|gruvbox-dark).
+                    shell = InteractiveShellEmbed(
+                        user_ns=user_ns, header="", colors=_IPYTHON_COLORS,
+                    )
+                    # Merge toolbar/rprompt style overrides into the shell's
+                    # Pygments style so the bottom bar and right prompt get
+                    # their own colours.
+                    try:
+                        existing = dict(shell.highlighting_style_overrides)
+                        existing.update(_ipython_toolbar_styles())
+                        shell.highlighting_style_overrides = existing
+                        shell.refresh_style()
+                    except Exception:
+                        pass
+
                     # Force asyncio autoawait so ``await tool(...)`` works at
                     # the top level.  IPython rewrites the cell into an async
                     # function and runs it on its own event loop (created in
@@ -2079,6 +2761,19 @@ async def repl_loop(manifests: List[ToolManifest]):
                             "new_keys": _trigger_key_spec(),
                             "create": True,
                         }]
+
+                    # ── Bottom toolbar + rprompt + F1 globals overlay ────
+                    # Wired after the shell is fully constructed (pt_app
+                    # exists).  The toolbar re-renders every keystroke;
+                    # the rprompt shows remaining required tool params when
+                    # the cursor is inside a tool call; F1 dumps all user
+                    # globals above the active prompt.
+                    try:
+                        _install_toolbar_and_keybindings(shell)
+                    except Exception as _e:
+                        if _COMPLETION_ENABLED:  # borrow the debug flag
+                            print(f"[toolbar] install skipped: {_e!r}")
+
                     shell()
 
                 await asyncio.to_thread(_embed)
