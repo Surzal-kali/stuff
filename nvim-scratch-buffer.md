@@ -29,6 +29,43 @@ The stub dir is disposable by design: it is fully derivable from the repo via
 the generator. Nothing in it is hand-written, so git-tracking it would only add
 drift.
 
+## Root lane (sudo'd `tool_repl`)
+
+The framework runs as **root**; `/root/.config/nvim` is symlinked to the kali
+config for transparency, but the symlink does **not** cover everything this
+lane wires. What root resolves depends on root's `$HOME`, so:
+
+| Piece | Root sees | Works? |
+| --- | --- | --- |
+| `~/.config/nvim` (specs) | symlink to kali config | ✅ if symlink |
+| Mason pyright | root's own Mason install (confirmed present) | ✅ |
+| `~/.local/share/framework-stubs/` | `/root/.local/share/framework-stubs` | ❌ **missing → `nmap` undefined** |
+| zshrc PYTHONPATH | root's own zshrc | ❌ not exported |
+
+The signature-window piece (`blink.lua`) and the pyright spec both load through
+the config symlink; the **stubs dir is the broken link** — `python.lua`
+computes `vim.fn.expand("~/.local/share/framework-stubs")` at spec load, which
+under root expands to a path that doesn't exist, so pyright's `extraPaths`
+points nowhere and no tool alias resolves.
+
+**Fix (one-time, keeps kali's stubs as single source of truth):**
+
+```bash
+sudo ln -s /home/kali/.local/share/framework-stubs /root/.local/share/framework-stubs
+```
+
+Root's pyright then sees the same regenerated stubs instantly — no second copy
+to keep fresh. Optionally, for running the REPL's `from framework_tools
+import *` as root:
+
+```bash
+echo 'export PYTHONPATH=/home/kali/.local/share/framework-stubs' | sudo tee -a /root/.zshrc
+```
+
+(Or symlink `/root/.zshrc` → kali's if the config-symlink policy extends that
+far; kali-specific bits would leak, so an absolute-path export is the targeted
+move.)
+
 ## Stub dir inventory (`~/.local/share/framework-stubs/`)
 
 ### `framework_tools.py` — PEP 562 shim (runtime side)
@@ -136,7 +173,11 @@ Notes:
   import resolves at runtime. nvim/pyright needs only `extraPaths` (next
   section) — the zshrc line is purely the in-REPL execution path.
 
-## nvim wiring (`~/.config/nvim/lua/plugins/python.lua`)
+## nvim wiring (`~/.config/nvim/lua/plugins/`)
+
+**Two spec files**, both in the tracked nvim config repo:
+
+### `python.lua` — pyright + stubs dir
 
 ```lua
 local stubs_dir = vim.fn.expand("~/.local/share/framework-stubs")
@@ -168,6 +209,84 @@ return {
 - `diagnosticMode = "openFilesOnly"` keeps background analysis off — diagnostics
   stay scoped to buffers you're actually in (scratch cells, stub consumers).
 
+### `blink.lua` — the signature window (blink.cmp is opt-in!)
+
+LazyVim's blink extra ships signature help **commented out** (experimental):
+`-- signature = { enabled = true }` in
+`lua/lazyvim/plugins/extras/coding/blink.lua`. Without this file, typing
+`ssh_connect(` shows **nothing** — blink never requests
+`textDocument/signatureHelp`, even though pyright serves it fine:
+
+```lua
+return {
+  "saghen/blink.cmp",
+  opts = {
+    signature = { enabled = true },
+  },
+}
+```
+
+blink.cmp's own defaults then do the rest: `trigger.show_on_trigger_character
+= true` auto-shows right after `(` / `,`; `show_on_insert_on_trigger_character`
+re-shows when re-entering insert mode inside a call; `show_on_accept` can be
+turned on additionally if you want it after accepting a completion.
+
+### What this does NOT require
+
+- **No Brain, no ChromaDB, no Ollama.** pyright reads the static stub files;
+  the entire lane works with every framework service stopped. (Only *executing*
+  a tool from the cell later hits the Brain socket — editing/typing never does.)
+- **Restart required after adding specs**: lazy.nvim loads spec files at
+  startup. If the nvim session predates `python.lua`/`blink.lua`, neither is
+  active — restart nvim (or `:Lazy reload nvim-lspconfig` after re-opening the
+  file) before concluding it doesn't work.
+
+### Scratch-cell gotcha (top-level await)
+
+IPython cells naturally contain top-level `await`; plain-Python pyright flags
+it as `"await" allowed only within async function` — **cosmetic only**: its
+semantic analysis still runs (verified: param-count `reportCallIssue`
+diagnostics still fire on both sides of the syntax error). Completion,
+hover, and signature help all work in cells with top-level `await`.
+
+## Runtime truth vs LSP truth (why the header is not optional)
+
+Two different scopes hold the tool names, and only one of them is visible to
+pyright:
+
+- **Runtime (the REPL):** `build_ipython_namespace()` injects every alias
+  directly into `user_ns`. A bare `await nmap(...)` in any cell *just works*
+  with no import — the names are already "imported" by construction.
+- **Editor (pyright):** sees only the file text. Without
+  `from framework_tools import *` in the buffer, pyright has no scope entry and
+  `nmap` is genuinely undefined to it — regardless of the REPL being live.
+
+So the header line is **for the LSP, not for Python**. And it isn't even a
+lie at runtime: the PEP 562 shim resolves each `__all__` entry to the *same
+live wrapper* already in `user_ns` (verified in an embedded shell), so the
+import rebinds identical objects. Cheap at runtime, load-bearing in the editor.
+
+**Debugging lesson (2026-10-10):** the entire lane was working while it looked
+dead end-to-end — every "broken" session was just a buffer without the header.
+Both the scratch lane and this doc now assume: *no header → undefined names is
+correct behavior, not a bug.*
+
+## Scratch-cell ergonomics (`~/.config/nvim/lua/plugins/scratch-cells.lua`)
+
+Because "remember the header" is the failure mode that actually bites, the
+editor side enforces it for you:
+
+- **Empty F2 temp files auto-stamp** — prompt_toolkit temp shapes
+  (`/tmp/tmpXXXX`, `/tmp/tmpXXXX.txt`) open with the two-line header inserted
+  and `ft=python` set. This also covers the empty-cell case, where there's no
+  modeline yet to trigger filetype detection.
+- **Non-empty files missing the header get a one-time notify** hintting
+  `<leader>fc` — the editor never silently mutates cell text you already typed.
+- **`<leader>fc` / `:FrameworkCell`** — stamp the header into the current
+  buffer unconditionally (idempotent; skips when `framework_tools` appears in
+  the first five lines). For cells with content, or named files.
+- Opt out of the empty-file autostamp with `vim.g.fwcell_no_autostamp = true`.
+
 ## Sanity checks (post-regen)
 
 1. Scratch cell with the header → typing `ssh_` blink-completes `ssh_connect`
@@ -177,3 +296,19 @@ return {
    resolves with `__manifest__` present.
 4. `K` on an alias → the manifest docstring.
 5. Header timestamp changes after re-running the generator; `--check` exits 0.
+
+## Ground-truth diagnostic (when it "still doesn't work")
+
+Run this **inside the failing buffer** (F2 cell, root or kali — whichever
+session misbehaves), then paste the `DIAG:` output verbatim:
+
+```vim
+:lua dofile("/home/kali/github/stuff/scripts/nvim_lsp_diag.lua")
+```
+
+Read-only — prints HOME, buffer filetype + header lines, which stub paths exist
+*for that process*, whether the spec files resolve, every attached LSP client
+with its `extraPaths`, and whether the server returns `nma*` completions. Each
+branch pins a distinct failure: missing stubs (root-lane section above), no
+filetype (modeline missing), stale session (specs/extraPaths absent → restart
+nvim), or a genuinely broken stub pair (re-run the generator).
