@@ -274,18 +274,29 @@ correct behavior, not a bug.*
 ## Scratch-cell ergonomics (`~/.config/nvim/lua/plugins/scratch-cells.lua`)
 
 Because "remember the header" is the failure mode that actually bites, the
-editor side enforces it for you:
+editor side enforces it for you — **but the header is buffer-only, never on
+disk**. prompt_toolkit's F2 reads the file back after `:wq` and pipes it into
+the IPython cell; a header line in the file would execute (or fail) as cell
+content, breaking the REPL.
 
-- **Empty F2 temp files auto-stamp** — prompt_toolkit temp shapes
-  (`/tmp/tmpXXXX`, `/tmp/tmpXXXX.txt`) open with the two-line header inserted
-  and `ft=python` set. This also covers the empty-cell case, where there's no
-  modeline yet to trigger filetype detection.
-- **Non-empty files missing the header get a one-time notify** hintting
-  `<leader>fc` — the editor never silently mutates cell text you already typed.
-- **`<leader>fc` / `:FrameworkCell`** — stamp the header into the current
-  buffer unconditionally (idempotent; skips when `framework_tools` appears in
-  the first five lines). For cells with content, or named files.
-- Opt out of the empty-file autostamp with `vim.g.fwcell_no_autostamp = true`.
+The lifecycle:
+
+1. **Open** (`BufReadPost`/`BufNewFile` on `/tmp/tmp*`) — header injected into
+   the *buffer* + `ft=python` set. pyright sees it; the file on disk doesn't.
+2. **Write** (`BufWritePre`) — header stripped from the buffer before the file
+   is written. The file on disk contains exactly what the operator typed.
+3. **Post-write** (`BufWritePost`) — header re-injected so pyright keeps
+   seeing it for continued editing.
+
+Manual: `<leader>fc` / `:FrameworkCell` injects into any buffer (idempotent).
+Opt out: `vim.g.fwcell_no_autostamp = true`. Disable: `vim.g.fwcell_disable
+= true`.
+
+> **ChromaDB is not the answer here.** ChromaDB powers tool *discovery*
+> (semantic search); the header lane is purely an editor-side *typing*
+> concern (pyright needs a file-scope import to resolve names that exist only
+> in the REPL's `user_ns`). The two are orthogonal — ChromaDB being always-on
+> doesn't help pyright see names in a file.
 
 ## Sanity checks (post-regen)
 
