@@ -31,6 +31,7 @@ Design notes
 """
 
 import os
+from pathlib import Path
 
 import scapy.all as scapy
 from scapy.layers.dhcp import DHCP, BOOTP
@@ -53,6 +54,27 @@ from .scope_gate import check_send, ScopeGateError
 # at call time via _default_interface() so .env edits apply without re-import.
 PACKET_INTERFACE_ENV = "PACKET_CRAFT"
 DEFAULT_INTERFACE = "enp92s0"
+
+# Pcap output directory — mirrors the msfvenom dropbox pattern: gitignored,
+# env-overridable, resolved at call time so .env edits apply without re-import.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+PCAP_DIR = Path(os.getenv("PCAP_DIR", str(_REPO_ROOT / "pcaps")))
+PCAP_MAX_PACKETS_PER_FILE = int(os.getenv("PCAP_MAX_PACKETS_PER_FILE", "100000"))
+PCAP_MAX_FILE_MB = int(os.getenv("PCAP_MAX_FILE_MB", "512"))
+
+
+def _pcap_dir() -> Path:
+    """Resolve the pcap output directory at call time (env edits take effect
+    without re-import)."""
+    return Path(os.getenv("PCAP_DIR", str(_REPO_ROOT / "pcaps")))
+
+
+def _pcap_max_packets() -> int:
+    return int(os.getenv("PCAP_MAX_PACKETS_PER_FILE", "100000"))
+
+
+def _pcap_max_file_mb() -> int:
+    return int(os.getenv("PCAP_MAX_FILE_MB", "512"))
 
 
 def _default_interface() -> str:
@@ -941,3 +963,307 @@ def wait_for_packet(filter: str = "", timeout: int = 30, interface: str = ""):
         return f"wait_for_packet requires root/raw-socket capability: {e}."
     except Exception as e:
         return f"wait_for_packet error: {e}"
+
+
+# ===========================================================================
+# Pcap forensic lane — batch save / sniff-to-pcap / load-all / list
+# ===========================================================================
+#
+# The single-packet save_packet / load_packet tools above are fine for
+# quick one-off use, but they can't build a multi-packet capture (wrpcap
+# overwrites, not appends) and load_packet returns only packet [0].  The
+# four tools below close that gap, mirroring the msfvenom dropbox pattern:
+#
+#   pcaps/        gitignored output root (override via PCAP_DIR env)
+#   save_pcap     hex list -> multi-packet .pcap in one call
+#   sniff_to_pcap sniff + auto-save the whole capture to pcaps/ in one call
+#   load_pcap     load ALL packets from a .pcap (paged summaries + hex)
+#   list_pcaps    browse saved captures with sizes, packet counts, timestamps
+
+import datetime
+import hashlib
+
+
+def _safe_pcap_name(filename: str) -> str:
+    """Sanitize a user-supplied filename for the pcaps/ directory.
+
+    Strips path separators (the file always lands in PCAP_DIR), appends .pcap
+    if no extension, and rejects empty names.
+    """
+    name = os.path.basename(filename.strip())
+    if not name:
+        raise ValueError("filename is empty after sanitizing")
+    if not name.lower().endswith(".pcap"):
+        name += ".pcap"
+    return name
+
+
+@framework_tool(
+    "Save multiple packets (by hex list) to a pcap file for forensic analysis "
+    "or evidence. Writes a multi-packet .pcap in one call — no root needed. "
+    "File lands in the pcaps/ directory (override via PCAP_DIR). Returns the "
+    "absolute path, packet count, and sha256.",
+    tags=["net.raw"],
+    next_hints=[
+        "list_pcaps to browse saved captures",
+        "load_pcap to read the packets back",
+        "report_finding to record the saved pcap path as evidence",
+    ],
+)
+def save_pcap(hexes: list, filename: str = ""):
+    """Save a batch of packets to a pcap file in pcaps/.
+
+    Args:
+        hexes: List of packet hex strings (from sniff_packets, craft_*,
+               send_and_receive_packet replies, etc.).
+        filename: Output filename (no path separators — the file always
+                  lands in the PCAP_DIR). If omitted, auto-generates a
+                  timestamped name. .pcap extension added if missing.
+    """
+    try:
+        if not hexes:
+            return "save_pcap: no packets to save (hexes list is empty)."
+        cap = _pcap_dir()
+        cap.mkdir(parents=True, exist_ok=True)
+        if filename:
+            name = _safe_pcap_name(filename)
+        else:
+            name = f"cap_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
+        out_path = cap / name
+
+        packets = [_packet_from_hex(h) for h in hexes]
+        scapy.wrpcap(str(out_path), packets)
+
+        file_bytes = out_path.read_bytes()
+        return (
+            f"Saved {len(packets)} packet(s) to {out_path}\n"
+            f"  size: {len(file_bytes)} bytes\n"
+            f"  sha256: {hashlib.sha256(file_bytes).hexdigest()}\n"
+            f"  packets: {len(packets)}\n"
+            f"Use load_pcap('{name}') to read them back, or "
+            f"dissect_packet on any packet's hex for a full breakdown."
+        )
+    except ValueError as e:
+        return f"save_pcap error: {e}"
+    except Exception as e:
+        return f"save_pcap error: {e}"
+
+
+@framework_tool(
+    "Sniff packets on an interface and save the entire capture to a pcap file "
+    "in one call. Returns a summary + the absolute pcap path for later "
+    "analysis. Requires root (raw sockets). The capture auto-saves to pcaps/ "
+    "(override via PCAP_DIR).",
+    tags=["net.raw"],
+    next_hints=[
+        "load_pcap to read and page through the captured packets",
+        "dissect_packet on any packet hex for a full field breakdown",
+        "list_pcaps to browse all saved captures",
+        "report_finding to record the saved pcap path as evidence",
+    ],
+)
+def sniff_to_pcap(
+    filter: str = "",
+    count: int = 50,
+    timeout: int = 60,
+    interface: str = "",
+    filename: str = "",
+):
+    """Sniff packets and save the whole capture to a pcap file.
+
+    Args:
+        filter: BPF filter string (e.g. 'tcp port 80', 'icmp', 'host 10.0.0.1').
+        count: Number of packets to capture (capped at PCAP_MAX_PACKETS_PER_FILE).
+        timeout: Capture timeout in seconds.
+        interface: Interface to capture on; defaults to PACKET_CRAFT env (fallback enp92s0).
+        filename: Output filename (no path separators — lands in PCAP_DIR).
+                  If omitted, auto-generates a timestamped name.
+    """
+    try:
+        iface = interface or _default_interface()
+        max_pkts = _pcap_max_packets()
+        cap_count = min(int(count), max_pkts)
+        pkts = _craft(iface).sniff_packets(
+            filter=filter, count=cap_count, timeout=int(timeout)
+        )
+        if not pkts:
+            return (
+                f"No packets captured on {iface} (filter={filter!r}). "
+                f"No pcap file written."
+            )
+
+        cap = _pcap_dir()
+        cap.mkdir(parents=True, exist_ok=True)
+        if filename:
+            name = _safe_pcap_name(filename)
+        else:
+            name = f"cap_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
+        out_path = cap / name
+
+        scapy.wrpcap(str(out_path), pkts)
+        file_bytes = out_path.read_bytes()
+
+        lines = [
+            f"Captured and saved {len(pkts)} packet(s) to {out_path}",
+            f"  interface: {iface}",
+            f"  filter: {filter!r}",
+            f"  size: {len(file_bytes)} bytes",
+            f"  sha256: {hashlib.sha256(file_bytes).hexdigest()}",
+            f"  packets: {len(pkts)}",
+            f"",
+            f"Packet summaries (first {min(len(pkts), 20)}):",
+        ]
+        for i, p in enumerate(pkts[:20], 1):
+            lines.append(f"  [{i}] {p.summary()}  hex={_packet_to_hex(p)}")
+        if len(pkts) > 20:
+            lines.append(f"  ... ({len(pkts) - 20} more — use load_pcap to page through)")
+        lines.append(
+            f"\nUse load_pcap('{name}') to page through all packets, "
+            f"or dissect_packet on any hex for a full breakdown."
+        )
+        return "\n".join(lines)
+    except PermissionError as e:
+        return f"sniff_to_pcap requires root/raw-socket capability: {e}."
+    except ValueError as e:
+        return f"sniff_to_pcap error: {e}"
+    except Exception as e:
+        return f"sniff_to_pcap error: {e}"
+
+
+@framework_tool(
+    "Load ALL packets from a pcap file and return paged summaries with hex. "
+    "No root needed — pure file parsing. Use offset/limit to page through "
+    "large captures. Returns packet count, page range, and per-packet hex "
+    "for dissect_packet.",
+    tags=["net.raw"],
+    next_hints=[
+        "dissect_packet with any returned hex for a full field breakdown",
+        "list_pcaps to browse other saved captures",
+    ],
+)
+def load_pcap(filename: str, offset: int = 0, limit: int = 50):
+    """Load packets from a pcap file with pagination.
+
+    Args:
+        filename: .pcap path. A bare name (no path separators) is resolved
+                  against the PCAP_DIR (e.g. 'cap_20260101_120000.pcap').
+                  An absolute or relative path with separators is used as-is.
+        limit: Maximum number of packets to return per page (default 50).
+        offset: Zero-based packet index to start from (default 0).
+    """
+    try:
+        # Resolve path: bare name -> PCAP_DIR; has separators -> as-is
+        if os.path.sep in filename or "/" in filename:
+            fpath = Path(filename)
+        else:
+            fpath = _pcap_dir() / filename
+
+        if not fpath.exists():
+            return f"load_pcap: file not found: {fpath}"
+
+        # Size guard to avoid blowing up the Brain wire frame
+        max_mb = _pcap_max_file_mb()
+        file_size = fpath.stat().st_size
+        if file_size > max_mb * 1024 * 1024:
+            return (
+                f"load_pcap: {fpath.name} is {file_size / 1024 / 1024:.1f} MiB "
+                f"(cap is {max_mb} MiB). Use tcpdump/tshark directly or raise "
+                f"PCAP_MAX_FILE_MB."
+            )
+
+        pkts = scapy.rdpcap(str(fpath))
+        total = len(pkts)
+        if total == 0:
+            return f"No packets in {fpath}."
+
+        off = max(0, int(offset))
+        lim = max(1, int(limit))
+        page = pkts[off : off + lim]
+
+        lines = [
+            f"Loaded {total} packet(s) from {fpath.name} "
+            f"(showing {off}–{off + len(page) - 1} of {total}):",
+            f"  size: {file_size} bytes",
+            f"",
+        ]
+        for i, p in enumerate(page, off + 1):
+            lines.append(f"  [{i}] {p.summary()}  hex={_packet_to_hex(p)}")
+
+        if off + len(page) < total:
+            next_off = off + len(page)
+            lines.append(
+                f"\n  ... {total - next_off} more — "
+                f"load_pcap('{fpath.name}', offset={next_off}, limit={lim}) "
+                f"for the next page."
+            )
+        else:
+            lines.append(f"\n  End of capture ({total} packets total).")
+        lines.append(
+            f"Use dissect_packet with any hex above for a full field breakdown."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"load_pcap error: {e}"
+
+
+@framework_tool(
+    "List saved pcap captures in the pcaps/ directory with file sizes, packet "
+    "counts, and timestamps. No root needed. Browse forensic captures and "
+    "recover pcap paths from earlier turns.",
+    tags=["net.raw"],
+    next_hints=[
+        "load_pcap to read and page through a capture",
+        "dissect_packet on any packet hex for a full breakdown",
+    ],
+)
+def list_pcaps():
+    """List pcap files in the PCAP_DIR with metadata."""
+    try:
+        cap = _pcap_dir()
+        cap.mkdir(parents=True, exist_ok=True)
+        # Filter out .gitkeep and README.md
+        pcap_files = sorted(
+            (p for p in cap.iterdir()
+             if p.is_file() and p.name.lower().endswith(".pcap")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not pcap_files:
+            return (
+                f"No pcap files in {cap}. Use sniff_to_pcap or save_pcap to "
+                f"create one."
+            )
+
+        lines = [f"Pcap captures in {cap} ({len(pcap_files)} file(s)):", ""]
+        for p in pcap_files:
+            st = p.stat()
+            size = st.st_size
+            mtime = datetime.datetime.fromtimestamp(
+                st.st_mtime
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            # Try to get packet count without loading the full file into
+            # memory — rdpcap is lazy (it reads the index), so this is cheap.
+            try:
+                pkts = scapy.rdpcap(str(p))
+                pkt_count = len(pkts)
+            except Exception:
+                pkt_count = "?"
+
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KiB"
+            else:
+                size_str = f"{size / 1024 / 1024:.1f} MiB"
+
+            lines.append(
+                f"  {p.name}  {size_str}  {pkt_count} pkts  {mtime}"
+            )
+
+        lines.append(
+            f"\nUse load_pcap('<name>.pcap') to page through packets, "
+            f"or dissect_packet on any hex for a full breakdown."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"list_pcaps error: {e}"

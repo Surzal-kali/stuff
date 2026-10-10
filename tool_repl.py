@@ -1464,6 +1464,14 @@ def _ollama_query_sync(model: str, system: str, typed_context: str, url: str,
 
     if not raw:
         return None
+    # Strip the FIM cursor marker if the model echoed it (gemma4 and others
+    # sometimes reproduce ``<CURSOR>`` verbatim in the completion).
+    if _COMPLETION_CURSOR_MARKER.strip():
+        raw = raw.replace(_COMPLETION_CURSOR_MARKER.strip(), "")
+        raw = raw.replace(_COMPLETION_CURSOR_MARKER, "")
+    raw = raw.strip()
+    if not raw:
+        return None
     # Strip markdown fences
     if raw.startswith("```"):
         lines = raw.split("\n")
@@ -1494,6 +1502,19 @@ def _trim_completion(completion: str, typed_prefix: str = "",
     working backwards line-by-line until we find a line that isn't an echo.
     """
     raw = completion.strip()
+    if not raw:
+        return ""
+    # Strip the FIM cursor marker if the model echoed it back.  The marker
+    # (default ``\n<CURSOR>\n``) was injected between the before-cursor and
+    # after-cursor text; a well-behaved model replaces it with the completion,
+    # but some models (gemma4, etc.) reproduce it verbatim inside their
+    # output.  Remove every occurrence — the marker is never valid ghost text.
+    if _COMPLETION_CURSOR_MARKER.strip():
+        raw = raw.replace(_COMPLETION_CURSOR_MARKER.strip(), "")
+        # Also remove bare ``<CURSOR>`` without surrounding newlines, in case
+        # the model reformatted it.
+        raw = raw.replace(_COMPLETION_CURSOR_MARKER, "")
+    raw = raw.strip()
     if not raw:
         return ""
     # Strip a full markdown code block if the model re-emitted one

@@ -524,6 +524,10 @@ NOTE (sandbox copy caveat): modules whose import chain needs `listeners/plugins/
 | `export_packet_hex` | `utils.packetcraft.export_packet_hex` | *hex |
 | `load_packet` | `utils.packetcraft.load_packet` | *filename |
 | `modify_packet` | `utils.packetcraft.modify_packet` | *hex, *fields |
+| `save_pcap` | `utils.packetcraft.save_pcap` | *hexes, filename |
+| `sniff_to_pcap` | `utils.packetcraft.sniff_to_pcap` | filter, count, timeout, interface, filename |
+| `load_pcap` | `utils.packetcraft.load_pcap` | *filename, offset, limit |
+| `list_pcaps` | `utils.packetcraft.list_pcaps` |  |
 | `save_packet` | `utils.packetcraft.save_packet` | *hex, *filename |
 | `send_and_receive_packet` | `utils.packetcraft.send_and_receive_packet` | *hex, timeout, interface |
 | `send_packet` | `utils.packetcraft.send_packet` | *hex, count, interval, interface |

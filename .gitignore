@@ -25,6 +25,10 @@ scope/
 /dropbox/*
 !/dropbox/.gitkeep
 !/dropbox/README.md
+# --- packet captures (scapy wrpcap output; forensic evidence) ---
+/pcaps/*
+!/pcaps/.gitkeep
+!/pcaps/README.md
 bugcheck_ledger.md
 ledger_archive/*
 briefs/*

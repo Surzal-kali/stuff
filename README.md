@@ -133,7 +133,7 @@ becomes the semantic capability description that the registry embeds.
 - **`payloads/wordlists.py`** — **BRAIN_DISPATCH**: Query-based wordlist discovery over the source tree including Kali's symlinked folders (feeds ffuf/hydra)
 - **`utils/findings.py`** — **BRAIN_DISPATCH**: Report, render, close, and supersede structured security findings
 - **`utils/paramiko_client.py`** — **BRAIN_DISPATCH**: Persistent SSH (connect/exec/shell/close) + one-shot mode
-- **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, send_and_receive_packet (sr1/srp1: fires a probe and captures its reply in one gated call), sniff_packets, dissect_packet, modify_packet, save/load pcap
+- **`utils/packetcraft.py`** — **BRAIN_DISPATCH**: Scapy packet crafting: craft_*(icmp/tcp/udp/arp/vlan/dhcp/dns/mdns/http), send_packet, send_and_receive_packet (sr1/srp1: fires a probe and captures its reply in one gated call), sniff_packets, dissect_packet, modify_packet, save/load pcap, **pcap forensic lane** (save_pcap, sniff_to_pcap, load_pcap, list_pcaps — batch save/load/list with `pcaps/` gitignored output dir, mirroring the msfvenom dropbox pattern)
 - **`utils/log_reader.py`** — **BRAIN_DISPATCH**: Read/stream Brain and MSF logs
 - **`utils/memory_tools.py`** — **BRAIN_DISPATCH**: Namespaced vector memory (remember_text/recall_text)
 - **`utils/crypto_kit.py`** — **BRAIN_DISPATCH**: Offline crypto/encoding workbench — decode, identify, and attack encoded blobs (Base64/JSON cookies, JWTs, unsalted hashes; zero network)
@@ -962,7 +962,7 @@ utils/
   session_manager.py    Singleton for live session objects
   sessions.py           SQLite database (targets/sessions/notes/findings)
   log_reader.py         Brain/MSF log reading and streaming
-  packetcraft.py        Scapy packet crafting (craft_*/send/send_and_receive/sniff/dissect/modify)
+  packetcraft.py        Scapy packet crafting (craft_*/send/send_and_receive/sniff/dissect/modify + pcap forensic lane: save_pcap/sniff_to_pcap/load_pcap/list_pcaps)
   memory_tools.py       remember_text/recall_text vector memory tools
   background_job.py     Shared background-job launch/poll helper
   handles.py            Session handle formatting/parsing/validation
