@@ -738,6 +738,16 @@ _IPYTHON_TOOLBAR_REPR_LEN = int(os.getenv("IPYTHON_TOOLBAR_REPR_LEN", "20"))
 # the app — hold Shift while dragging to force terminal-native selection
 # (works in GNOME Terminal, iTerm2, Windows Terminal, Konsole, etc.).
 _IPYTHON_MOUSE_SUPPORT = os.getenv("IPYTHON_MOUSE", "1").lower() not in ("0", "false", "no", "off")
+# External editor for the IPython shell.  F2 (always on in IPython) opens
+# the current cell in $VISUAL/$EDITOR; we default to nvim so the escape
+# hatch lands in a full TUI IDE (LazyVim, copilot, neo-tree, telescope, …)
+# instead of the nano/vi fallback.  Override with IPYTHON_EDITOR="code --wait"
+# or similar if you prefer a different editor.
+_IPYTHON_EDITOR = os.getenv("IPYTHON_EDITOR", "nvim")
+# F3 launches a full standalone nvim session (not cell-edit) — the TUI IDE
+# escape hatch.  :qa returns to IPython with all live state intact.
+# Set IPYTHON_NVIM_ESCAPE=0 to disable the F3 binding.
+_IPYTHON_NVIM_ESCAPE = os.getenv("IPYTHON_NVIM_ESCAPE", "1").lower() not in ("0", "false", "no", "off")
 
 
 def _user_globals(shell) -> List[tuple]:
@@ -1153,10 +1163,43 @@ def _install_toolbar_and_keybindings(shell) -> None:
                 print(f"  {name:25s} {tn:6s} = {rv}")
         print()
 
+    # ── Ctrl+X Ctrl+E: open current cell in editor (emacs-style) ──────
+    # IPython's F2 binding (open_input_in_editor) is always on, but the
+    # emacs-style Ctrl+X Ctrl-E shortcut is gated behind
+    # extra_open_editor_shortcuts which must be set at shell-creation time.
+    # We add our own binding that does the same thing — calls
+    # Buffer.open_in_editor() which writes the cell to a temp .py file,
+    # launches $VISUAL/$EDITOR, and pipes the result back.
+    @kb.add("c-x", "c-e")
+    def _open_in_editor(event):
+        """Open current cell in external editor (emacs-style, same as F2)."""
+        event.app.current_buffer.open_in_editor()
+
+    # ── F3: full nvim escape hatch ─────────────────────────────────────
+    # Unlike F2/Ctrl+X Ctrl+E (which edit the current cell and pipe the
+    # result back), F3 launches a standalone nvim session in the workspace
+    # root.  The user gets their full TUI IDE — LazyVim, neo-tree,
+    # telescope, copilot, the lot.  :qa returns to IPython with all live
+    # state (sessions, globals, tool wrappers) intact.  Uses
+    # run_in_terminal(in_executor=True) so nvim gets full terminal control
+    # while prompt_toolkit's UI is suspended.
+    if _IPYTHON_NVIM_ESCAPE:
+        @kb.add("f3")
+        async def _open_nvim_escape(event):
+            """Launch a full nvim session in the workspace root."""
+            import subprocess
+            from prompt_toolkit.application.run_in_terminal import run_in_terminal
+            await run_in_terminal(
+                lambda: subprocess.call(
+                    shlex.split(_IPYTHON_EDITOR) + [str(Path(__file__).resolve().parent)]
+                ),
+                in_executor=True,
+            )
+
     # Merge our keybindings with IPython's existing set.
     # ``merge_key_bindings`` produces a ``_MergedKeyBindings`` that checks
     # both registries — the original bindings (Ctrl+L, Ctrl+R, Tab, etc.)
-    # stay live, and F1 is added alongside them.
+    # stay live, and F1/F3/Ctrl+X Ctrl+E are added alongside them.
     from prompt_toolkit.key_binding import merge_key_bindings as _merge_kb
     existing_kb = pt_app.key_bindings
     if existing_kb is not None:
@@ -2653,6 +2696,11 @@ async def repl_loop(manifests: List[ToolManifest]):
                     print("    Right prompt: missing required params shown inside tool()")
                 if _IPYTHON_MOUSE_SUPPORT:
                     print("    Mouse: click to position cursor (Shift+drag to select text)")
+                print("  ── Editor escape hatches ──")
+                print(f"    F2            → open current cell in {_IPYTHON_EDITOR} (save+quit pipes back)")
+                print(f"    Ctrl+X Ctrl+E → same as F2 (emacs-style)")
+                if _IPYTHON_NVIM_ESCAPE:
+                    print(f"    F3            → full {_IPYTHON_EDITOR} session in workspace root (:qa to return)")
 
                 # Build the Ollama suggester BEFORE the print block that
                 # references it.  The suggester is a
@@ -2721,6 +2769,21 @@ async def repl_loop(manifests: List[ToolManifest]):
                         shell.refresh_style()
                     except Exception:
                         pass
+
+                    # ── Editor: nvim as the escape hatch ────────────────
+                    # F2 (always on in IPython) opens the current cell in
+                    # $VISUAL/$EDITOR via prompt_toolkit's
+                    # Buffer.open_in_editor().  Without this, prompt_toolkit
+                    # falls back to /usr/bin/editor (nano/vi) — a blank,
+                    # boring text editor.  Setting VISUAL+EDITOR to nvim
+                    # means F2 drops you into LazyVim with syntax
+                    # highlighting, treesitter, copilot, the works — for the
+                    # current cell.  Save+quit pipes the text back into the
+                    # IPython prompt.
+                    os.environ["VISUAL"] = _IPYTHON_EDITOR
+                    os.environ["EDITOR"] = _IPYTHON_EDITOR
+                    # Also wire IPython's %edit magic to nvim.
+                    shell.editor = _IPYTHON_EDITOR
 
                     # Force asyncio autoawait so ``await tool(...)`` works at
                     # the top level.  IPython rewrites the cell into an async
