@@ -96,7 +96,12 @@ def _render_signature(manifest) -> str:
     """Render ``(params, **kwargs: Any)`` from the manifest — never re-derived."""
     sig = tool_repl._build_signature(manifest)
     parts = [_param_str(p) for p in sig.parameters.values()]
-    parts.append(_PERMISSIVE)
+    has_star = any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in sig.parameters.values()
+    )
+    if not has_star:
+        parts.append(_PERMISSIVE)
     return ", ".join(parts)
 
 
@@ -130,11 +135,12 @@ def generate_pyi(alias_map: Dict[str, Any]) -> str:
     for alias in sorted(alias_map):
         m = alias_map[alias]
         sig = _render_signature(m)
-        body.append(f"async def {alias}({sig}) -> Any: ...")
+        body.append(f"async def {alias}({sig}) -> Any:")
         body.append("    \"\"\"")
         for ln in tool_repl._build_docstring(m).splitlines():
             body.append(f"    {ln}" if ln.strip() else "")
         body.append("    \"\"\"")
+        body.append("    ...")
         # One-line tag / handle-kinds comment for quick visual grep.
         tags = getattr(m, "tags", ()) or ()
         handles = getattr(m, "accepted_handle_kinds", ()) or ()
